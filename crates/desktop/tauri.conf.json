@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "知乎答主助手",
+  "version": "0.1.0",
+  "identifier": "com.lyofficial.zhihuqahelper",
+  "build": {
+    "frontendDist": "../../apps/web/.build"
+  },
+  "app": {
+    "windows": [],
+    "trayIcon": {
+      "iconPath": "icons/32x32.png",
+      "iconAsTemplate": false,
+      "tooltip": "知乎答主助手 · 值守中"
+    },
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "垂直领域答主的问题筛选、材料核查与批阅台",
+    "longDescription": "自动同步知乎邀请与推荐回答，按领域画像筛选、联网取材、生成初稿并逐条核对，最后交给你亲手批阅成稿。"
+  }
+}

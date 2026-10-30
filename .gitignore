@@ -1,0 +1,49 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next.js
+.next/
+.build/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+
+# rust
+target/
+**/*.rs.bk
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# runtime data (账号 cookie、题稿、图片 —— 绝不入库)
+data/
+!data/.gitkeep
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# secrets
+.env
+.env.local
+agents/.runtime/
+
+# screenshots
+shots/
+
+# os
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# tauri 生成物
+crates/desktop/gen/
+
+# 工作区记忆（本地笔记，不入库）
+.workbuddy/
