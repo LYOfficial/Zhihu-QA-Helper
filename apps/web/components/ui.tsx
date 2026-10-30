@@ -133,43 +133,24 @@ export const IconUser = svg(
   </>
 );
 
-/* ---------------------------------------------------------------- 印章 */
+/* ---------------------------------------------------------------- 品牌标记 */
 
 export function Seal({ size = 40 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 44 44" aria-label="知乎答主助手">
-      <rect
-        x="1.6"
-        y="1.6"
-        width="40.8"
-        height="40.8"
-        rx="2.5"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.6"
-        opacity="0.85"
-      />
-      <rect
-        x="5.2"
-        y="5.2"
-        width="33.6"
-        height="33.6"
-        rx="1.2"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="0.7"
-        opacity="0.45"
-      />
-      <text
-        x="22"
-        y="30.5"
-        textAnchor="middle"
-        fontFamily="KaiTi, STKaiti, serif"
-        fontSize="23"
-        fill="currentColor"
-      >
-        答
-      </text>
+    <svg width={size} height={size} viewBox="0 0 128 128" aria-label="知乎答主助手" role="img">
+      <rect x="6" y="6" width="116" height="116" rx="32" fill="currentColor" />
+      <g transform="translate(64 64) scale(.8) translate(-59 -69)">
+        <path
+          d="M28 17h52l20 20v74c0 5.523-4.477 10-10 10H28c-5.523 0-10-4.477-10-10V27c0-5.523 4.477-10 10-10Z"
+          fill="white"
+        />
+        <path d="M80 17v20h20" fill="#dce9ff" />
+        <path d="M36 40h30M36 48h18M36 100h56" fill="none" stroke="currentColor" strokeWidth="5" strokeLinecap="round" />
+        <g transform="translate(48 55) scale(.4)" fill="currentColor">
+          <path d="m53.29 80.035 7.32.002 2.41 8.24 13.128-8.24h15.477v-67.98h-38.335zm7.79-60.598h22.756v53.22h-8.73l-8.718 5.473-1.587-5.46-3.72-.012v-53.22z" />
+          <path d="m46.818 43.162h-16.35c.545-8.467.687-16.12.687-22.955h15.987s.615-7.05-2.68-6.97h-27.655c1.09-4.1 2.46-8.332 4.1-12.708 0 0-7.523 0-10.085 6.74-1.06 2.78-4.128 13.48-9.592 24.41 1.84-.2 7.927-.37 11.512-6.94.66-1.84.785-2.08 1.605-4.54h9.02c0 3.28-.374 20.9-.526 22.95h-16.331c-3.67 0-4.863 7.38-4.863 7.38h20.493c-1.375 15.581-8.755 28.711-22.14 39.091 6.403 1.828 12.784-.29 15.937-3.094 0 0 7.182-6.53 11.12-21.64l16.863 20.294s2.473-8.402-.388-12.496c-2.37-2.788-8.768-10.33-11.496-13.064l-4.57 3.627c1.363-4.368 2.183-8.61 2.46-12.71h19.264s-.027-7.38-2.372-7.38z" />
+        </g>
+      </g>
     </svg>
   );
 }
