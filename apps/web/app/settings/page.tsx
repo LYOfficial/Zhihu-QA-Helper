@@ -551,9 +551,7 @@ export default function SettingsPage() {
               />
             </div>
             <div className="field">
-              <label>
-                配图张数 {settings.imageMin} – {settings.imageMax}
-              </label>
+              <label>备选配图上限 {settings.imageMax} 张</label>
               <input
                 className="range"
                 type="range"
@@ -568,6 +566,9 @@ export default function SettingsPage() {
                   })
                 }
               />
+              <p className="hint" style={{ marginTop: 6 }}>
+                初稿正文不会自动带图。这里只限制从权威平台抓多少张备选，抓到的图放在批阅台左栏，由你决定插哪张、插在哪。
+              </p>
             </div>
           </div>
 

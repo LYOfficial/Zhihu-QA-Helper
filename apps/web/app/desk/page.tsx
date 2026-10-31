@@ -46,19 +46,30 @@ function RenderMarkdown({
   md,
   qid,
   images,
+  onPick,
 }: {
   md: string;
   qid: string;
   images: Draft["images"];
+  /** 预览态点击某一段时，把「插入点」落到这一段结尾，供插图使用 */
+  onPick?: (offset: number) => void;
 }) {
   const lines = md.split("\n");
   const blocks: React.ReactNode[] = [];
   let list: string[] = [];
+  // 每一行在全文中的起始偏移，用于把预览里的点击换算成正文插入位置
+  const starts: number[] = [];
+  let cursor = 0;
+  for (const line of lines) {
+    starts.push(cursor);
+    cursor += line.length + 1;
+  }
+  const after = (idx: number) => Math.min(md.length, starts[idx] + lines[idx].length);
 
   const flushList = (k: number) => {
     if (!list.length) return;
     blocks.push(
-      <ul key={`ul-${k}`} style={{ margin: "0 0 1em", paddingLeft: 20 }}>
+      <ul key={`ul-${k}`} data-off={after(k - 1)} style={{ margin: "0 0 1em", paddingLeft: 20 }}>
         {list.map((li, i) => (
           <li key={i} style={{ marginBottom: 4 }}>
             {inline(li, `li-${k}-${i}`)}
@@ -77,7 +88,11 @@ function RenderMarkdown({
       const file = img[1];
       const asset = images.find((x) => x.filename === file);
       blocks.push(
-        <figure key={`fig-${idx}`} style={{ margin: "18px 0", textAlign: "center" }}>
+        <figure
+          key={`fig-${idx}`}
+          data-off={after(idx)}
+          style={{ margin: "18px 0", textAlign: "center" }}
+        >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={imageSrc(qid, file)}
@@ -109,6 +124,7 @@ function RenderMarkdown({
       blocks.push(
         <h4
           key={idx}
+          data-off={after(idx)}
           style={{
             fontFamily: "var(--font-kai)",
             fontSize: 15.5,
@@ -126,6 +142,7 @@ function RenderMarkdown({
       blocks.push(
         <h3
           key={idx}
+          data-off={after(idx)}
           style={{
             fontFamily: "var(--font-kai)",
             fontSize: 19,
@@ -148,6 +165,7 @@ function RenderMarkdown({
       blocks.push(
         <blockquote
           key={idx}
+          data-off={after(idx)}
           style={{
             margin: "0 0 1em",
             paddingLeft: 14,
@@ -167,14 +185,27 @@ function RenderMarkdown({
     }
     flushList(idx);
     blocks.push(
-      <p key={idx} style={{ margin: "0 0 1.05em", lineHeight: 2 }}>
+      <p key={idx} data-off={after(idx)} style={{ margin: "0 0 1.05em", lineHeight: 2 }}>
         {inline(line, `p-${idx}`)}
       </p>
     );
   });
   flushList(9999);
 
-  return <div style={{ fontSize: 15, lineHeight: 2, color: "var(--ink)" }}>{blocks}</div>;
+  return (
+    <div
+      style={{ fontSize: 15, lineHeight: 2, color: "var(--ink)" }}
+      onClick={(e) => {
+        if (!onPick) return;
+        const el = (e.target as HTMLElement).closest("[data-off]");
+        if (!el) return;
+        const off = Number(el.getAttribute("data-off"));
+        if (Number.isFinite(off)) onPick(off);
+      }}
+    >
+      {blocks}
+    </div>
+  );
 }
 
 /* ------------------------------------------------------------ 主组件 */
@@ -213,6 +244,11 @@ function DeskInner() {
   const [tab, setTab] = React.useState<"doubt" | "source">("doubt");
   const taRef = React.useRef<HTMLTextAreaElement>(null);
   const dirty = React.useRef(false);
+  // 记住最后一次落下的插入点：编辑态是选区，预览态是点中的段落结尾。
+  // 之前预览态直接 append 到 md 末尾，插图永远跑到文末，这就是那个 bug。
+  const caretRef = React.useRef<number | null>(null);
+  const pendingCaret = React.useRef<number | null>(null);
+  const pendingScroll = React.useRef<number | null>(null);
   const { copy } = useCopy();
 
   const draftId = current?.id ?? "";
@@ -314,23 +350,54 @@ function DeskInner() {
   const max = se.data?.draftMax ?? 1000;
   const good = words >= min && words <= max;
 
+  function noteCaret() {
+    const ta = taRef.current;
+    if (ta) caretRef.current = ta.selectionStart ?? 0;
+  }
+
+  /** 在插入点插入片段。编辑态跟着选区走，预览态用最后点中的段落位置。 */
   function insertAtCursor(snippet: string) {
     const ta = taRef.current;
-    if (!ta) {
-      setMd((v) => v + snippet);
-      return;
+    const inEditor = mode === "edit" && ta != null;
+    const placed = caretRef.current != null || (inEditor && (ta!.selectionStart ?? 0) > 0);
+
+    let start: number;
+    let end: number;
+    if (inEditor && placed) {
+      start = ta!.selectionStart ?? 0;
+      end = ta!.selectionEnd ?? start;
+    } else if (caretRef.current != null) {
+      start = caretRef.current;
+      end = start;
+    } else {
+      // 从没在正文里落过光标，只能接在末尾
+      start = md.length;
+      end = md.length;
     }
-    const start = ta.selectionStart ?? md.length;
-    const end = ta.selectionEnd ?? md.length;
+
     const next = md.slice(0, start) + snippet + md.slice(end);
-    setMd(next);
+    const caret = start + snippet.length;
+    caretRef.current = caret;
+    pendingCaret.current = caret;
+    pendingScroll.current = ta?.scrollTop ?? null;
     dirty.current = true;
-    requestAnimationFrame(() => {
-      ta.focus();
-      const pos = start + snippet.length;
-      ta.setSelectionRange(pos, pos);
-    });
+    setMd(next);
   }
+
+  // 受控 textarea 更新 value 后浏览器会把光标甩到末尾，这里立刻按回插入点，
+  // 并恢复滚动位置，避免插图时整篇往下跳。
+  React.useLayoutEffect(() => {
+    if (mode !== "edit") return;
+    const pos = pendingCaret.current;
+    if (pos == null) return;
+    const ta = taRef.current;
+    if (!ta) return;
+    pendingCaret.current = null;
+    ta.focus({ preventScroll: true });
+    ta.setSelectionRange(pos, pos);
+    if (pendingScroll.current != null) ta.scrollTop = pendingScroll.current;
+    pendingScroll.current = null;
+  }, [md, mode]);
 
   function insertImage(file: string, caption?: string) {
     insertAtCursor(`\n\n[IMG:${file}]\n\n`);
@@ -524,7 +591,7 @@ function DeskInner() {
 
           {images.length === 0 ? (
             <p className="dim" style={{ fontSize: 11.5, marginBottom: 18, lineHeight: 1.7 }}>
-              暂无配图。拟稿时会在权威平台筛选 3-10 张，并记录来源。
+              暂无配图。拟稿时会从你配置的权威平台挑几张备选，点一下插到光标处；正文本身不会自动带图。
             </p>
           ) : (
             <div className="img-grid" style={{ marginBottom: 20 }}>
@@ -687,35 +754,50 @@ function DeskInner() {
           </div>
         </div>
 
-        <div className="desk-edit">
-          {mode === "edit" ? (
-            <textarea
-              ref={taRef}
-              className="editor"
-              value={md}
-              placeholder="在这里落下你的判断。左侧配图点一下就能插到光标处，也可以直接拖进来。"
-              onChange={(e) => {
+        {/* 编辑器常驻不卸载：切到预览时光标位置也不会丢，
+            插图时才能准确插在原来那句话后面 */}
+        <div className="desk-edit" style={mode === "edit" ? undefined : { display: "none" }}>
+          <textarea
+            ref={taRef}
+            className="editor"
+            value={md}
+            placeholder="在这里落下你的判断。左侧配图点一下就能插到光标处，也可以直接拖进来。"
+            onChange={(e) => {
+              dirty.current = true;
+              setMd(e.target.value);
+            }}
+            onSelect={noteCaret}
+            onClick={noteCaret}
+            onKeyUp={noteCaret}
+            onBlur={noteCaret}
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "copy";
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              const text = e.dataTransfer.getData("text/plain");
+              if (text.startsWith("[IMG:")) {
+                insertAtCursor(`\n\n${text}\n\n`);
                 dirty.current = true;
-                setMd(e.target.value);
-              }}
-              onDragOver={(e) => {
-                e.preventDefault();
-                e.dataTransfer.dropEffect = "copy";
-              }}
-              onDrop={(e) => {
-                e.preventDefault();
-                const text = e.dataTransfer.getData("text/plain");
-                if (text.startsWith("[IMG:")) {
-                  insertAtCursor(`\n\n${text}\n\n`);
-                  dirty.current = true;
-                }
-              }}
-              spellCheck={false}
-            />
-          ) : (
-            <RenderMarkdown md={md} qid={current.id} images={images} />
-          )}
+              }
+            }}
+            spellCheck={false}
+          />
         </div>
+
+        {mode === "preview" && (
+          <div className="desk-edit">
+            <RenderMarkdown
+              md={md}
+              qid={current.id}
+              images={images}
+              onPick={(off) => {
+                caretRef.current = off;
+              }}
+            />
+          </div>
+        )}
 
         <div className="desk-toolbar" style={{ borderTop: "1px solid var(--rule)", borderBottom: "none" }}>
           <span className="mono" style={{ color: good ? "var(--moss)" : "var(--ink-3)" }}>

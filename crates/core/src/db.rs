@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS profile_meta (
   summary    TEXT NOT NULL DEFAULT '',
   evidence   TEXT NOT NULL DEFAULT '[]',
   sample_size INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT
+  updated_at TEXT,
+  style      TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS profile_terms (
@@ -291,6 +292,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_column("model_config", "output_limit") {
         conn.execute(
             "ALTER TABLE model_config ADD COLUMN output_limit INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column("profile_meta", "style") {
+        conn.execute(
+            "ALTER TABLE profile_meta ADD COLUMN style TEXT NOT NULL DEFAULT '{}'",
             [],
         )?;
     }

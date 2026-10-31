@@ -214,7 +214,16 @@ def _guess_search_url(source: dict, query: str) -> str | None:
     return None
 
 
-def _fetch_doc(url: str, source: dict) -> dict | None:
+def _allow_image(source: dict) -> bool:
+    """平台是否被允许作为图源。配置里 useFor 不含 image 的，只当文字资料用。
+    老数据没有 useFor 的按允许处理，避免升级后一张图都取不到。"""
+    use_for = source.get("useFor")
+    if not isinstance(use_for, list) or not use_for:
+        return True
+    return "image" in use_for
+
+
+def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: bool = False) -> dict | None:
     try:
         raw, ctype, charset = fetch(url, timeout=10)
     except Exception:
@@ -229,6 +238,10 @@ def _fetch_doc(url: str, source: dict) -> dict | None:
         "text": text[:9000],
         "images": imgs,
         "trust": source.get("trust") or 3,
+        # authority=False 表示这一篇来自通用网页检索兜底，不是用户配置的权威平台。
+        # 这类页面只能当背景资料，绝不能作为图源——否则图库里会混进没授权过的站点。
+        "authority": authority,
+        "allowImage": allow_image,
     }
 
 
@@ -240,8 +253,8 @@ def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float 
         [s for s in sources if s.get("enabled", True)],
         key=lambda s: -int(s.get("trust") or 3),
     )
-    urls: list[tuple[str, dict]] = []
-    json_hits: list[tuple[str, str, dict]] = []
+    urls: list[tuple[str, dict, bool]] = []
+    json_hits: list[tuple[str, str, dict, bool]] = []
 
     for s in ordered:
         if len(urls) + len(json_hits) >= max_pages * 2:
@@ -251,10 +264,11 @@ def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float 
         base = (s.get("baseUrl") or "").rstrip("/")
         if not base or _is_bad(base):
             continue
+        allow_img = _allow_image(s)
 
         if s.get("kind") == "wiki" or "wiki" in base:
             for hit in mediawiki_search(base, query, limit=2):
-                urls.append((hit["url"], s))
+                urls.append((hit["url"], s, allow_img))
             continue
 
         surl = _guess_search_url(s, query)
@@ -268,7 +282,9 @@ def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float 
             try:
                 data = json.loads(_decode(raw, charset))
                 for h in (data.get("hits") or [])[:2]:
-                    json_hits.append((f"https://modrinth.com/mod/{h.get('slug')}", h.get("slug", ""), s))
+                    json_hits.append(
+                        (f"https://modrinth.com/mod/{h.get('slug')}", h.get("slug", ""), s, allow_img)
+                    )
             except Exception:
                 pass
             continue
@@ -282,18 +298,20 @@ def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float 
                     "text": text[:5000],
                     "images": imgs,
                     "trust": (s.get("trust") or 3) - 1,
+                    "authority": True,
+                    "allowImage": allow_img,
                 }
             )
         if len(docs) >= max_pages:
             return docs
 
-    urls.extend((u, s) for u, _slug, s in json_hits)
+    urls.extend((u, s, allow) for u, _slug, s, allow in json_hits)
     if not urls:
         return docs
 
     limit = max(1, max_pages - len(docs))
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(urls))) as pool:
-        futures = [pool.submit(_fetch_doc, u, s) for u, s in urls[: limit * 2]]
+        futures = [pool.submit(_fetch_doc, u, s, True, allow) for u, s, allow in urls[: limit * 2]]
         for fut in concurrent.futures.as_completed(futures, timeout=25 if not deadline else max(5, deadline - time.time())):
             try:
                 d = fut.result()
@@ -383,10 +401,16 @@ def _sniff_ext(raw: bytes) -> str | None:
 
 
 def pick_image_urls(docs: list[dict], want: int) -> list[tuple[str, str, str]]:
-    """返回 [(url, sourceName, 所在页面)]，按可信度优先，去重。"""
+    """返回 [(url, sourceName, 所在页面)]，按可信度优先，去重。
+
+    只收用户配置的权威平台页面的图（authority 且 allowImage）：
+    通用网页检索兜底来的页面，哪怕图再多也不收，否则图库里会冒出
+    用户根本没有授权过的站点（比如 mc.163.com）。"""
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for d in docs:
+        if not (d.get("authority") and d.get("allowImage")):
+            continue
         for u in d.get("images", []):
             low = u.lower()
             if any(b in low for b in BAD_IMG_HINTS):

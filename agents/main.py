@@ -34,6 +34,34 @@ DATA_DIR = os.path.join(os.getcwd(), "data")
 
 # ---------------------------------------------------------------- profile
 
+def _str_list(value, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+STYLE_FIELDS = (
+    "voice", "structure", "sentence", "pacing", "formatting", "examples", "length", "guide",
+)
+
+
+def _norm_style(raw) -> dict:
+    """把模型给的文风档案收成固定结构，缺字段填空串，前端与提示词都按同一套读。"""
+    raw = raw if isinstance(raw, dict) else {}
+    style = {k: str(raw.get(k) or "").strip() for k in STYLE_FIELDS}
+    style["openers"] = _str_list(raw.get("openers"), 4)
+    style["signature"] = _str_list(raw.get("signature"), 6)
+    style["avoid"] = _str_list(raw.get("avoid"), 4)
+    return style
+
+
 def do_profile(payload: dict) -> dict:
     samples = payload.get("samples") or []
     cfg = payload.get("model") or {}
@@ -43,9 +71,10 @@ def do_profile(payload: dict) -> dict:
     lines = []
     for s in samples[:24]:
         head = "回答" if s.get("kind") == "answer" else "文章"
-        lines.append(
-            f"- [{head}] {s.get('title', '')}｜赞同 {s.get('voteups', 0)}｜{s.get('text', '')[:90]}"
-        )
+        # 文风要靠句式判断，90 字看不出节奏，这里给到 260 字；
+        # 24 条 × 260 字 ≈ 6000 字，仍在常见模型的上下文预算之内。
+        body = re.sub(r"\s+", " ", (s.get("text") or "")).strip()[:260]
+        lines.append(f"- [{head}] {s.get('title', '')}｜赞同 {s.get('voteups', 0)}｜{body}")
     block = "\n".join(lines)
 
     try:
@@ -56,9 +85,9 @@ def do_profile(payload: dict) -> dict:
                 {"role": "user", "content": f"以下是该答主的 {len(samples)} 条历史内容：\n\n{block}"},
             ],
             temperature=0.2,
-            max_tokens=8000,
-            retry_tokens=12000,
-            timeout=120,
+            max_tokens=10000,
+            retry_tokens=16000,
+            timeout=150,
         )
     except llm.LLMError:
         data = llm.chat_json(
@@ -68,8 +97,8 @@ def do_profile(payload: dict) -> dict:
                 {"role": "user", "content": f"历史内容：\n{block}"},
             ],
             temperature=0.1,
-            max_tokens=4000,
-            retry_tokens=6000,
+            max_tokens=5000,
+            retry_tokens=8000,
             timeout=90,
         )
 
@@ -99,6 +128,7 @@ def do_profile(payload: dict) -> dict:
         "summary": (data.get("summary") or "").strip(),
         "evidence": [str(e) for e in (data.get("evidence") or [])][:6],
         "terms": terms,
+        "style": _norm_style(data.get("style")),
         "sampleSize": len(samples),
     }
 
@@ -224,35 +254,42 @@ def _fmt_docs(docs: list[dict], budget: int = 11000) -> str:
     return "".join(parts) if parts else "（本次没有检索到可用资料，请仅凭公认常识作答，并把所有具体数值列入待核实项）"
 
 
-def _fmt_images(images: list[dict]) -> str:
-    if not images:
-        return "（没有可用配图，正文中不要出现 [IMG:] 占位）"
-    return "\n".join(f"- {i['filename']}｜来源 {i['sourceName']}" for i in images)
-
-
-def _ensure_image_placeholders(markdown: str, images: list[dict]) -> str:
-    if not images:
-        return re.sub(r"\[IMG:[^\]]*\]", "", markdown)
-    existing = re.findall(r"\[IMG:([^\]]+)\]", markdown)
-    valid = {i["filename"] for i in images}
-    # 剔除模型编造的占位
-    markdown = re.sub(
-        r"\[IMG:([^\]]+)\]",
-        lambda m: m.group(0) if m.group(1) in valid else "",
-        markdown,
+def _fmt_style(style) -> str:
+    """把画像里的文风档案摊成提示词块。字段缺了就跳过，不要留空标题。"""
+    if not isinstance(style, dict):
+        return "（暂无文风档案，按老练答主的常规写法作答）"
+    labels = (
+        ("voice", "语气与人称"),
+        ("structure", "结构套路"),
+        ("sentence", "句子节奏"),
+        ("pacing", "详略取舍"),
+        ("formatting", "排版习惯"),
+        ("examples", "论据偏好"),
+        ("length", "常见篇幅"),
     )
-    existing = [f for f in existing if f in valid]
-    if existing:
-        return markdown
-    # 模型一张都没插：按段落均分补上
-    paras = [p for p in markdown.split("\n\n") if p.strip()]
-    if not paras:
-        return markdown
-    step = max(1, len(paras) // (len(images) + 1))
-    for idx, img in enumerate(images):
-        pos = min(len(paras) - 1, (idx + 1) * step)
-        paras[pos] = paras[pos] + f"\n\n[IMG:{img['filename']}]"
-    return "\n\n".join(paras)
+    parts = [
+        f"- {label}：{str(style.get(key) or '').strip()}"
+        for key, label in labels
+        if str(style.get(key) or "").strip()
+    ]
+    for key, label in (("openers", "常用开头"), ("signature", "口头禅"), ("avoid", "忌用写法")):
+        items = [str(x).strip() for x in (style.get(key) or []) if str(x).strip()]
+        if items:
+            parts.append(f"- {label}：" + "；".join(items))
+    guide = str(style.get("guide") or "").strip()
+    if guide:
+        parts.append(f"- 写作指令（必须遵守）：{guide}")
+    return "\n".join(parts) if parts else "（暂无文风档案，按老练答主的常规写法作答）"
+
+
+def _strip_images(markdown: str) -> str:
+    """正文一律不留图片：清掉模型自作主张写的占位符和 Markdown 图片。
+    配图改成答主在编辑器里手动插入，模型不再参与排图。"""
+    markdown = re.sub(r"^[ \t]*\[IMG:[^\]]*\][ \t]*\r?\n?", "", markdown, flags=re.M)
+    markdown = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", markdown)
+    markdown = re.sub(r"[ \t]{2,}", " ", markdown)
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
+    return markdown.strip()
 
 
 def _verify_doubts(doubts: list[dict], docs: list[dict], cfg: dict, deadline: float) -> list[dict]:
@@ -311,7 +348,6 @@ def do_research(payload: dict) -> dict:
     draft_min = int(st.get("draftMin") or 500)
     draft_max = int(st.get("draftMax") or 1000)
     image_max = int(st.get("imageMax") or 8)
-    image_min = int(st.get("imageMin") or 3)
 
     # 整条流水线的硬时限：不能让用户对着转圈等二十分钟。
     budget = float(payload.get("deadlineSeconds") or 300)
@@ -369,7 +405,8 @@ def do_research(payload: dict) -> dict:
     if not docs:
         warnings.append("没有检索到权威资料，初稿仅凭常识生成，请重点核对数值")
 
-    # 3) 取图（并行，最多占 40 秒，取不到就少图，不阻塞起草）
+    # 3) 备选配图：只从用户配置的权威平台取（兜底网页检索来的页面一律不取图），
+    #    取到的图只进左栏素材区，由答主自己决定插不插、插在哪。
     t0 = time.time()
     images: list[dict] = []
     if deadline - time.time() > 40:
@@ -378,8 +415,8 @@ def do_research(payload: dict) -> dict:
             cands, img_dir, want=image_max,
             deadline=min(deadline, time.time() + 40),
         )
-    if len(images) < image_min:
-        warnings.append(f"可用配图只有 {len(images)} 张，低于设定的 {image_min} 张")
+    if not images:
+        warnings.append("权威平台没有取到可用配图，需要插图时请自己补一张")
     mark("images", t0)
 
     # 4) 起草
@@ -395,8 +432,8 @@ def do_research(payload: dict) -> dict:
         excerpt=q.get("excerpt", "") or "（无补充说明）",
         tags="、".join(q.get("tags") or []) or "（无）",
         profile=profile_text or "（暂无画像）",
+        style=_fmt_style(profile.get("style")),
         docs=_fmt_docs(docs),
-        images=_fmt_images(images),
     )
     t0 = time.time()
     remaining = max(45, int(deadline - time.time()))
@@ -429,6 +466,8 @@ def do_research(payload: dict) -> dict:
     markdown = (data.get("markdown") or "").strip()
     if not markdown:
         raise llm.LLMError("模型返回的正文为空")
+    # 初稿一律不带图：占位符、Markdown 图片都在这里清掉
+    markdown = _strip_images(markdown)
 
     # doubts 可能是 [{"text": ...}]，也可能只是字符串数组，两种都收
     raw_doubts = data.get("doubts") or []
@@ -459,7 +498,6 @@ def do_research(payload: dict) -> dict:
     mark("verify", t0)
     # 若核查给出了更正，把更正内容作为"批注"留在 doubts 里，正文不自动改，
     # 让答主在批阅台自己决定怎么改——这是本产品的核心主张：AI 不直接定稿。
-    markdown = _ensure_image_placeholders(markdown, images)
 
     citations = []
     for c in (data.get("citations") or [])[:6]:

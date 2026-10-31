@@ -51,6 +51,20 @@ export interface ProfileTerm {
   note: string;
 }
 
+export interface ProfileStyle {
+  voice: string;
+  structure: string;
+  sentence: string;
+  openers: string[];
+  signature: string[];
+  pacing: string;
+  formatting: string;
+  examples: string;
+  avoid: string[];
+  length: string;
+  guide: string;
+}
+
 export interface Profile {
   status: "empty" | "running" | "ready";
   summary: string;
@@ -58,6 +72,7 @@ export interface Profile {
   terms: ProfileTerm[];
   evidence: string[];
   sampleSize: number;
+  style: ProfileStyle;
 }
 
 export interface Source {

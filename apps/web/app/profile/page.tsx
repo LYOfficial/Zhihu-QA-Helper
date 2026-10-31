@@ -12,7 +12,7 @@ import {
 } from "@/components/ui";
 import { api, toast } from "@/lib/api";
 import { useLoad } from "@/lib/hooks";
-import type { Job, Profile, ProfileTerm } from "@/lib/types";
+import type { Job, Profile, ProfileStyle, ProfileTerm } from "@/lib/types";
 
 const GROUPS: { key: ProfileTerm["kind"]; label: string; hint: string }[] = [
   { key: "primary", label: "主领域", hint: "账号的立身之本，最多两个" },
@@ -20,10 +20,24 @@ const GROUPS: { key: ProfileTerm["kind"]; label: string; hint: string }[] = [
   { key: "adjacent", label: "附属领域", hint: "答过且表现不差，可以迁移过去的方向" },
 ];
 
+const STYLE_ROWS: {
+  key: "voice" | "structure" | "sentence" | "pacing" | "formatting" | "examples" | "length";
+  label: string;
+}[] = [
+  { key: "voice", label: "语气与人称" },
+  { key: "structure", label: "结构套路" },
+  { key: "sentence", label: "句子节奏" },
+  { key: "pacing", label: "详略取舍" },
+  { key: "formatting", label: "排版习惯" },
+  { key: "examples", label: "论据偏好" },
+  { key: "length", label: "常见篇幅" },
+];
+
 export default function ProfilePage() {
   const p = useLoad<Profile>(() => api.get("/api/profile"));
   const [terms, setTerms] = React.useState<ProfileTerm[]>([]);
   const [summary, setSummary] = React.useState("");
+  const [style, setStyle] = React.useState<ProfileStyle | null>(null);
   const [dirty, setDirty] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [analyzing, setAnalyzing] = React.useState(false);
@@ -35,6 +49,7 @@ export default function ProfilePage() {
     if (p.data) {
       setTerms(p.data.terms);
       setSummary(p.data.summary);
+      setStyle(p.data.style ?? null);
       setDirty(false);
       setAnalyzing(p.data.status === "running");
     }
@@ -105,7 +120,7 @@ export default function ProfilePage() {
   async function save() {
     setBusy(true);
     try {
-      await api.put("/api/profile", { summary, terms });
+      await api.put("/api/profile", { summary, terms, style });
       toast("画像已保存", "ok");
       setDirty(false);
       p.reload(true);
@@ -232,6 +247,110 @@ export default function ProfilePage() {
                     <span>{e}</span>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {style && (style.guide || style.voice) && (
+              <div style={{ margin: "6px 0 30px" }}>
+                <SectionTitle right={<span className="dim">拟稿时会照着这份写</span>}>
+                  文章风格
+                </SectionTitle>
+                <div
+                  style={{
+                    border: "1px solid var(--rule)",
+                    background: "var(--paper-raised)",
+                    padding: "10px 14px",
+                  }}
+                >
+                  {STYLE_ROWS.map(({ key, label }) => {
+                    const text = String(style[key] ?? "").trim();
+                    if (!text) return null;
+                    return (
+                      <div
+                        key={key}
+                        style={{
+                          display: "flex",
+                          gap: 14,
+                          padding: "6px 0",
+                          borderBottom: "1px dotted var(--rule-2)",
+                        }}
+                      >
+                        <span
+                          style={{
+                            width: 72,
+                            flexShrink: 0,
+                            fontSize: 11.5,
+                            color: "var(--ink-3)",
+                          }}
+                        >
+                          {label}
+                        </span>
+                        <span style={{ fontSize: 12.5, lineHeight: 1.75, color: "var(--ink-2)" }}>
+                          {text}
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {[
+                    { label: "常用开头", items: style.openers },
+                    { label: "口头禅", items: style.signature },
+                    { label: "忌用写法", items: style.avoid },
+                  ]
+                    .filter((g) => (g.items ?? []).length > 0)
+                    .map((g) => (
+                      <div
+                        key={g.label}
+                        style={{
+                          display: "flex",
+                          gap: 14,
+                          padding: "7px 0",
+                          borderBottom: "1px dotted var(--rule-2)",
+                        }}
+                      >
+                        <span
+                          style={{
+                            width: 72,
+                            flexShrink: 0,
+                            fontSize: 11.5,
+                            color: "var(--ink-3)",
+                          }}
+                        >
+                          {g.label}
+                        </span>
+                        <span style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                          {g.items.map((x, i) => (
+                            <span key={i} className="chip">
+                              {x}
+                            </span>
+                          ))}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+                <div style={{ marginTop: 12 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "baseline",
+                      justifyContent: "space-between",
+                      marginBottom: 6,
+                    }}
+                  >
+                    <span className="eyebrow">写作指令</span>
+                    <span className="dim" style={{ fontSize: 11 }}>
+                      这段会原文进拟稿提示词，可以直接改
+                    </span>
+                  </div>
+                  <textarea
+                    className="textarea"
+                    style={{ minHeight: 110, fontSize: 12.5, lineHeight: 1.8 }}
+                    value={style.guide}
+                    onChange={(e) => {
+                      setStyle({ ...style, guide: e.target.value });
+                      setDirty(true);
+                    }}
+                  />
+                </div>
               </div>
             )}
 
@@ -407,6 +526,7 @@ export default function ProfilePage() {
                 if (p.data) {
                   setTerms(p.data.terms);
                   setSummary(p.data.summary);
+                  setStyle(p.data.style ?? null);
                   setDirty(false);
                 }
               }}

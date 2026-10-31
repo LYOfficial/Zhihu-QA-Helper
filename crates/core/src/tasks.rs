@@ -509,7 +509,7 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         &format!("正在整理 {} 条历史内容", sample),
     )
     .await;
-    job_step(state, job, "模型归纳", 0.58, "正在归纳主领域与边界").await;
+    job_step(state, job, "模型归纳", 0.58, "正在归纳主领域、边界与文风").await;
 
     let model = {
         let db = state.db.lock().await;
@@ -543,6 +543,8 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         .and_then(|x| x.as_array())
         .cloned()
         .unwrap_or_default();
+    // 文风档案：拟稿时直接喂给写作模型，缺了也要落一个空对象，别让老库报错
+    let style = resp.get("style").cloned().unwrap_or_else(|| json!({}));
 
     {
         let db = state.db.lock().await;
@@ -593,13 +595,19 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         }
 
         let _ = db.conn.execute(
-            "UPDATE profile_meta SET status='ready', summary=?1, evidence=?2, sample_size=?3, updated_at=?4 WHERE id=1",
-            params![summary, serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".into()), sample as i64, now_iso()],
+            "UPDATE profile_meta SET status='ready', summary=?1, evidence=?2, sample_size=?3, style=?4, updated_at=?5 WHERE id=1",
+            params![
+                summary,
+                serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".into()),
+                sample as i64,
+                style.to_string(),
+                now_iso()
+            ],
         );
         db.log_event(
             "profile",
             None,
-            "更新领域画像",
+            "更新领域画像与文风档案",
             &format!("基于 {sample} 篇内容"),
         );
     }
@@ -788,7 +796,7 @@ async fn agent_research_with_progress(
 }
 
 async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
-    let (question, terms, meta_summary, sources, model, settings) = {
+    let (question, terms, meta_summary, meta_style, sources, model, settings) = {
         let db = state.db.lock().await;
         let q = db
             .conn
@@ -834,6 +842,16 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             })
             .unwrap_or_default();
 
+        let style: Value = db
+            .conn
+            .query_row("SELECT style FROM profile_meta WHERE id=1", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| json!({}));
+
         let mut stmt = db.conn.prepare(
             "SELECT id, domain, name, base_url, kind, trust, enabled, notes, use_for, discovered_by, ok FROM sources WHERE enabled = 1",
         )?;
@@ -877,7 +895,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             .collect();
         drop(tstmt);
 
-        (q, terms, summary, src, load_model(&db), s)
+        (q, terms, summary, style, src, load_model(&db), s)
     };
 
     {
@@ -895,7 +913,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
 
     let payload = json!({
         "question": question.clone(),
-        "profile": { "summary": meta_summary, "terms": terms },
+        "profile": { "summary": meta_summary, "terms": terms, "style": meta_style },
         "sources": sources,
         "model": model,
         "settings": settings,

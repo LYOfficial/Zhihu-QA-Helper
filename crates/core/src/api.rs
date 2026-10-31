@@ -432,14 +432,28 @@ async fn refresh_me(State(st): State<Shared>) -> R {
 
 async fn get_profile(State(st): State<Shared>) -> R {
     let db = st.db.lock().await;
-    let (status, summary, evidence, sample, updated): (String, String, String, i64, Option<String>) = db
+    let (status, summary, evidence, sample, updated, style_json): (
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        String,
+    ) = db
         .conn
         .query_row(
-            "SELECT status, summary, evidence, sample_size, updated_at FROM profile_meta WHERE id=1",
+            "SELECT status, summary, evidence, sample_size, updated_at, style FROM profile_meta WHERE id=1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
-        .unwrap_or(("empty".into(), "".into(), "[]".into(), 0, None));
+        .unwrap_or((
+            "empty".into(),
+            "".into(),
+            "[]".into(),
+            0,
+            None,
+            "{}".into(),
+        ));
 
     let mut stmt = db.conn.prepare(
         "SELECT id, kind, label, weight, keywords, locked, note FROM profile_terms ORDER BY ord, weight DESC",
@@ -466,6 +480,7 @@ async fn get_profile(State(st): State<Shared>) -> R {
         terms,
         evidence: serde_json::from_str(&evidence).unwrap_or_default(),
         sample_size: sample,
+        style: serde_json::from_str::<ProfileStyle>(&style_json).unwrap_or_default(),
     })))
 }
 
@@ -512,6 +527,8 @@ async fn put_profile(State(st): State<Shared>, Json(body): Json<Value>) -> R {
         .cloned()
         .unwrap_or_default();
     let summary = body.get("summary").and_then(|x| x.as_str()).unwrap_or("");
+    // 文风档案允许答主自己改（尤其是 guide 那段写作指令），传了对象就整体覆盖
+    let style = body.get("style").cloned().unwrap_or(Value::Null);
     {
         let db = st.db.lock().await;
         let _ = db.conn.execute("DELETE FROM profile_terms", []);
@@ -541,10 +558,17 @@ async fn put_profile(State(st): State<Shared>, Json(body): Json<Value>) -> R {
                 ],
             );
         }
-        let _ = db.conn.execute(
-            "UPDATE profile_meta SET summary=?1, updated_at=?2 WHERE id=1",
-            params![summary, now_iso()],
-        );
+        if style.is_object() {
+            let _ = db.conn.execute(
+                "UPDATE profile_meta SET summary=?1, style=?2, updated_at=?3 WHERE id=1",
+                params![summary, style.to_string(), now_iso()],
+            );
+        } else {
+            let _ = db.conn.execute(
+                "UPDATE profile_meta SET summary=?1, updated_at=?2 WHERE id=1",
+                params![summary, now_iso()],
+            );
+        }
         db.log_event("profile", None, "手动修订领域词条", "");
     }
     get_profile(State(st)).await
