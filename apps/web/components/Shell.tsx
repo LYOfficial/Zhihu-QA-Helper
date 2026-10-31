@@ -29,6 +29,48 @@ import {
 
 type Toast = { id: number; msg: string; kind: "ok" | "err" | "info" };
 
+function WindowTitlebar() {
+  const [maximized, setMaximized] = React.useState(false);
+
+  async function withWindow(action: (win: import("@tauri-apps/api/window").Window) => Promise<void>) {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    await action(getCurrentWindow());
+  }
+
+  async function toggleMaximize() {
+    await withWindow(async (win) => {
+      await win.toggleMaximize();
+      setMaximized(await win.isMaximized());
+    });
+  }
+
+  return (
+    <header className="app-titlebar" data-tauri-drag-region>
+      <Link href="/" className="app-titlebar-brand" data-tauri-drag-region>
+        <span className="mark"><Seal size={20} /></span>
+        <span>知乎答主助手</span>
+      </Link>
+      <div className="app-window-actions" data-tauri-drag-region="false">
+        <button aria-label="最小化" onClick={() => withWindow((win) => win.minimize())}>−</button>
+        <button aria-label={maximized ? "还原" : "最大化"} onClick={toggleMaximize}>
+          {maximized ? "❐" : "□"}
+        </button>
+        <button className="close" aria-label="关闭" onClick={() => withWindow((win) => win.close())}>×</button>
+      </div>
+    </header>
+  );
+}
+
+function DesktopFrame({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="app-window">
+      <WindowTitlebar />
+      {children}
+    </div>
+  );
+}
+
 const GROUPS = [
   {
     label: "工作台",
@@ -143,13 +185,13 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     </div>
   );
 
-  if (mode === "unknown") return <Boot text="正在唤起本地内核…" />;
-  if (mode === "offline") return <Offline onRetry={retry} />;
-  if (session.loading && !session.data) return <Boot text="正在读取登录状态…" />;
+  if (mode === "unknown") return <DesktopFrame><Boot text="正在唤起本地内核…" /></DesktopFrame>;
+  if (mode === "offline") return <DesktopFrame><Offline onRetry={retry} /></DesktopFrame>;
+  if (session.loading && !session.data) return <DesktopFrame><Boot text="正在读取登录状态…" /></DesktopFrame>;
 
   if (!session.data?.loggedIn) {
     return (
-      <>
+      <DesktopFrame>
         <LoginScreen
           theme={theme}
           onThemeChange={changeTheme}
@@ -158,7 +200,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
           }}
         />
         {toastHost}
-      </>
+      </DesktopFrame>
     );
   }
 
@@ -168,16 +210,9 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   const paperTheme = theme === "paper";
 
   return (
+    <DesktopFrame>
     <div className="app">
       <aside className="side">
-        <Link href="/" className="side-brand">
-          <span className="mark">
-            <Seal size={24} />
-          </span>
-          <span className="name">知乎答主助手</span>
-          <span className="ver">v0.1</span>
-        </Link>
-
         <div className="side-scroll">
           {GROUPS.map((g) => (
             <div className="side-group" key={g.label}>
@@ -258,5 +293,6 @@ export default function Shell({ children }: { children: React.ReactNode }) {
 
       {toastHost}
     </div>
+    </DesktopFrame>
   );
 }

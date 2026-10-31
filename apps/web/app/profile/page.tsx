@@ -28,6 +28,7 @@ export default function ProfilePage() {
   const [busy, setBusy] = React.useState(false);
   const [analyzing, setAnalyzing] = React.useState(false);
   const [job, setJob] = React.useState<Job | null>(null);
+  const jobIdRef = React.useRef<string | null>(null);
   const [kwEdit, setKwEdit] = React.useState<string | null>(null);
 
   React.useEffect(() => {
@@ -35,21 +36,27 @@ export default function ProfilePage() {
       setTerms(p.data.terms);
       setSummary(p.data.summary);
       setDirty(false);
+      setAnalyzing(p.data.status === "running");
     }
   }, [p.data]);
 
   React.useEffect(() => {
-    if (!analyzing) return;
+    const running = analyzing || p.data?.status === "running";
+    if (!running) return;
     let alive = true;
     const poll = async () => {
       try {
         const r = await api.get<{ jobs: Job[] }>("/api/jobs");
-        const current = r.jobs.find((x) => x.kind === "profile");
-        if (!alive || !current) return;
-        setJob(current);
+        const current = r.jobs.find(
+          (x) => x.kind === "profile" && (!jobIdRef.current || x.id === jobIdRef.current)
+        );
+        if (!alive) return;
+        if (current) setJob(current);
+        if (!current) return;
         if (current.state === "done" || current.state === "failed") {
           setAnalyzing(false);
           setBusy(false);
+          jobIdRef.current = null;
           if (current.state === "done") {
             toast("领域画像已更新", "ok");
             p.reload(true);
@@ -67,7 +74,7 @@ export default function ProfilePage() {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [analyzing, p.reload]);
+  }, [analyzing, p.data?.status, p.reload]);
 
   function patch(id: string, next: Partial<ProfileTerm>) {
     setTerms((t) => t.map((x) => (x.id === id ? { ...x, ...next } : x)));
@@ -114,7 +121,8 @@ export default function ProfilePage() {
       setBusy(true);
       setAnalyzing(true);
       setJob(null);
-      await api.post("/api/profile/analyze");
+      const started = await api.post<{ jobId?: string }>("/api/profile/analyze");
+      jobIdRef.current = started.jobId ?? null;
       toast("已开始分析，进度会实时显示", "ok");
     } catch (e) {
       setBusy(false);
@@ -174,10 +182,11 @@ export default function ProfilePage() {
         </div>
       )}
 
-      {status === "empty" ? (
+      {status === "empty" || status === "running" ? (
         <Empty glyph="画">
-          画像还是空的。点右上角「重新分析」，我会读你最近的回答与文章，
-          归纳出主领域、子领域和可迁移的附属领域。
+          {status === "running"
+            ? "画像分析正在后台进行。你可以切换页面，回来后会继续显示实时进度。"
+            : "画像还是空的。点右上角「重新分析」，我会读你最近的回答与文章，归纳出主领域、子领域和可迁移的附属领域。"}
         </Empty>
       ) : (
         <div className="split">

@@ -199,8 +199,74 @@ p {
 .app {
   display: grid;
   grid-template-columns: var(--side) minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app-window {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
   height: 100vh;
   overflow: hidden;
+  border-radius: 14px;
+  background: var(--paper);
+}
+
+html,
+body,
+html[data-theme="paper"] body {
+  background: transparent;
+}
+
+.app-titlebar {
+  display: flex;
+  align-items: center;
+  height: 38px;
+  flex: 0 0 38px;
+  padding-left: 14px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--paper-raised);
+  user-select: none;
+}
+.app-titlebar-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-family: var(--font-kai);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-decoration: none;
+}
+.app-titlebar-brand:hover {
+  text-decoration: none;
+}
+.app-titlebar-brand .mark {
+  display: grid;
+  place-items: center;
+  color: var(--cinnabar);
+}
+.app-window-actions {
+  display: flex;
+  align-self: stretch;
+  margin-left: auto;
+}
+.app-window-actions button {
+  width: 46px;
+  height: 100%;
+  color: var(--ink-2);
+  font-size: 17px;
+  line-height: 1;
+}
+.app-window-actions button:hover {
+  background: var(--blue-wash);
+  color: var(--ink);
+}
+.app-window-actions button.close:hover {
+  background: #d94f4f;
+  color: #fff;
 }
 
 /* ---------------- 左侧导航 ---------------- */
@@ -212,40 +278,6 @@ p {
   border-right: 1px solid var(--rule);
   background: var(--paper-raised);
   padding: 0 0 8px;
-}
-
-.side-brand {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 13px 14px 13px;
-  border-bottom: 1px solid var(--rule);
-  color: var(--ink);
-  text-decoration: none;
-  flex-shrink: 0;
-}
-.side-brand:hover {
-  text-decoration: none;
-}
-.side-brand .mark {
-  color: var(--cinnabar);
-  flex-shrink: 0;
-  display: grid;
-  place-items: center;
-}
-.side-brand .name {
-  font-family: var(--font-kai);
-  font-size: 15.5px;
-  letter-spacing: 0.04em;
-  line-height: 1.2;
-  white-space: nowrap;
-}
-.side-brand .ver {
-  margin-left: auto;
-  font-size: 9.5px;
-  color: var(--ink-4);
-  letter-spacing: 0.06em;
-  font-family: var(--font-num);
 }
 
 .side-scroll {

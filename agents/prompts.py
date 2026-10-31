@@ -25,6 +25,11 @@ PROFILE_SYSTEM = """你是一名内容策略分析师，专门帮中文平台的
   ]
 }"""
 
+PROFILE_COMPACT_SYSTEM = """请根据历史内容生成极简领域画像，只输出合法 JSON，不要 Markdown 代码块。
+summary 不超过 90 个汉字，evidence 只给 2 条，terms 最多 7 条；每个词条只给 3 个关键词。
+结构必须是：
+{"summary":"...","evidence":["...","..."],"terms":[{"kind":"primary|sub|adjacent","label":"...","weight":0.6,"keywords":["..."],"note":"..."}]}"""
+
 
 SOURCES_SYSTEM = """你是事实核查员，负责为某个领域的答主配置「权威平台清单」。
 

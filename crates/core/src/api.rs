@@ -405,13 +405,33 @@ async fn get_profile(State(st): State<Shared>) -> R {
 }
 
 async fn analyze_profile(State(st): State<Shared>) -> R {
+    {
+        let db = st.db.lock().await;
+        let running: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT id FROM jobs WHERE kind='profile' AND state='running' ORDER BY started_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = running {
+            return Ok(Json(json!({ "ok": true, "message": "画像分析已经在进行中", "jobId": id })));
+        }
+    }
+    let job_id = tasks::job_start(&st, "profile", None, "读取历史回答").await;
+    {
+        let db = st.db.lock().await;
+        let _ = db.conn.execute("UPDATE profile_meta SET status='running' WHERE id=1", []);
+    }
     let st2 = st.clone();
+    let job_id2 = job_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = tasks::run_profile(&st2).await {
+        if let Err(e) = tasks::run_profile_job(&st2, job_id2).await {
             tracing::warn!("画像分析失败: {e}");
         }
     });
-    Ok(Json(json!({ "ok": true, "message": "已开始分析历史内容" })))
+    Ok(Json(json!({ "ok": true, "message": "已开始分析历史内容", "jobId": job_id })))
 }
 
 async fn put_profile(State(st): State<Shared>, Json(body): Json<Value>) -> R {

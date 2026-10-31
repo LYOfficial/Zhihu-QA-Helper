@@ -39,10 +39,10 @@ def do_profile(payload: dict) -> dict:
         raise llm.LLMError("没有可分析的历史内容")
 
     lines = []
-    for s in samples[:48]:
+    for s in samples[:24]:
         head = "回答" if s.get("kind") == "answer" else "文章"
         lines.append(
-            f"- [{head}] {s.get('title', '')}｜赞同 {s.get('voteups', 0)}｜{s.get('text', '')[:120]}"
+            f"- [{head}] {s.get('title', '')}｜赞同 {s.get('voteups', 0)}｜{s.get('text', '')[:90]}"
         )
     block = "\n".join(lines)
 
@@ -53,10 +53,23 @@ def do_profile(payload: dict) -> dict:
             {"role": "user", "content": f"以下是该答主的 {len(samples)} 条历史内容：\n\n{block}"},
         ],
         temperature=0.2,
-        max_tokens=2600,
+        max_tokens=12000,
         json_mode=True,
     )
-    data = llm.extract_json(raw)
+    try:
+        data = llm.extract_json(raw)
+    except llm.LLMError:
+        compact = llm.chat(
+            cfg,
+            [
+                {"role": "system", "content": prompts.PROFILE_COMPACT_SYSTEM},
+                {"role": "user", "content": f"历史内容：\n{block}"},
+            ],
+            temperature=0.1,
+            max_tokens=4000,
+            json_mode=True,
+        )
+        data = llm.extract_json(compact)
 
     terms = []
     for t in data.get("terms") or []:
@@ -106,10 +119,13 @@ def do_sources(payload: dict) -> dict:
             },
         ],
         temperature=0.2,
-        max_tokens=1800,
+        max_tokens=4000,
         json_mode=True,
     )
-    data = llm.extract_json(raw)
+    try:
+        data = llm.extract_json(raw)
+    except llm.LLMError:
+        data = {}
     out = []
     for s in (data.get("sources") or [])[:8]:
         name = (s.get("name") or "").strip()
@@ -128,6 +144,44 @@ def do_sources(payload: dict) -> dict:
                 "notes": (s.get("notes") or "").strip(),
             }
         )
+    if not out:
+        minecraft = any(
+            key in " ".join(domains).lower()
+            for key in ("minecraft", "我的世界", "红石", "mc")
+        )
+        if minecraft:
+            out = [
+                {
+                    "domain": domains[0],
+                    "name": "Minecraft Wiki",
+                    "baseUrl": "https://minecraft.wiki/",
+                    "kind": "wiki",
+                    "trust": 5,
+                    "useFor": ["fact", "image"],
+                    "notes": "查阅方块、实体、机制和版本变更。",
+                },
+                {
+                    "domain": domains[0],
+                    "name": "Minecraft 官方网站",
+                    "baseUrl": "https://www.minecraft.net/",
+                    "kind": "official",
+                    "trust": 5,
+                    "useFor": ["fact"],
+                    "notes": "查阅官方版本公告和产品信息。",
+                },
+            ]
+        else:
+            out = [
+                {
+                    "domain": domains[0],
+                    "name": "维基百科",
+                    "baseUrl": "https://zh.wikipedia.org/",
+                    "kind": "wiki",
+                    "trust": 4,
+                    "useFor": ["fact"],
+                    "notes": "作为领域基础事实的起点，重要结论需交叉验证。",
+                }
+            ]
     return {"sources": out}
 
 

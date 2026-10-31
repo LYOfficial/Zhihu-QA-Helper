@@ -51,7 +51,11 @@ fn spawn_core() -> Option<Child> {
     }
     let path = find_core_binary()?;
     let mut cmd = Command::new(path);
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    if cfg!(debug_assertions) {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -216,6 +220,9 @@ fn main() {
                 .title("知乎答主助手")
                 .inner_size(1280.0, 840.0)
                 .min_inner_size(1060.0, 700.0)
+                .decorations(false)
+                .transparent(true)
+                .shadow(true)
                 .center()
                 .visible(false)
                 .build()?;

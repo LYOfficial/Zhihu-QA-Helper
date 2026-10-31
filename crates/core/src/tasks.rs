@@ -19,6 +19,8 @@ pub async fn job_start(state: &AppState, kind: &str, qid: Option<&str>, msg: &st
          VALUES (?1,?2,?3,'准备',0.02,?4,'running',?5)",
         params![id, kind, qid, msg, now_iso()],
     );
+    tracing::info!(target: "jobs", job_id = %id, kind, "任务开始：{msg}");
+    db.log_event("job", qid, &format!("{kind} 任务开始"), msg);
     id
 }
 
@@ -28,6 +30,8 @@ pub async fn job_step(state: &AppState, id: &str, stage: &str, progress: f64, ms
         "UPDATE jobs SET stage=?1, progress=?2, message=?3 WHERE id=?4",
         params![stage, progress, msg, id],
     );
+    tracing::info!(target: "jobs", job_id = %id, stage, progress, "任务进度：{msg}");
+    db.log_event("job", None, &format!("任务阶段：{stage}"), msg);
 }
 
 pub async fn job_end(state: &AppState, id: &str, ok: bool, msg: &str) {
@@ -36,6 +40,8 @@ pub async fn job_end(state: &AppState, id: &str, ok: bool, msg: &str) {
         "UPDATE jobs SET state=?1, message=?2, progress=1.0, finished_at=?3 WHERE id=?4",
         params![if ok { "done" } else { "failed" }, msg, now_iso(), id],
     );
+    tracing::info!(target: "jobs", job_id = %id, state = if ok { "done" } else { "failed" }, "任务结束：{msg}");
+    db.log_event("job", None, if ok { "任务完成" } else { "任务失败" }, msg);
 }
 
 
@@ -320,8 +326,11 @@ async fn sync_inner(state: &crate::state::Shared, job: &str, days: Option<i64>) 
 
 // ---------------- 画像分析 ----------------
 
-pub async fn run_profile(state: &AppState) -> Result<()> {
-    let job = job_start(state, "profile", None, "读取历史回答").await;
+pub async fn run_profile_job(state: &AppState, job: String) -> Result<()> {
+    {
+        let db = state.db.lock().await;
+        let _ = db.conn.execute("UPDATE profile_meta SET status='running' WHERE id=1", []);
+    }
     let r = profile_inner(state, &job).await;
     match &r {
         Ok(_) => job_end(state, &job, true, "领域画像已更新").await,
@@ -355,10 +364,6 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         anyhow::bail!("请先登录知乎账号");
     }
 
-    {
-        let db = state.db.lock().await;
-        let _ = db.conn.execute("UPDATE profile_meta SET status='running' WHERE id=1", []);
-    }
     job_step(state, job, "抓取回答", 0.16, "正在获取回答列表").await;
     let client = zhihu_client(state).await?;
     let answers = client.my_answers(&url_token, 3).await.unwrap_or_default();
