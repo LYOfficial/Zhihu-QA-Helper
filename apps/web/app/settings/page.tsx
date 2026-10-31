@@ -32,6 +32,19 @@ export default function SettingsPage() {
   const [testing, setTesting] = React.useState(false);
   const [savingModel, setSavingModel] = React.useState(false);
 
+  function sortCronTimes(times: string[]) {
+    return [...times].sort((a, b) => a.localeCompare(b));
+  }
+
+  function nextCronTime(times: string[]) {
+    const used = new Set(times);
+    for (let minute = 0; minute < 24 * 60; minute += 30) {
+      const value = `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+      if (!used.has(value)) return value;
+    }
+    return "22:00";
+  }
+
   React.useEffect(() => {
     if (se.data) setSettings(se.data);
   }, [se.data]);
@@ -41,10 +54,16 @@ export default function SettingsPage() {
 
   async function saveSettings(patch: Partial<Settings>) {
     if (!settings) return;
-    const next = { ...settings, ...patch };
+    const next = {
+      ...settings,
+      ...patch,
+      cronTimes: patch.cronTimes ? sortCronTimes(patch.cronTimes) : settings.cronTimes,
+    };
     setSettings(next);
     try {
-      await api.put("/api/settings", next);
+      const saved = await api.put<Settings>("/api/settings", next);
+      setSettings(saved);
+      window.dispatchEvent(new Event("zhihu-settings-updated"));
     } catch (e) {
       toast(e instanceof Error ? e.message : "保存失败", "err");
     }
@@ -112,6 +131,7 @@ export default function SettingsPage() {
       const current = nextCatalog[model?.provider ?? ""] ?? [];
       if (current.length) setModels(current);
       setCatalogAt(new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }));
+      window.sessionStorage.setItem("zhihu-qa-helper-model-catalog-synced", "1");
       toast(current.length ? `模型库已同步，当前平台 ${current.length} 个模型` : "模型库已同步", "ok");
     } catch (e) {
       toast(e instanceof Error ? e.message : "模型库同步失败，继续使用离线清单", "err");
@@ -119,12 +139,6 @@ export default function SettingsPage() {
       setCatalogSyncing(false);
     }
   }
-
-  React.useEffect(() => {
-    if (model) syncCatalog();
-    // 只在设置页首次加载时同步一次
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [Boolean(model)]);
 
   if (!settings || !model) {
     return (
@@ -244,7 +258,7 @@ export default function SettingsPage() {
 
           {/* 模型 */}
           <div className="mt-24">
-            <SectionTitle right={<span className="dim">主流模型自动同步</span>}>大模型</SectionTitle>
+            <SectionTitle right={<span className="dim">首次启动同步</span>}>大模型</SectionTitle>
           </div>
 
           <div
@@ -334,7 +348,7 @@ export default function SettingsPage() {
           </div>
 
           <p className="hint" style={{ marginTop: -6, marginBottom: 14, lineHeight: 1.75 }}>
-            模型清单来自 models.dev 开源目录，设置页打开时会自动同步各主流厂商公开模型 ID。
+            模型清单来自 models.dev 开源目录。首次启动时会自动同步，之后只在这里手动点击“同步模型库”时更新。
             {preset.docs && (
               <>
                 {" "}
@@ -390,7 +404,7 @@ export default function SettingsPage() {
 
           {/* 节奏 */}
           <div className="mt-24">
-            <SectionTitle right={<span className="dim">每天三次</span>}>值守与拟稿节奏</SectionTitle>
+            <SectionTitle right={<span className="dim">每天 {settings.cronTimes.length} 次</span>}>值守与拟稿节奏</SectionTitle>
           </div>
 
           <div className="field">
@@ -405,21 +419,22 @@ export default function SettingsPage() {
                   onChange={(e) => {
                     const next = [...settings.cronTimes];
                     next[i] = e.target.value;
-                    saveSettings({ cronTimes: next });
+                    setSettings({ ...settings, cronTimes: next });
+                  }}
+                  onBlur={() => {
+                    void saveSettings({ cronTimes: settings.cronTimes });
                   }}
                 />
               ))}
-              {settings.cronTimes.length < 5 && (
-                <button
-                  className="btn btn-sm"
-                  onClick={() => saveSettings({ cronTimes: [...settings.cronTimes, "22:00"] })}
-                >
-                  + 加一次
-                </button>
-              )}
+              <button
+                className="btn btn-sm"
+                onClick={() => saveSettings({ cronTimes: [...settings.cronTimes, nextCronTime(settings.cronTimes)] })}
+              >
+                + 加一次
+              </button>
             </div>
             <div className="hint">
-              知乎每次登录并打开通知就会生成新的邀请提醒，所以这三次会覆盖当天绝大多数新问题。
+              可添加任意多个时间点，保存后会自动按先后顺序排列；知乎每次登录并打开通知就会生成新的邀请提醒。
             </div>
           </div>
 

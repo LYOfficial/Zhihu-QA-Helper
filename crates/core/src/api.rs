@@ -57,6 +57,7 @@ pub fn router(state: Shared) -> Router {
         .route("/sources/discover", post(discover_sources))
         .route("/questions", get(list_questions))
         .route("/questions/sync", post(sync_now))
+        .route("/questions/sync/recent", post(sync_recent_now))
         .route("/questions/{id}", get(get_question))
         .route("/questions/{id}/research", post(research_question))
         .route("/questions/{id}/status", post(set_status))
@@ -641,11 +642,13 @@ async fn get_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
 }
 
 async fn sync_now(State(st): State<Shared>) -> R {
-    let st2 = st.clone();
-    tokio::spawn(async move {
-        let _ = tasks::run_sync(&st2).await;
-    });
-    Ok(Json(json!({ "ok": true, "message": "开始同步知乎通知" })))
+    let job_id = tasks::start_sync(&st, None).await;
+    Ok(Json(json!({ "ok": true, "jobId": job_id, "message": "开始同步知乎通知" })))
+}
+
+async fn sync_recent_now(State(st): State<Shared>) -> R {
+    let job_id = tasks::start_sync(&st, Some(3)).await;
+    Ok(Json(json!({ "ok": true, "jobId": job_id, "message": "开始同步最近 3 天的邀请与推荐" })))
 }
 
 async fn research_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
@@ -991,7 +994,7 @@ async fn put_settings(State(st): State<Shared>, Json(body): Json<Value>) -> R {
     let db = st.db.lock().await;
     let cur = tasks::load_settings(&db);
     let g = |k: &str, d: &str| body.get(k).and_then(|x| x.as_str()).unwrap_or(d).to_string();
-    let times = body
+    let mut times = body
         .get("cronTimes")
         .and_then(|x| x.as_array())
         .map(|a| {
@@ -1007,6 +1010,8 @@ async fn put_settings(State(st): State<Shared>, Json(body): Json<Value>) -> R {
         })
         .filter(|v| !v.is_empty())
         .unwrap_or(cur.cron_times.clone());
+    times.sort();
+    times.dedup();
     let pick_ratio = body.get("pickRatio").and_then(|x| x.as_f64()).unwrap_or(cur.pick_ratio).clamp(0.1, 0.9);
     let draft_min = body.get("draftMin").and_then(|x| x.as_i64()).unwrap_or(cur.draft_min).clamp(100, 5000);
     let draft_max = body.get("draftMax").and_then(|x| x.as_i64()).unwrap_or(cur.draft_max).clamp(draft_min, 5000);

@@ -55,19 +55,27 @@ GET https://www.zhihu.com/api/v4/me?include=answer_count,articles_count,follower
 ## 通知 → 邀请回答
 
 ```
+GET https://api.zhihu.com/notifications/v3/timeline/entry/invite?invite_with_time_slice=1&limit=20
 GET https://www.zhihu.com/api/v4/notifications/v2/default?limit=20
 GET https://www.zhihu.com/api/v4/notifications/v2/follow?limit=20
 GET https://www.zhihu.com/api/v4/notifications/v2/vote_thank?limit=20
 ```
 
-三个源都要拉：`default` 是主通知，「邀请你回答」多在 `default` 与 `follow` 里。
-条目结构在不同版本间有差异，`crates/core/src/zhihu.rs::parse_notification` 做了容错：
+独立的 `invite` 是移动端邀请回答时间线，使用与 `zhurl --android` 一致的移动端请求头，不做 Web 签名。
+另外三个 Web 源也要拉，用于覆盖推荐回答及仍出现在旧通知中心的邀请。所有来源都跟随响应里的
+`paging.next` 翻页，以 `paging.is_end` 判断结束，不再自行递增 `offset`；近三天模式遇到整页
+带时间戳的条目均早于截止时间后停止。
 
-1. 先看 `content.verb` / `content.text` 是否包含邀请或推荐语义；
-2. 问题对象优先取 `content.subject`，其次 `target`；若 `subject.type == "answer"`，再下钻到 `subject.question`；
-3. 都拿不到 id 时，从文案里的 `/question/<id>` 抠数字兜底。
+条目结构在 Web v2 与 Android v3 间有差异，`crates/core/src/zhihu.rs::parse_notification` 做了容错：
 
-宁可漏，不可错 —— 解析不出问题 id 的条目直接丢弃，不猜。
+1. 独立 `invite` 来源直接按邀请处理，其他来源看 `content.verb` / 文案是否包含邀请或推荐语义；
+2. 问题对象兼容 `content.subject`、`content.target`、`target`、`targetSource`，回答对象会下钻到 `question`；
+3. 同时读取字符串或数字 ID，并可从 `url` / `link` / `targetLink` 里的 `/question/<id>` 提取；
+4. 时间字段兼容 `create_time`、`created_time`、`created` 等，秒和毫秒统一转成秒；
+5. 邀请人兼容 `actor`、`actors[]` 与移动端 `head.author`。
+
+宁可漏，不可错 —— 解析不出问题 id 的条目直接丢弃，不猜。请求失败、非 JSON 风控页和缺少
+`data` 数组都会记录明确错误；所有来源失败时任务直接失败，不再伪装成“同步成功，读取 0 条”。
 
 ## 历史内容（画像用）
 
@@ -85,14 +93,15 @@ GET https://www.zhihu.com/api/v4/members/{url_token}/articles?include=data[*].co
 
 ```
 x-zse-93: 101_3_3.0
-x-zse-96: 2.0_<base64(md5("101_3_3.0+{path?query}+{d_c0}"))>
+x-zse-96: 2.0_<加密后的签名>
 ```
 
-`path?query` 是去掉域名的完整路径，含 query，不含 hash。
+签名原文是 `101_3_3.0+{path?query}+{d_c0}`，`path?query` 为去掉域名的完整路径，含 query，不含 hash。
+不能只做 `base64(md5(...))`：现行算法还会执行自定义块变换与字符表编码。本项目直接使用
+`zhihu_sign = "=0.1.0"`（与 `zly2006/zhurl` 相同），实现在
+`crates/core/src/zhihu.rs::send_web`。
 
-实现见 `crates/core/src/zhihu.rs::signed_zse96`。
-
-**注意**：这是公开流传的 v2 方案，知乎迭代后可能失效。因此设置里给了三档：
+**注意**：签名算法可能随知乎迭代失效。因此设置里给了三档：
 
 | 模式 | 行为 |
 | --- | --- |

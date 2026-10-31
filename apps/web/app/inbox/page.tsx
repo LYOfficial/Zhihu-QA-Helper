@@ -12,7 +12,7 @@ import {
 import { api, toast } from "@/lib/api";
 import { useLoad } from "@/lib/hooks";
 import { watchJob } from "@/lib/jobwatch";
-import type { DomainCount, Question } from "@/lib/types";
+import type { DomainCount, Job, Question } from "@/lib/types";
 
 const TABS = [
   { key: "todo", label: "全部待办" },
@@ -28,6 +28,7 @@ export default function InboxPage() {
   const [domain, setDomain] = React.useState("all");
   const [kw, setKw] = React.useState("");
   const [confirmDismiss, setConfirmDismiss] = React.useState<Question | null>(null);
+  const [syncJob, setSyncJob] = React.useState<Job | null>(null);
 
   const qs = useLoad<{ questions: Question[]; domains: DomainCount[] }>(() =>
     api.get("/api/questions?status=all")
@@ -35,6 +36,24 @@ export default function InboxPage() {
 
   const all = qs.data?.questions ?? [];
   const domains = qs.data?.domains ?? [];
+
+  React.useEffect(() => {
+    if (!syncJob || syncJob.state !== "running") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const job = await api.get<Job>(`/api/jobs/${syncJob.id}`);
+        setSyncJob(job);
+        if (job.state === "done" || job.state === "failed") {
+          window.clearInterval(timer);
+          qs.reload(true);
+          toast(job.state === "done" ? job.message || "同步完成" : `同步失败：${job.message}`, job.state === "done" ? "ok" : "err");
+        }
+      } catch {
+        // 单次进度查询失败时，下一次轮询继续尝试。
+      }
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [syncJob?.id, syncJob?.state]);
 
   const list = React.useMemo(() => {
     let l = [...all];
@@ -79,11 +98,12 @@ export default function InboxPage() {
     }
   }
 
-  async function syncNow() {
+  async function syncNow(recent = false) {
+    if (syncJob?.state === "running") return;
     try {
-      await api.post("/api/questions/sync");
-      toast("开始同步知乎通知", "ok");
-      setTimeout(() => qs.reload(true), 2800);
+      const result = await api.post<{ jobId: string }>(recent ? "/api/questions/sync/recent" : "/api/questions/sync");
+      setSyncJob({ id: result.jobId, kind: "sync", questionId: null, stage: "准备", progress: 0.02, message: recent ? "正在准备最近 3 天通知" : "正在连接知乎", state: "running", startedAt: new Date().toISOString(), finishedAt: null });
+      toast(recent ? "开始同步最近 3 天的邀请与推荐" : "开始同步知乎通知", "ok");
     } catch (e) {
       toast(e instanceof Error ? e.message : "同步失败", "err");
     }
@@ -101,11 +121,22 @@ export default function InboxPage() {
           </p>
         </div>
         <div className="page-actions">
-          <button className="btn" onClick={syncNow}>
+          <button className="btn" onClick={() => void syncNow(false)} disabled={syncJob?.state === "running"}>
             <IconRefresh size={14} /> 立即同步
+          </button>
+          <button className="btn" onClick={() => void syncNow(true)} disabled={syncJob?.state === "running"}>
+            <IconRefresh size={14} /> 同步近 3 天
           </button>
         </div>
       </header>
+
+      {syncJob && (
+        <div className="sync-progress" role="status" aria-live="polite">
+          <div className="sync-progress-head"><span>{syncJob.state === "failed" ? "同步失败" : syncJob.state === "done" ? "同步完成" : syncJob.stage}</span><span>{Math.round(syncJob.progress * 100)}%</span></div>
+          <div className="sync-progress-track"><i style={{ width: `${Math.max(2, Math.round(syncJob.progress * 100))}%` }} /></div>
+          <div className="sync-progress-message">{syncJob.message}</div>
+        </div>
+      )}
 
       <div className="page-body">
 

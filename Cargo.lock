@@ -2119,14 +2119,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
-name = "md-5"
-version = "0.10.6"
+name = "md5"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
-dependencies = [
- "cfg-if",
- "digest",
-]
+checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "memchr"
@@ -5405,10 +5401,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
- "md-5",
  "once_cell",
  "qrcode",
  "rand",
@@ -5424,6 +5418,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
+ "zhihu_sign",
 ]
 
 [[package]]
@@ -5435,6 +5430,15 @@ dependencies = [
  "tauri",
  "tauri-build",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "zhihu_sign"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fecbe6bc757a2e4de5e8b17fa6a1f705624e91b8148c3692461331833eb6f135"
+dependencies = [
+ "md5",
 ]
 
 [[package]]

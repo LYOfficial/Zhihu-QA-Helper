@@ -13,7 +13,7 @@ import {
 import { api } from "@/lib/api";
 import { useLoad } from "@/lib/hooks";
 import { getTheme, saveTheme, type Theme } from "@/lib/theme";
-import type { Health, Session, StatsOverview } from "@/lib/types";
+import type { Health, Session, Settings, StatsOverview } from "@/lib/types";
 import LoginScreen from "./LoginScreen";
 import {
   IconChart,
@@ -81,7 +81,11 @@ function WindowTitlebar() {
     <header className="app-titlebar">
       <div className="app-titlebar-drag" data-tauri-drag-region onDoubleClick={() => void onToggleMaximize()}>
         <Link href="/" className="app-titlebar-brand" onClick={(event) => event.preventDefault()}>
-          <span className="mark"><Seal size={20} /></span>
+          <span className="mark">
+            {/* 使用项目蓝色 Logo，避免标题栏继续显示旧印章图标 */}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/logo.svg" alt="" />
+          </span>
           <span>知乎答主助手</span>
         </Link>
       </div>
@@ -166,6 +170,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   const seq = React.useRef(0);
 
   const session = useLoad<Session>(() => api.get("/api/session"));
+  const settings = useLoad<Settings>(() => api.get("/api/settings"));
   const health = useLoad<Health>(() => api.get("/api/health"));
   const stats = useLoad<StatsOverview>(() => api.get("/api/stats/overview"));
 
@@ -193,6 +198,19 @@ export default function Shell({ children }: { children: React.ReactNode }) {
       setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4200);
     });
   }, []);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined" || window.sessionStorage.getItem("zhihu-qa-helper-model-catalog-synced")) return;
+    void api.get("/api/model/catalog")
+      .then(() => window.sessionStorage.setItem("zhihu-qa-helper-model-catalog-synced", "1"))
+      .catch((error) => console.error("首次启动同步模型库失败", error));
+  }, []);
+
+  React.useEffect(() => {
+    const refreshSettings = () => settings.reload(true);
+    window.addEventListener("zhihu-settings-updated", refreshSettings);
+    return () => window.removeEventListener("zhihu-settings-updated", refreshSettings);
+  }, [settings.reload]);
 
   const refreshAll = React.useCallback(() => {
     session.reload(true);
@@ -286,7 +304,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
               <span className="acct-name">{user?.name || "已登录"}</span>
               <span className="acct-state" data-on={true}>
                 <i />
-                值守中 · 每日 3 次
+                值守中 · 每日 {settings.data?.cronTimes.length ?? 3} 次
               </span>
             </span>
           </Link>

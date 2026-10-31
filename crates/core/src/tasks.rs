@@ -150,6 +150,28 @@ pub async fn run_sync_recent(state: &crate::state::Shared, days: i64) -> Result<
     run_sync_window(state, Some(days)).await
 }
 
+pub async fn start_sync(state: &crate::state::Shared, days: Option<i64>) -> String {
+    let message = if days.is_some() {
+        "正在准备最近 3 天通知"
+    } else {
+        "正在连接知乎"
+    };
+    let job = job_start(state, "sync", None, message).await;
+    let state = state.clone();
+    let job_id = job.clone();
+    tokio::spawn(async move {
+        let result = sync_inner(&state, &job_id, days).await;
+        match &result {
+            Ok(report) => job_end(&state, &job_id, true, &report.message).await,
+            Err(error) => {
+                job_end(&state, &job_id, false, &format!("{error}")).await;
+                tracing::error!(target: "sync", job_id = %job_id, "通知同步失败：{error:#}");
+            }
+        }
+    });
+    job
+}
+
 pub async fn bootstrap_if_empty(state: &crate::state::Shared) {
     let should_sync = {
         let db = state.db.lock().await;
@@ -176,7 +198,10 @@ async fn run_sync_window(state: &crate::state::Shared, days: Option<i64>) -> Res
     let result = sync_inner(state, &job, days).await;
     match &result {
         Ok(r) => job_end(state, &job, true, &r.message).await,
-        Err(e) => job_end(state, &job, false, &format!("{e}")).await,
+        Err(e) => {
+            job_end(state, &job, false, &format!("{e}")).await;
+            tracing::error!(target: "sync", job_id = %job, "通知同步失败：{e:#}");
+        }
     }
     result
 }
@@ -191,12 +216,21 @@ async fn sync_inner(state: &crate::state::Shared, job: &str, days: Option<i64>) 
     )
     .await;
     let client = zhihu_client(state).await?;
-    let raws = match days {
+    let batch = match days {
         Some(days) => client.fetch_invites_since(days).await?,
-        None => client.fetch_invites(30).await?,
+        None => client.fetch_invites(20).await?,
     };
+    let received = batch.received;
+    let raws = batch.questions;
 
-    job_step(state, job, "归类领域", 0.45, &format!("{} 条候选", raws.len())).await;
+    job_step(
+        state,
+        job,
+        "归类领域",
+        0.45,
+        &format!("读取 {received} 条通知，识别 {} 条邀请/推荐候选", raws.len()),
+    )
+    .await;
     let terms = load_terms(state).await;
     let mut added = 0usize;
     let mut inserted: Vec<(String, f64)> = Vec::new();
@@ -296,19 +330,19 @@ async fn sync_inner(state: &crate::state::Shared, job: &str, days: Option<i64>) 
             "sync",
             None,
             "完成一次通知同步",
-            &format!("抓取 {} 条，新增 {} 条，进入重点队列 {} 条", raws.len(), added, selected_ids.len()),
+            &format!("读取 {received} 条通知，识别 {} 条候选，新增 {added} 条，进入重点队列 {} 条", raws.len(), selected_ids.len()),
         );
     }
 
     let report = SyncReport {
-        fetched: raws.len(),
+        fetched: received,
         added,
         selected: selected_ids.len(),
         by_domain,
         message: if added == 0 {
-            format!("抓取 {} 条通知，没有新的问题", raws.len())
+            format!("读取 {received} 条通知，识别 {} 条邀请/推荐，没有新的问题", raws.len())
         } else {
-            format!("新增 {added} 个问题，{} 个进入重点队列", selected_ids.len())
+            format!("读取 {received} 条通知，新增 {added} 个问题，{} 个进入重点队列", selected_ids.len())
         },
     };
 

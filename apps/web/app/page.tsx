@@ -21,6 +21,7 @@ import type {
   Session,
   Settings,
   StatsOverview,
+  Job,
 } from "@/lib/types";
 
 function slotStates(times: string[], lastSyncAt: string | null) {
@@ -49,6 +50,7 @@ export default function DeskHome() {
   const st = useLoad<StatsOverview>(() => api.get("/api/stats/overview"));
   const se = useLoad<Settings>(() => api.get("/api/settings"));
   const ss = useLoad<Session>(() => api.get("/api/session"));
+  const [syncJob, setSyncJob] = React.useState<Job | null>(null);
 
   const all = q.data?.questions ?? [];
   const pending = all.filter((x) => x.status === "pending_review");
@@ -57,15 +59,32 @@ export default function DeskHome() {
 
   const slots = slotStates(se.data?.cronTimes ?? ["07:00", "15:00", "20:00"], ss.data?.lastSyncAt ?? null);
 
+  React.useEffect(() => {
+    if (!syncJob || syncJob.state !== "running") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const job = await api.get<Job>(`/api/jobs/${syncJob.id}`);
+        setSyncJob(job);
+        if (job.state === "done" || job.state === "failed") {
+          window.clearInterval(timer);
+          q.reload(true);
+          ev.reload(true);
+          st.reload(true);
+          toast(job.state === "done" ? job.message || "同步完成" : `同步失败：${job.message}`, job.state === "done" ? "ok" : "err");
+        }
+      } catch {
+        // 单次进度查询失败时，下一次轮询继续尝试。
+      }
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [syncJob?.id, syncJob?.state]);
+
   async function syncNow() {
+    if (syncJob?.state === "running") return;
     try {
-      await api.post("/api/questions/sync");
+      const result = await api.post<{ jobId: string }>("/api/questions/sync");
+      setSyncJob({ id: result.jobId, kind: "sync", questionId: null, stage: "准备", progress: 0.02, message: "正在连接知乎", state: "running", startedAt: new Date().toISOString(), finishedAt: null });
       toast("已开始同步，稍等片刻看结果", "ok");
-      setTimeout(() => {
-        q.reload(true);
-        ev.reload(true);
-        st.reload(true);
-      }, 2600);
     } catch (e) {
       toast(e instanceof Error ? e.message : "同步失败", "err");
     }
@@ -102,7 +121,7 @@ export default function DeskHome() {
           </p>
         </div>
         <div className="page-actions">
-          <button className="btn" onClick={syncNow}>
+          <button className="btn" onClick={() => void syncNow()} disabled={syncJob?.state === "running"}>
             <IconRefresh size={14} /> 同步通知
           </button>
           <button className="btn btn-primary" onClick={() => router.push("/desk")}>
@@ -110,6 +129,14 @@ export default function DeskHome() {
           </button>
         </div>
       </header>
+
+      {syncJob && (
+        <div className="sync-progress" role="status" aria-live="polite">
+          <div className="sync-progress-head"><span>{syncJob.state === "failed" ? "同步失败" : syncJob.state === "done" ? "同步完成" : syncJob.stage}</span><span>{Math.round(syncJob.progress * 100)}%</span></div>
+          <div className="sync-progress-track"><i style={{ width: `${Math.max(2, Math.round(syncJob.progress * 100))}%` }} /></div>
+          <div className="sync-progress-message">{syncJob.message}</div>
+        </div>
+      )}
 
       <div className="page-body">
 

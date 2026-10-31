@@ -5,16 +5,18 @@
 //! 签名失败时自动降级为「仅 Cookie」请求，并在 UI 里如实提示。
 
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use md5::{Digest, Md5};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::models::{ZhihuUser};
+use crate::models::ZhihuUser;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const ZSE93: &str = "101_3_3.0";
+const ANDROID_API_VERSION: &str = "3.0.93";
+const ANDROID_APP_VERSION: &str = "10.100.0";
+const ANDROID_UA: &str = "com.zhihu.android/Futureve/10.100.0 Mozilla/5.0 (Linux; Android 12; sdk_gphone64_arm64 Build/SE1A.220630.001.A1; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/57.0.1000.10 Mobile Safari/537.36";
+const ANDROID_APP_ZA: &str = "OS=Android&Release=12&Model=sdk_gphone64_arm64&VersionName=10.100.0&VersionCode=30008&Product=com.zhihu.android&Width=1440&Height=2952&Installer=Market&DeviceType=AndroidPhone&Brand=google";
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum SignMode {
@@ -153,67 +155,76 @@ impl ZhihuClient {
             .join("; ");
     }
 
-    /// x-zse-96 v2：`2.0_` + base64(md5("101_3_3.0+{path}+{d_c0}"))
-    /// 知乎换算法时这里会失效，届时 `sign_mode=off` 仍可跑通不需要签名的接口。
-    fn signed_zse96(&self, path_with_query: &str) -> String {
-        let raw = format!("{ZSE93}+{path_with_query}+{}", self.d_c0());
-        let mut h = Md5::new();
-        h.update(raw.as_bytes());
-        let digest = h.finalize();
-        format!("2.0_{}", B64.encode(digest))
+    async fn send(&self, method: reqwest::Method, url: &str, signed: bool) -> Result<Value> {
+        match self.send_web(method.clone(), url, signed).await {
+            Err(error)
+                if self.sign_mode == SignMode::Auto && signed && error.retry_without_sign =>
+            {
+                tracing::warn!(target: "zhihu", "签名请求被知乎拒绝，改用仅 Cookie 重试：{}", error.message);
+                self.send_web(method, url, false)
+                    .await
+                    .map_err(|error| anyhow!(error.message))
+            }
+            result => result.map_err(|error| anyhow!(error.message)),
+        }
     }
 
-    async fn send(&self, method: reqwest::Method, url: &str, signed: bool) -> Result<Value> {
-        let path = url
-            .splitn(2, "www.zhihu.com")
-            .nth(1)
-            .or_else(|| url.splitn(2, "api.zhihu.com").nth(1))
-            .unwrap_or("/");
-        let path = path.splitn(2, '#').next().unwrap_or(path);
-
+    async fn send_web(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        signed: bool,
+    ) -> std::result::Result<Value, RequestError> {
+        if signed && self.d_c0().is_empty() {
+            return Err(RequestError::fatal(
+                "登录 Cookie 缺少 d_c0，无法生成 x-zse-96；请重新粘贴完整 Cookie",
+            ));
+        }
+        let path = request_path(url);
         let mut req = self
             .http
-            .request(method.clone(), url)
+            .request(method, url)
             .header("Cookie", &self.cookie)
             .header("x-requested-with", "fetch")
-            .header("x-zse-93", ZSE93)
             .header("Referer", "https://www.zhihu.com/")
+            .header("Origin", "https://www.zhihu.com")
             .header("Accept", "application/json, text/plain, */*");
-
+        if let Some(xsrf) = self.xsrf() {
+            req = req.header("x-xsrftoken", xsrf);
+        }
         if signed {
-            req = req.header("x-zse-96", self.signed_zse96(path));
-        }
-
-        let resp = req.send().await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-
-        if status == 404 || status == 403 || status == 401 {
-            if self.sign_mode == SignMode::Auto && signed {
-                // 降级重试：不带签名
-                let mut req2 = self
-                    .http
-                    .request(method, url)
-                    .header("Cookie", &self.cookie)
-                    .header("x-requested-with", "fetch")
-                    .header("Referer", "https://www.zhihu.com/");
-                req2 = req2.header("Accept", "application/json");
-                let r2 = req2.send().await?;
-                let s2 = r2.status();
-                let t2 = r2.text().await.unwrap_or_default();
-                if s2.is_success() {
-                    return Ok(serde_json::from_str(&t2)?);
-                }
-                return Err(anyhow!(
-                    "HTTP {s2}：知乎拒绝了这次请求（风控签名可能已失效，或登录态过期）"
-                ));
+            for (name, value) in zhihu_sign::sign_zhihu_request(&path, &self.d_c0(), None) {
+                req = req.header(name, value);
             }
-            return Err(anyhow!("HTTP {status}：知乎拒绝了这次请求"));
+        } else {
+            req = req.header("x-zse-93", ZSE93);
         }
-        if !status.is_success() {
-            return Err(anyhow!("HTTP {status}: {}", slim(&text, 200)));
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(json!({})))
+        decode_response(req.send().await.map_err(RequestError::from)?).await
+    }
+
+    /// 移动端通知接口不使用 Web 的 x-zse-96，请求头与 zhurl --android 保持一致。
+    async fn send_mobile(&self, url: &str) -> Result<Value> {
+        let req = self
+            .http
+            .get(url)
+            .header("User-Agent", ANDROID_UA)
+            .header("Cookie", &self.cookie)
+            .header("Accept", "application/json, text/plain, */*")
+            .header("x-page-id", "132")
+            .header("x-api-version", ANDROID_API_VERSION)
+            .header("x-app-version", ANDROID_APP_VERSION)
+            .header("x-app-za", ANDROID_APP_ZA)
+            .header("x-app-bundleid", "com.zhihu.android")
+            .header("x-app-flavor", "zhihuwap64")
+            .header("x-app-build", "release")
+            .header("x-network-type", "3G");
+        let response = req
+            .send()
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        decode_response(response)
+            .await
+            .map_err(|error| anyhow!(error.message))
     }
 
     // ---------- 登录 ----------
@@ -228,7 +239,10 @@ impl ZhihuClient {
         let signin = self
             .http
             .get("https://www.zhihu.com/signin")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
             .header("Accept-Language", "zh-CN,zh;q=0.9")
             .header("Referer", "https://www.zhihu.com/")
             .send()
@@ -328,7 +342,10 @@ impl ZhihuClient {
         let v: Value = resp.json().await.unwrap_or(json!({}));
 
         // 403 / code 40352：知乎要求人机验证，扫码流程在本机被风控拦住了
-        let err_code = v.pointer("/error/code").and_then(|x| x.as_i64()).unwrap_or(0);
+        let err_code = v
+            .pointer("/error/code")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0);
         if code == 403 || err_code == 40352 {
             let msg = v
                 .pointer("/error/message")
@@ -337,11 +354,7 @@ impl ZhihuClient {
             return Ok(("blocked".to_string(), None, msg.to_string()));
         }
         if !code.is_success() {
-            return Ok((
-                "blocked".to_string(),
-                None,
-                format!("轮询返回 HTTP {code}"),
-            ));
+            return Ok(("blocked".to_string(), None, format!("轮询返回 HTTP {code}")));
         }
 
         let login_status = v
@@ -404,64 +417,144 @@ impl ZhihuClient {
 
     // ---------- 通知 → 问题 ----------
 
-    /// 拉取三类通知里的「邀请回答」与「推荐回答」。
-    pub async fn fetch_invites(&self, limit: u32) -> Result<Vec<RawQuestion>> {
-        self.fetch_invites_window(limit, None).await
+    /// 拉取独立邀请时间线及三类 Web 通知里的「邀请回答」与「推荐回答」。
+    pub async fn fetch_invites(&self, limit: u32) -> Result<NotificationBatch> {
+        self.fetch_invites_window(limit.clamp(1, 20), None).await
     }
 
     /// 拉取指定天数内的邀请与推荐，首次登录时用于补齐历史通知。
-    pub async fn fetch_invites_since(&self, days: i64) -> Result<Vec<RawQuestion>> {
+    pub async fn fetch_invites_since(&self, days: i64) -> Result<NotificationBatch> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(days.max(1));
-        self.fetch_invites_window(20, Some(cutoff.timestamp())).await
+        self.fetch_invites_window(20, Some(cutoff.timestamp()))
+            .await
     }
 
-    async fn fetch_invites_window(&self, limit: u32, cutoff: Option<i64>) -> Result<Vec<RawQuestion>> {
+    async fn fetch_invites_window(
+        &self,
+        limit: u32,
+        cutoff: Option<i64>,
+    ) -> Result<NotificationBatch> {
         let mut out: Vec<RawQuestion> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut received = 0usize;
+        let mut succeeded_sources = 0usize;
+        let mut errors = Vec::new();
 
-        for kind in ["default", "follow", "vote_thank"] {
-            let pages = if cutoff.is_some() { 12 } else { 1 };
+        for kind in ["invite", "default", "follow", "vote_thank"] {
+            let mobile = kind == "invite";
+            let pages = if cutoff.is_some() { 100 } else { 1 };
+            let mut next_url = if mobile {
+                format!("https://api.zhihu.com/notifications/v3/timeline/entry/invite?invite_with_time_slice=1&limit={limit}")
+            } else {
+                format!("https://www.zhihu.com/api/v4/notifications/v2/{kind}?limit={limit}")
+            };
+            let mut visited_urls = std::collections::HashSet::new();
+            let mut source_received = 0usize;
+            let mut source_candidates = 0usize;
+            let mut source_succeeded = false;
+
             for page in 0..pages {
-                let offset = page * limit as usize;
-                let url = format!(
-                    "https://www.zhihu.com/api/v4/notifications/v2/{kind}?limit={limit}&offset={offset}"
-                );
-                let v = match self.send(reqwest::Method::GET, &url, true).await {
+                if !visited_urls.insert(next_url.clone()) {
+                    tracing::warn!(target: "zhihu", "通知源 {kind} 的分页游标重复，停止该来源翻页");
+                    break;
+                }
+                let url = next_url.clone();
+                let response = if mobile {
+                    self.send_mobile(&url).await
+                } else {
+                    self.send(reqwest::Method::GET, &url, true).await
+                };
+                let v = match response {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(target: "zhihu", "通知源 {kind} 第 {page} 页拉取失败: {e}");
+                        tracing::warn!(target: "zhihu", "通知源 {kind} 第 {} 页拉取失败: {e}", page + 1);
+                        errors.push(format!("{kind}: {e}"));
                         break;
                     }
                 };
-                let items = v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+                let Some(items) = v.get("data").and_then(|d| d.as_array()) else {
+                    let message = format!(
+                        "通知源 {kind} 的响应缺少 data 数组：{}",
+                        slim(&v.to_string(), 180)
+                    );
+                    tracing::warn!(target: "zhihu", "{message}");
+                    errors.push(message);
+                    break;
+                };
+                source_succeeded = true;
+                received += items.len();
+                source_received += items.len();
                 if items.is_empty() {
                     break;
                 }
-                let mut old_items = 0;
-                for item in &items {
+
+                let mut dated_items = 0usize;
+                let mut old_items = 0usize;
+                for item in items {
                     if let Some(cutoff) = cutoff {
                         if let Some(ts) = notification_timestamp(item) {
+                            dated_items += 1;
                             if ts < cutoff {
                                 old_items += 1;
                                 continue;
                             }
                         }
                     }
-                    if let Some(rq) = parse_notification(item) {
+                    if let Some(rq) = parse_notification(item, mobile) {
+                        source_candidates += 1;
                         if seen.insert(rq.question_id.clone()) {
                             out.push(rq);
                         }
                     }
                 }
-                if cutoff.is_some() && old_items >= items.len().saturating_div(2) {
+                if cutoff.is_some() && dated_items > 0 && old_items == dated_items {
                     break;
                 }
-                if items.len() < limit as usize {
+                if cutoff.is_none() {
                     break;
+                }
+
+                let paging = v.get("paging");
+                let is_end = paging
+                    .and_then(|p| p.get("is_end"))
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true);
+                let next = paging
+                    .and_then(|p| p.get("next"))
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.replacen("http://", "https://", 1));
+                if is_end {
+                    break;
+                }
+                match next {
+                    Some(url) => next_url = url,
+                    None => {
+                        tracing::warn!(target: "zhihu", "通知源 {kind} 未到底但缺少 paging.next，停止该来源翻页");
+                        break;
+                    }
                 }
             }
+
+            if source_succeeded {
+                succeeded_sources += 1;
+            }
+            tracing::info!(target: "zhihu", "通知源 {kind} 共读取 {source_received} 条，识别 {source_candidates} 条邀请/推荐候选");
         }
-        Ok(out)
+
+        if succeeded_sources == 0 {
+            return Err(anyhow!("所有通知源均拉取失败：{}", errors.join("；")));
+        }
+        if out.is_empty() && !errors.is_empty() {
+            return Err(anyhow!(
+                "部分通知源读取失败，且没有识别到邀请/推荐候选：{}",
+                errors.join("；")
+            ));
+        }
+        Ok(NotificationBatch {
+            questions: out,
+            received,
+        })
     }
 
     pub async fn my_answers(&self, url_token: &str, pages: usize) -> Result<Vec<Value>> {
@@ -471,9 +564,14 @@ impl ZhihuClient {
                 Ok(data) => {
                     let len = data.len();
                     out.extend(data);
-                    if len < 20 { break; }
+                    if len < 20 {
+                        break;
+                    }
                 }
-                Err(e) => { tracing::warn!(target: "zhihu", "历史回答第 {page} 页失败: {e}"); break; }
+                Err(e) => {
+                    tracing::warn!(target: "zhihu", "历史回答第 {page} 页失败: {e}");
+                    break;
+                }
             }
         }
         Ok(out)
@@ -485,7 +583,10 @@ impl ZhihuClient {
             "https://www.zhihu.com/api/v4/members/{url_token}/answers?include=data[*].content,excerpt,voteup_count,comment_count,question.title&limit=20&offset={offset}&sort_by=voteups"
         );
         let v = self.send(reqwest::Method::GET, &url, true).await?;
-        Ok(v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default())
+        Ok(v.get("data")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub async fn my_articles(&self, url_token: &str, pages: usize) -> Result<Vec<Value>> {
@@ -495,9 +596,14 @@ impl ZhihuClient {
                 Ok(data) => {
                     let len = data.len();
                     out.extend(data);
-                    if len < 20 { break; }
+                    if len < 20 {
+                        break;
+                    }
                 }
-                Err(e) => { tracing::warn!(target: "zhihu", "历史文章第 {page} 页失败: {e}"); break; }
+                Err(e) => {
+                    tracing::warn!(target: "zhihu", "历史文章第 {page} 页失败: {e}");
+                    break;
+                }
             }
         }
         Ok(out)
@@ -509,12 +615,94 @@ impl ZhihuClient {
             "https://www.zhihu.com/api/v4/members/{url_token}/articles?include=data[*].content,excerpt,voteup_count,comment_count&limit=20&offset={offset}&sort_by=created"
         );
         let v = self.send(reqwest::Method::GET, &url, true).await?;
-        Ok(v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default())
+        Ok(v.get("data")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
+#[derive(Debug)]
+struct RequestError {
+    message: String,
+    retry_without_sign: bool,
+}
+
+impl RequestError {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry_without_sign: false,
+        }
+    }
+}
+
+impl From<reqwest::Error> for RequestError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::fatal(format!("请求知乎失败：{error}"))
+    }
+}
+
+async fn decode_response(resp: reqwest::Response) -> std::result::Result<Value, RequestError> {
+    let status = resp.status();
+    let text = resp.text().await.map_err(RequestError::from)?;
+    if !status.is_success() {
+        return Err(RequestError {
+            message: format!("HTTP {status}：知乎拒绝了请求：{}", slim(&text, 200)),
+            retry_without_sign: matches!(status.as_u16(), 401 | 403 | 404),
+        });
+    }
+    let value: Value = serde_json::from_str(&text).map_err(|_| {
+        RequestError::fatal(format!(
+            "知乎返回 HTTP {status}，但正文不是 JSON（可能是登录页或风控页）：{}",
+            slim(&text, 160)
+        ))
+    })?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("知乎接口返回错误");
+        return Err(RequestError::fatal(format!(
+            "{message}：{}",
+            slim(&error.to_string(), 180)
+        )));
+    }
+    Ok(value)
+}
+
+fn request_path(url: &str) -> String {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let after_scheme = without_fragment
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(without_fragment);
+    let path_start = after_scheme.find(['/', '?']).unwrap_or(after_scheme.len());
+    let path = &after_scheme[path_start..];
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('?') {
+        format!("/{path}")
+    } else {
+        path.to_string()
+    }
+}
+
+#[derive(Debug)]
+pub struct NotificationBatch {
+    pub questions: Vec<RawQuestion>,
+    pub received: usize,
+}
+
 fn notification_timestamp(item: &Value) -> Option<i64> {
-    for key in ["created_time", "created_at", "created", "time"] {
+    for key in [
+        "create_time",
+        "created_time",
+        "created_at",
+        "created",
+        "createdTime",
+        "time",
+    ] {
         let Some(value) = item.get(key) else { continue };
         if let Some(n) = value.as_i64() {
             return Some(if n > 10_000_000_000 { n / 1000 } else { n });
@@ -558,7 +746,10 @@ fn strip_html(s: &str) -> String {
             _ => {}
         }
     }
-    out.replace("&nbsp;", " ").replace("&quot;", "\"").trim().to_string()
+    out.replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .trim()
+        .to_string()
 }
 
 fn as_str(v: &Value, path: &[&str]) -> String {
@@ -569,18 +760,60 @@ fn as_str(v: &Value, path: &[&str]) -> String {
             None => return String::new(),
         };
     }
-    cur.as_str().unwrap_or("").to_string()
+    match cur {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
 }
 
-/// 通知条目结构在不同版本间有差异，这里做容错解析：
-/// 优先取 content.subject（问题对象），其次 target，再其次从文案里找 question id。
-fn parse_notification(item: &Value) -> Option<RawQuestion> {
+fn first_text(values: impl IntoIterator<Item = String>) -> String {
+    values
+        .into_iter()
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn question_id_from_text(text: &str) -> String {
+    let Some(pos) = text.find("/question/") else {
+        return String::new();
+    };
+    text[pos + 10..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect()
+}
+
+fn question_id_from_links(objects: &[&Value]) -> String {
+    for object in objects {
+        for key in ["url", "link", "target_link", "targetLink", "my_answer_url"] {
+            let qid = question_id_from_text(&as_str(object, &[key]));
+            if !qid.is_empty() {
+                return qid;
+            }
+        }
+    }
+    String::new()
+}
+
+/// 同时兼容 Web v2 与 Android v3 通知结构；独立 invite 时间线中的条目都按邀请处理。
+fn parse_notification(item: &Value, assume_invite: bool) -> Option<RawQuestion> {
     let content = item.get("content").unwrap_or(&Value::Null);
-    let text = strip_html(&as_str(content, &["text"]));
+    let target_source = item.get("target_source").unwrap_or(&Value::Null);
+    let raw_text = first_text([
+        as_str(content, &["text"]),
+        as_str(content, &["title"]),
+        as_str(content, &["sub_title"]),
+        as_str(content, &["subTitle"]),
+        as_str(content, &["target", "text"]),
+        as_str(target_source, &["full_text"]),
+        as_str(target_source, &["fullText"]),
+    ]);
+    let text = strip_html(&raw_text);
     let verb = as_str(content, &["verb"]);
 
-    // 只保留「邀请回答 / 推荐回答」类通知
-    let is_invite = verb.to_lowercase().contains("invite")
+    let is_invite = assume_invite
+        || verb.to_lowercase().contains("invite")
         || text.contains("邀请你回答")
         || text.contains("邀请回答");
     let is_recommend = verb.to_lowercase().contains("recommend")
@@ -594,35 +827,45 @@ fn parse_notification(item: &Value) -> Option<RawQuestion> {
     if !subject.is_object() {
         subject = item.get("target").cloned().unwrap_or(Value::Null);
     }
-    // subject 可能是 answer，其 question 字段才是问题
     let question = if as_str(&subject, &["type"]) == "answer" {
         subject.get("question").cloned().unwrap_or(Value::Null)
     } else {
         subject.clone()
     };
 
-    let mut qid = as_str(&question, &["id"]);
+    let mut qid = first_text([
+        as_str(&question, &["id"]),
+        as_str(&subject, &["question", "id"]),
+        as_str(target_source, &["object_id"]),
+        as_str(target_source, &["objectId"]),
+    ]);
     if qid.is_empty() {
-        qid = as_str(&subject, &["question", "id"]);
+        qid = question_id_from_links(&[
+            &question,
+            &subject,
+            content.get("target").unwrap_or(&Value::Null),
+            item.get("target").unwrap_or(&Value::Null),
+            target_source,
+            content,
+        ]);
     }
-    // 兜底：从 https://www.zhihu.com/question/123456 里抠
     if qid.is_empty() {
-        if let Some(pos) = text.find("/question/") {
-            let tail: String = text[pos + 10..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            qid = tail;
-        }
+        qid = question_id_from_text(&raw_text);
     }
     if qid.is_empty() {
         return None;
     }
 
-    let mut title = as_str(&question, &["title"]);
-    if title.is_empty() {
-        title = as_str(&subject, &["title"]);
-    }
+    let mut title = first_text([
+        as_str(&question, &["title"]),
+        as_str(&subject, &["title"]),
+        as_str(item, &["target", "title"]),
+        as_str(content, &["target", "text"]),
+        as_str(content, &["title"]),
+        as_str(target_source, &["top_text"]),
+        as_str(target_source, &["topText"]),
+    ]);
+    title = strip_html(&title);
     if title.is_empty() {
         title = text
             .split(['，', ',', '「', '」'])
@@ -636,6 +879,14 @@ fn parse_notification(item: &Value) -> Option<RawQuestion> {
         .get("actor")
         .cloned()
         .or_else(|| item.get("actor").cloned())
+        .or_else(|| {
+            content
+                .get("actors")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .cloned()
+        })
+        .or_else(|| item.pointer("/head/author").cloned())
         .unwrap_or(Value::Null);
 
     let tags = question
@@ -643,24 +894,116 @@ fn parse_notification(item: &Value) -> Option<RawQuestion> {
         .and_then(|t| t.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .filter_map(|t| {
+                    t.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect()
         })
         .unwrap_or_default();
+    let excerpt = first_text([
+        as_str(&question, &["excerpt"]),
+        as_str(target_source, &["sub_text"]),
+        as_str(target_source, &["subText"]),
+    ]);
+    let zhihu_id = first_text([
+        as_str(item, &["id"]),
+        as_str(item, &["unique_id"]),
+        as_str(item, &["uniqueId"]),
+    ]);
 
     Some(RawQuestion {
-        zhihu_id: as_str(item, &["id"]),
+        zhihu_id,
         question_id: qid.clone(),
         title,
-        excerpt: strip_html(&as_str(&question, &["excerpt"])),
+        excerpt: strip_html(&excerpt),
         url: format!("https://www.zhihu.com/question/{qid}"),
-        source: if is_invite { "invite".into() } else { "recommend".into() },
+        source: if is_invite {
+            "invite".into()
+        } else {
+            "recommend".into()
+        },
         asker_name: as_str(&asker, &["name"]),
         asker_headline: as_str(&asker, &["headline"]),
-        answer_count: question.get("answer_count").and_then(|x| x.as_i64()).unwrap_or(0),
-        follower_count: question.get("follower_count").and_then(|x| x.as_i64()).unwrap_or(0),
+        answer_count: question
+            .get("answer_count")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0),
+        follower_count: question
+            .get("follower_count")
+            .or_else(|| question.get("follow_num"))
+            .or_else(|| question.get("followNum"))
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0),
         tags,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_web_invite_with_numeric_id_and_create_time() {
+        let item = json!({
+            "id": "web-1",
+            "create_time": 1_790_000_000,
+            "content": {
+                "verb": "INVITE_ANSWER",
+                "actors": [{"name": "邀请人", "headline": "简介"}],
+                "target": {
+                    "text": "如何理解分布式系统？",
+                    "link": "https://www.zhihu.com/question/123456789"
+                }
+            }
+        });
+        let parsed = parse_notification(&item, false).expect("Web 邀请应可解析");
+        assert_eq!(parsed.question_id, "123456789");
+        assert_eq!(parsed.title, "如何理解分布式系统？");
+        assert_eq!(parsed.asker_name, "邀请人");
+        assert_eq!(notification_timestamp(&item), Some(1_790_000_000));
+    }
+
+    #[test]
+    fn parses_mobile_invite_timeline_item() {
+        let item = json!({
+            "uniqueId": "mobile-1",
+            "created": 1_790_000_000_000i64,
+            "content": {"title": "移动端邀请问题", "subTitle": "邀请你回答"},
+            "target": {
+                "id": "987654321",
+                "type": "question",
+                "title": "移动端邀请问题",
+                "followNum": 42
+            },
+            "head": {"author": {"name": "移动端邀请人", "headline": "作者简介"}}
+        });
+        let parsed = parse_notification(&item, true).expect("移动端邀请应可解析");
+        assert_eq!(parsed.zhihu_id, "mobile-1");
+        assert_eq!(parsed.question_id, "987654321");
+        assert_eq!(parsed.source, "invite");
+        assert_eq!(parsed.follower_count, 42);
+        assert_eq!(parsed.asker_name, "移动端邀请人");
+        assert_eq!(notification_timestamp(&item), Some(1_790_000_000));
+    }
+
+    #[test]
+    fn ignores_non_invite_notifications() {
+        let item = json!({
+            "content": {"verb": "ANSWER_VOTE_UP", "text": "有人赞了你的回答"},
+            "target": {"id": 123, "type": "question", "title": "不应入库"}
+        });
+        assert!(parse_notification(&item, false).is_none());
+    }
+
+    #[test]
+    fn signing_path_keeps_query_and_removes_fragment() {
+        assert_eq!(
+            request_path("https://www.zhihu.com/api/v4/me?include=foo#ignored"),
+            "/api/v4/me?include=foo"
+        );
+    }
 }
 
 fn slim(s: &str, n: usize) -> String {

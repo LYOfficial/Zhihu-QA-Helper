@@ -236,7 +236,6 @@ html[data-theme="paper"] body {
   align-items: center;
   height: 38px;
   flex: 0 0 38px;
-  padding-left: 14px;
   border-bottom: 1px solid var(--rule);
   background: var(--paper-raised);
   user-select: none;
@@ -249,6 +248,7 @@ html[data-theme="paper"] body {
   flex: 1;
   position: absolute;
   inset: 0 138px 0 0;
+  padding-left: 36px;
   z-index: 5;
   min-width: 0;
   cursor: default;
@@ -270,7 +270,14 @@ html[data-theme="paper"] body {
 .app-titlebar-brand .mark {
   display: grid;
   place-items: center;
-  color: var(--cinnabar);
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+}
+.app-titlebar-brand .mark img {
+  display: block;
+  width: 22px;
+  height: 22px;
 }
 .app-window-actions {
   position: relative;
@@ -1663,6 +1670,41 @@ html[data-theme="paper"] .profile-progress {
   margin-left: auto;
   padding: 3px 10px;
   font-size: 11.5px;
+}
+
+.sync-progress {
+  margin: 0 40px 16px;
+  padding: 10px 13px;
+  border: 1px solid rgba(23, 114, 246, 0.2);
+  background: var(--blue-wash);
+}
+.sync-progress-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+.sync-progress-head span:last-child {
+  color: var(--blue);
+  font-family: var(--font-num);
+}
+.sync-progress-track {
+  height: 5px;
+  margin-top: 7px;
+  background: rgba(23, 114, 246, 0.12);
+  overflow: hidden;
+}
+.sync-progress-track i {
+  display: block;
+  height: 100%;
+  background: var(--blue);
+  transition: width 0.3s ease;
+}
+.sync-progress-message {
+  margin-top: 5px;
+  color: var(--ink-3);
+  font-size: 11px;
 }
 
 .toasts {
