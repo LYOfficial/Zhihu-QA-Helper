@@ -6,17 +6,23 @@
   "remote": {
     "urls": [
       "http://localhost:31873/*",
-      "http://127.0.0.1:31873/*"
+      "http://127.0.0.1:31873/*",
+      "http://localhost:8787/*",
+      "http://127.0.0.1:8787/*"
     ]
   },
   "permissions": [
     "core:default",
     "core:window:allow-close",
     "core:window:allow-minimize",
+    "core:window:allow-unminimize",
     "core:window:allow-maximize",
     "core:window:allow-unmaximize",
     "core:window:allow-toggle-maximize",
+    "core:window:allow-internal-toggle-maximize",
     "core:window:allow-is-maximized",
+    "core:window:allow-is-minimized",
+    "core:window:allow-show",
     "core:window:allow-start-dragging"
   ]
 }

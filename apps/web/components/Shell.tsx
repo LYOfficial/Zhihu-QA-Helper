@@ -34,11 +34,6 @@ function WindowTitlebar() {
   const isTauriRuntime =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-  async function invokeWindow<T>(command: string): Promise<T> {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<T>(command);
-  }
-
   async function getAppWindow() {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     return getCurrentWindow();
@@ -46,35 +41,48 @@ function WindowTitlebar() {
 
   React.useEffect(() => {
     if (!isTauriRuntime) return;
-    void import("@tauri-apps/api/window")
-      .then(({ getCurrentWindow }) => getCurrentWindow().isMaximized())
+    void getAppWindow()
+      .then((w) => w.isMaximized())
       .then(setMaximized)
-      .catch(() => setMaximized(false));
+      // IPC 被拒绝时顶栏会整体失效且毫无提示，这里必须留下可查的痕迹。
+      .catch((error) => {
+        console.error("窗口控制不可用：请检查 capabilities/default.json 是否覆盖当前窗口来源", error);
+        setMaximized(false);
+      });
   }, [isTauriRuntime]);
 
+  // 只走 window 插件的官方命令：窗口来源是远程 URL（127.0.0.1:8787）时，
+  // 应用自定义命令必须挂在 app 级 ACL 上才可能被放行，实际会被判为
+  // “not allowed. Plugin not found”，所以这里不再使用自定义命令。
   async function onMinimize() {
     if (!isTauriRuntime) return;
-    try { await invokeWindow("window_minimize"); }
-    catch { try { await (await getAppWindow()).minimize(); } catch (error) { console.error("窗口最小化失败", error); } }
+    try {
+      await (await getAppWindow()).minimize();
+    } catch (error) {
+      console.error("窗口最小化失败", error);
+    }
   }
 
   async function onToggleMaximize() {
     if (!isTauriRuntime) return;
-    try { setMaximized(await invokeWindow<boolean>("window_toggle_maximize")); }
-    catch {
-      try {
-        const appWindow = await getAppWindow();
-        if (await appWindow.isMaximized()) await appWindow.unmaximize();
-        else await appWindow.maximize();
-        setMaximized(await appWindow.isMaximized());
-      } catch (error) { console.error("窗口最大化切换失败", error); }
+    try {
+      const appWindow = await getAppWindow();
+      const next = !(await appWindow.isMaximized());
+      if (next) await appWindow.maximize();
+      else await appWindow.unmaximize();
+      setMaximized(await appWindow.isMaximized());
+    } catch (error) {
+      console.error("窗口最大化切换失败", error);
     }
   }
 
   async function onClose() {
     if (!isTauriRuntime) return;
-    try { await invokeWindow("window_close"); }
-    catch { try { await (await getAppWindow()).close(); } catch (error) { console.error("窗口关闭失败", error); } }
+    try {
+      await (await getAppWindow()).close();
+    } catch (error) {
+      console.error("窗口关闭失败", error);
+    }
   }
 
   return (

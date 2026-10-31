@@ -221,37 +221,6 @@ fn trigger_sync() {
     }
 }
 
-fn main_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
-    app.get_webview_window("main")
-        .ok_or_else(|| "主窗口不存在".to_string())
-}
-
-#[tauri::command]
-fn window_start_dragging(app: tauri::AppHandle) -> Result<(), String> {
-    main_window(&app)?.start_dragging().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn window_minimize(app: tauri::AppHandle) -> Result<(), String> {
-    main_window(&app)?.minimize().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn window_toggle_maximize(app: tauri::AppHandle) -> Result<bool, String> {
-    let window = main_window(&app)?;
-    if window.is_maximized().map_err(|e| e.to_string())? {
-        window.unmaximize().map_err(|e| e.to_string())?;
-    } else {
-        window.maximize().map_err(|e| e.to_string())?;
-    }
-    window.is_maximized().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn window_close(app: tauri::AppHandle) -> Result<(), String> {
-    main_window(&app)?.close().map_err(|e| e.to_string())
-}
-
 fn main() {
     let Some(_instance_guard) = acquire_single_instance() else {
         eprintln!("[desktop] 已有知乎答主助手实例在运行，忽略本次重复启动");
@@ -261,12 +230,6 @@ fn main() {
     let ok = wait_core(Duration::from_secs(25));
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            window_start_dragging,
-            window_minimize,
-            window_toggle_maximize,
-            window_close
-        ])
         .manage(CoreProcess(Mutex::new(child)))
         .setup(move |app| {
             // 窗口在运行时创建：开发时指向 Next dev server（可热更新），
