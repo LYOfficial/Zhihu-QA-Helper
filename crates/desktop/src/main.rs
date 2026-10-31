@@ -21,6 +21,28 @@ const PORT: u16 = 8787;
 
 struct CoreProcess(Mutex<Option<Child>>);
 
+#[cfg(windows)]
+fn acquire_single_instance() -> Option<isize> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = "Local\\ZhihuQAHelperDesktop\0".encode_utf16().collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return None;
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(handle) };
+        return None;
+    }
+    Some(handle as isize)
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance() -> Option<()> {
+    Some(())
+}
+
 fn find_core_binary() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) {
         "zhihu-qa-core.exe"
@@ -199,11 +221,52 @@ fn trigger_sync() {
     }
 }
 
+fn main_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
+    app.get_webview_window("main")
+        .ok_or_else(|| "主窗口不存在".to_string())
+}
+
+#[tauri::command]
+fn window_start_dragging(app: tauri::AppHandle) -> Result<(), String> {
+    main_window(&app)?.start_dragging().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_minimize(app: tauri::AppHandle) -> Result<(), String> {
+    main_window(&app)?.minimize().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_toggle_maximize(app: tauri::AppHandle) -> Result<bool, String> {
+    let window = main_window(&app)?;
+    if window.is_maximized().map_err(|e| e.to_string())? {
+        window.unmaximize().map_err(|e| e.to_string())?;
+    } else {
+        window.maximize().map_err(|e| e.to_string())?;
+    }
+    window.is_maximized().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_close(app: tauri::AppHandle) -> Result<(), String> {
+    main_window(&app)?.close().map_err(|e| e.to_string())
+}
+
 fn main() {
+    let Some(_instance_guard) = acquire_single_instance() else {
+        eprintln!("[desktop] 已有知乎答主助手实例在运行，忽略本次重复启动");
+        return;
+    };
     let child = spawn_core();
     let ok = wait_core(Duration::from_secs(25));
 
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            window_start_dragging,
+            window_minimize,
+            window_toggle_maximize,
+            window_close
+        ])
         .manage(CoreProcess(Mutex::new(child)))
         .setup(move |app| {
             // 窗口在运行时创建：开发时指向 Next dev server（可热更新），
@@ -222,10 +285,11 @@ fn main() {
                 .min_inner_size(1060.0, 700.0)
                 .decorations(false)
                 .transparent(true)
-                .shadow(true)
+                .shadow(false)
                 .center()
                 .visible(false)
                 .build()?;
+            let _ = window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
             if dev_url.is_some() {
                 eprintln!("[desktop] 开发模式：窗口加载 {target}");
             }

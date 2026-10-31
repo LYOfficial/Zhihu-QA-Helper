@@ -2,9 +2,9 @@
 /**
  * 桌面开发模式：窗口里热更新，不是浏览器。
  *
- *   1. next dev        → localhost:3000（带 HMR）
+ *   1. next dev        → localhost:31873（带 HMR）
  *   2. cargo build 内核 → 确保 target/debug/zhihu-qa-core.exe 存在
- *   3. cargo run 桌面壳 → 窗口加载 http://localhost:3000
+ *   3. cargo run 桌面壳 → 窗口加载 http://localhost:31873
  *
  * 窗口内的界面调 API 走 http://127.0.0.1:8787（内核自己由桌面壳拉起）。
  * 只想在浏览器里调样式，用 `npm run dev:web`。
@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const isWin = process.platform === "win32";
-const DEV_URL = "http://localhost:3000";
+const DEV_URL = "http://localhost:31873";
 
 const procs = [];
 let shuttingDown = false;
@@ -24,7 +24,8 @@ let shuttingDown = false;
 function run(name, cmd, args, cwd, color, extraEnv = {}) {
   const child = spawn(cmd, args, {
     cwd,
-    shell: isWin,
+    shell: isWin && cmd === "npm",
+    windowsHide: true,
     env: { ...process.env, FORCE_COLOR: "1", ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -39,6 +40,10 @@ function run(name, cmd, args, cwd, color, extraEnv = {}) {
   };
   pipe(child.stdout);
   pipe(child.stderr);
+  child.on("error", (error) => {
+    console.error(tag + `启动失败：${error.message}`);
+    if (!shuttingDown) shutdown();
+  });
   child.on("exit", (code) => {
     if (shuttingDown) return;
     console.log(tag + `退出（code=${code}）`);
@@ -63,6 +68,10 @@ function shutdown() {
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+if (isWin) process.on("SIGBREAK", shutdown);
+process.on("exit", () => {
+  if (!shuttingDown) shutdown();
+});
 
 async function waitFor(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -94,9 +103,10 @@ console.log("  Next dev server 起来之后会自动打开桌面窗口\n");
 if (!existsSync(resolve(root, "apps/web/.build/index.html"))) {
   console.log("  首次运行：先导出一次前端（tauri 编译期需要该目录）…\n");
   await new Promise((res) => {
-    const c = spawn("npm", ["run", "build", "--workspace", "apps/web"], {
+    const c = spawn(isWin ? "npm" : "npm", ["run", "build", "--workspace", "apps/web"], {
       cwd: root,
       shell: isWin,
+      windowsHide: true,
       stdio: "inherit",
     });
     c.on("exit", (code) => res(code === 0));
@@ -117,7 +127,8 @@ console.log("  Next 就绪，准备内核与桌面窗口…\n");
 const coreOk = await new Promise((res) => {
   const c = spawn("cargo", ["build", "-p", "zhihu-qa-core"], {
     cwd: root,
-    shell: isWin,
+    shell: false,
+    windowsHide: true,
     stdio: "inherit",
   });
   c.on("exit", (code) => res(code === 0));

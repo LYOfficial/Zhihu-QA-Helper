@@ -8,11 +8,6 @@
   },
   "app": {
     "windows": [],
-    "trayIcon": {
-      "iconPath": "icons/32x32.png",
-      "iconAsTemplate": false,
-      "tooltip": "知乎答主助手 · 值守中"
-    },
     "security": {
       "csp": null
     }

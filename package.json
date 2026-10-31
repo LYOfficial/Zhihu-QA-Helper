@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:web": "npm run dev --workspace apps/web",
+    "dev:stop": "node scripts/stop-dev.mjs",
     "dev:core": "cargo run -p zhihu-qa-core",
     "dev:agent": "python agents/main.py",
     "app": "npm run build:web && cargo build -p zhihu-qa-core && cargo build -p zhihu-qa-desktop && node scripts/run-app.mjs",

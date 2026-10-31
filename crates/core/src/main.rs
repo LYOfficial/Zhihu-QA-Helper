@@ -150,8 +150,8 @@ async fn main() -> Result<()> {
     let mut app = api::router(state.clone()).layer(
         CorsLayer::new()
             .allow_origin([
-                "http://localhost:3000".parse::<HeaderValue>().unwrap(),
-                "http://127.0.0.1:3000".parse::<HeaderValue>().unwrap(),
+                "http://localhost:31873".parse::<HeaderValue>().unwrap(),
+                "http://127.0.0.1:31873".parse::<HeaderValue>().unwrap(),
                 "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
             ])
             .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
 <body style="font:15px/1.7 'Microsoft YaHei UI',sans-serif;background:#f7f4ed;color:#1b1a17;padding:48px;max-width:640px;margin:auto">
 <h1 style="font-family:KaiTi,serif;font-weight:400">内核已启动</h1>
 <p>后端运行在 <code>127.0.0.1:8787</code>，但还没找到前端产物。</p>
-<p>开发模式请另开终端执行 <code>npm run dev:web</code> 并访问 <code>localhost:3000</code>；<br>
+<p>开发模式请另开终端执行 <code>npm run dev:web</code> 并访问 <code>localhost:31873</code>；<br>
 打包模式请先执行 <code>npm run build:web</code> 生成 <code>apps/web/.build</code>。</p>
 </body>"#,
             )

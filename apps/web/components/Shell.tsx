@@ -31,32 +31,66 @@ type Toast = { id: number; msg: string; kind: "ok" | "err" | "info" };
 
 function WindowTitlebar() {
   const [maximized, setMaximized] = React.useState(false);
+  const isTauriRuntime =
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-  async function withWindow(action: (win: import("@tauri-apps/api/window").Window) => Promise<void>) {
-    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    await action(getCurrentWindow());
+  async function invokeWindow<T>(command: string): Promise<T> {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<T>(command);
   }
 
-  async function toggleMaximize() {
-    await withWindow(async (win) => {
-      await win.toggleMaximize();
-      setMaximized(await win.isMaximized());
-    });
+  async function getAppWindow() {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    return getCurrentWindow();
+  }
+
+  React.useEffect(() => {
+    if (!isTauriRuntime) return;
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => getCurrentWindow().isMaximized())
+      .then(setMaximized)
+      .catch(() => setMaximized(false));
+  }, [isTauriRuntime]);
+
+  async function onMinimize() {
+    if (!isTauriRuntime) return;
+    try { await invokeWindow("window_minimize"); }
+    catch { try { await (await getAppWindow()).minimize(); } catch (error) { console.error("窗口最小化失败", error); } }
+  }
+
+  async function onToggleMaximize() {
+    if (!isTauriRuntime) return;
+    try { setMaximized(await invokeWindow<boolean>("window_toggle_maximize")); }
+    catch {
+      try {
+        const appWindow = await getAppWindow();
+        if (await appWindow.isMaximized()) await appWindow.unmaximize();
+        else await appWindow.maximize();
+        setMaximized(await appWindow.isMaximized());
+      } catch (error) { console.error("窗口最大化切换失败", error); }
+    }
+  }
+
+  async function onClose() {
+    if (!isTauriRuntime) return;
+    try { await invokeWindow("window_close"); }
+    catch { try { await (await getAppWindow()).close(); } catch (error) { console.error("窗口关闭失败", error); } }
   }
 
   return (
-    <header className="app-titlebar" data-tauri-drag-region>
-      <Link href="/" className="app-titlebar-brand" data-tauri-drag-region>
-        <span className="mark"><Seal size={20} /></span>
-        <span>知乎答主助手</span>
-      </Link>
-      <div className="app-window-actions" data-tauri-drag-region="false">
-        <button aria-label="最小化" onClick={() => withWindow((win) => win.minimize())}>−</button>
-        <button aria-label={maximized ? "还原" : "最大化"} onClick={toggleMaximize}>
+    <header className="app-titlebar">
+      <div className="app-titlebar-drag" data-tauri-drag-region onDoubleClick={() => void onToggleMaximize()}>
+        <Link href="/" className="app-titlebar-brand" onClick={(event) => event.preventDefault()}>
+          <span className="mark"><Seal size={20} /></span>
+          <span>知乎答主助手</span>
+        </Link>
+      </div>
+      <div className="app-window-actions">
+        <button type="button" aria-label="最小化" onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); void onMinimize(); }}>−</button>
+        <button type="button" aria-label={maximized ? "还原" : "最大化"} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); void onToggleMaximize(); }}>
           {maximized ? "❐" : "□"}
         </button>
-        <button className="close" aria-label="关闭" onClick={() => withWindow((win) => win.close())}>×</button>
+        <button type="button" className="close" aria-label="关闭" onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); void onClose(); }}>×</button>
       </div>
     </header>
   );

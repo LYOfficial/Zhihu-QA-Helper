@@ -33,8 +33,8 @@ export function apiBase(): string {
   const env = process.env.NEXT_PUBLIC_API_BASE;
   if (env) {
     cachedBase = env.replace(/\/$/, "");
-  } else if (window.location.port === "3000") {
-    // next dev：前端在 3000，内核在 8787
+  } else if (window.location.port === "31873") {
+    // next dev：前端在 31873，内核在 8787
     cachedBase = "http://127.0.0.1:8787";
   } else {
     cachedBase = ""; // 桌面壳内：内核托管静态资源，同源
