@@ -43,7 +43,11 @@ export function watchJob(
     } catch {
       /* 单次轮询失败忽略 */
     }
-    if (tries > 120) clearInterval(timer); // 最多跟 4 分钟
+    if (tries > 300) {
+      // 10 分钟还没结束：明确告诉用户，不要留下一个永远转圈的界面
+      clearInterval(timer);
+      toast("这个任务比预期久，已停止跟随。可以点「刷新状态」查看结果", "info");
+    }
   }, 2000);
   return () => clearInterval(timer);
 }

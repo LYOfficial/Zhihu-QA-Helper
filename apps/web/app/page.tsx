@@ -92,8 +92,8 @@ export default function DeskHome() {
 
   async function research(item: Question) {
     try {
-      await api.post(`/api/questions/${item.id}/research`);
-      toast("智能体已接手，正在检索资料", "ok");
+      const r = await api.post<{ message?: string }>(`/api/questions/${item.id}/research`);
+      toast(r?.message || "智能体已接手，正在检索资料", "ok");
       q.reload(true);
       watchJob(item.id, "research", () => {
         q.reload(true);

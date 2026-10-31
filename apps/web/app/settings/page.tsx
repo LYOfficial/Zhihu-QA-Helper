@@ -11,10 +11,21 @@ import {
   Toggle,
   relTime,
 } from "@/components/ui";
-import { api, getMode, toast } from "@/lib/api";
+import { api, getMode, openExternal, toast } from "@/lib/api";
 import { useLoad } from "@/lib/hooks";
 import { PROVIDERS } from "@/lib/providers";
 import type { Health, ModelConfig, QrTicket, Session, Settings } from "@/lib/types";
+
+/** 把 1000000 写成 1M，界面上不占地方又看得懂 */
+function formatTokens(n: number): string {
+  if (!n) return "未知";
+  if (n >= 1_000_000) {
+    const v = n / 1_000_000;
+    return `${Number.isInteger(v) ? v : v.toFixed(1)}M`;
+  }
+  if (n >= 1000) return `${Math.round(n / 1000)}K`;
+  return String(n);
+}
 
 export default function SettingsPage() {
   const se = useLoad<Settings>(() => api.get("/api/settings"));
@@ -27,6 +38,9 @@ export default function SettingsPage() {
   const [test, setTest] = React.useState<{ ok: boolean; msg: string } | null>(null);
   const [models, setModels] = React.useState<string[]>([]);
   const [catalogModels, setCatalogModels] = React.useState<Record<string, string[]>>({});
+  const [catalogLimits, setCatalogLimits] = React.useState<
+    Record<string, Record<string, { context: number; output: number }>>
+  >({});
   const [catalogSyncing, setCatalogSyncing] = React.useState(false);
   const [catalogAt, setCatalogAt] = React.useState("");
   const [testing, setTesting] = React.useState(false);
@@ -122,23 +136,59 @@ export default function SettingsPage() {
     setModels(catalogModels[preset.key] ?? preset.models);
   }, [preset.key, catalogModels]);
 
-  async function syncCatalog() {
+  async function syncCatalog(silent = false) {
     setCatalogSyncing(true);
     try {
-      const r = await api.get<{ providers?: Record<string, string[]> }>("/api/model/catalog");
+      const r = await api.get<{
+        providers?: Record<string, string[]>;
+        limits?: Record<string, Record<string, { context: number; output: number }>>;
+      }>("/api/model/catalog");
       const nextCatalog = r.providers ?? {};
       setCatalogModels(nextCatalog);
+      setCatalogLimits(r.limits ?? {});
       const current = nextCatalog[model?.provider ?? ""] ?? [];
       if (current.length) setModels(current);
+      // 顺手把当前模型的容量补齐：之前存的是 0，说明还没同步过
+      const lim = r.limits?.[model?.provider ?? ""]?.[model?.model ?? ""];
+      if (lim && model && (!model.contextLimit || !model.outputLimit)) {
+        setModel({ ...model, contextLimit: lim.context, outputLimit: lim.output });
+      }
       setCatalogAt(new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }));
       window.sessionStorage.setItem("zhihu-qa-helper-model-catalog-synced", "1");
-      toast(current.length ? `模型库已同步，当前平台 ${current.length} 个模型` : "模型库已同步", "ok");
+      const withLimit = Object.values(r.limits ?? {}).reduce(
+        (n, byModel) => n + Object.keys(byModel).length,
+        0
+      );
+      if (!silent) {
+        toast(
+          current.length
+            ? `模型库已同步：当前平台 ${current.length} 个模型，${withLimit} 个带上下文容量`
+            : "模型库已同步",
+          "ok"
+        );
+      }
     } catch (e) {
-      toast(e instanceof Error ? e.message : "模型库同步失败，继续使用离线清单", "err");
+      if (!silent) toast(e instanceof Error ? e.message : "模型库同步失败，继续使用离线清单", "err");
     } finally {
       setCatalogSyncing(false);
     }
   }
+
+  const currentLimit = catalogLimits[model?.provider ?? ""]?.[model?.model ?? ""];
+  const ctxLimit = currentLimit?.context || model?.contextLimit || 0;
+  const outLimit = currentLimit?.output || model?.outputLimit || 0;
+
+  // 每次启动静默同步一次模型库：把 models.dev 的上下文容量补到当前模型上，
+  // 拟稿时才知道能一次性喂多少资料。失败就继续用内置清单，不打扰用户。
+  const autoSynced = React.useRef(false);
+  React.useEffect(() => {
+    if (autoSynced.current || !model) return;
+    autoSynced.current = true;
+    if (catalogAt) return;
+    if (window.sessionStorage.getItem("zhihu-qa-helper-model-catalog-synced") === "1") return;
+    void syncCatalog(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model]);
 
   if (!settings || !model) {
     return (
@@ -279,6 +329,8 @@ export default function SettingsPage() {
                     provider: p.key,
                     baseUrl: p.baseUrl,
                     model: p.models[0],
+                    contextLimit: catalogLimits[p.key]?.[p.models[0]]?.context ?? 0,
+                    outputLimit: catalogLimits[p.key]?.[p.models[0]]?.output ?? 0,
                   })
                 }
                 style={{
@@ -295,7 +347,7 @@ export default function SettingsPage() {
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
-            <button className="btn btn-sm" onClick={syncCatalog} disabled={catalogSyncing}>
+            <button className="btn btn-sm" onClick={() => syncCatalog()} disabled={catalogSyncing}>
               {catalogSyncing ? <Spinner /> : <IconRefresh size={13} />} 同步模型库
             </button>
             <span className="hint" style={{ margin: 0 }}>
@@ -323,17 +375,35 @@ export default function SettingsPage() {
                   className="input"
                   list="model-list"
                   value={model.model}
-                  onChange={(e) => setModel({ ...model, model: e.target.value, })}
+                  onChange={(e) => {
+                    const name = e.target.value;
+                    const lim = catalogLimits[model.provider]?.[name];
+                    setModel({
+                      ...model,
+                      model: name,
+                      ...(lim ? { contextLimit: lim.context, outputLimit: lim.output } : {}),
+                    });
+                  }}
                 />
-                <button className="btn btn-sm" style={{ flexShrink: 0 }} onClick={syncCatalog} disabled={catalogSyncing}>
+                <button className="btn btn-sm" style={{ flexShrink: 0 }} onClick={() => syncCatalog()} disabled={catalogSyncing}>
                   {catalogSyncing ? <Spinner /> : "同步"}
                 </button>
               </div>
               <datalist id="model-list">
-                {models.map((m) => (
-                  <option key={m} value={m} />
-                ))}
+                {models.map((m) => {
+                  const lim = catalogLimits[model.provider]?.[m];
+                  return (
+                    <option key={m} value={m}>
+                      {lim ? `上下文 ${formatTokens(lim.context)} · 输出 ${formatTokens(lim.output)}` : ""}
+                    </option>
+                  );
+                })}
               </datalist>
+              <p className="hint" style={{ marginTop: 5, marginBottom: 0, lineHeight: 1.6 }}>
+                {ctxLimit > 0
+                  ? `上下文 ${formatTokens(ctxLimit)} tokens${outLimit > 0 ? ` · 单次输出上限 ${formatTokens(outLimit)}` : ""}`
+                  : "上下文容量未知：点「同步模型库」可自动补全，拟稿时据此决定一次性喂多少资料"}
+              </p>
             </div>
             <div className="field">
               <label>API Key</label>
@@ -352,7 +422,13 @@ export default function SettingsPage() {
             {preset.docs && (
               <>
                 {" "}
-                <a href={preset.docs} target="_blank" rel="noreferrer noopener">
+                <a
+                  href={preset.docs}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void openExternal(preset.docs);
+                  }}
+                >
                   查看 {preset.label} 文档 ↗
                 </a>
               </>

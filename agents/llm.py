@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -111,6 +112,8 @@ def _post(url: str, payload: dict, headers: dict, timeout: int = 180) -> dict:
         raise LLMError(f"HTTP {e.code}：{_friendly(e.code, body)}") from None
     except urllib.error.URLError as e:
         raise LLMError(f"网络不可达：{e.reason}") from None
+    except TimeoutError:
+        raise LLMError(f"模型 {timeout} 秒内没有返回，已放弃本次调用") from None
     except json.JSONDecodeError:
         raise LLMError("返回内容不是合法 JSON，可能是网关错误页") from None
 
@@ -152,11 +155,34 @@ def _norm(cfg: dict) -> dict:
     }
 
 
+def _approx_tokens(messages: list[dict]) -> int:
+    """粗估输入 token：中文约 1 字 1 token，留 10% 余量。宁可高估，不要超窗。"""
+    chars = sum(len(str(m.get("content") or "")) for m in messages)
+    return int(chars * 1.1) + 16 * len(messages)
+
+
+def _clamp_tokens(cfg: dict, messages: list[dict], want: int) -> int:
+    """按模型真实容量收口 max_tokens。
+    推理模型会先花 token 思考，给太小就会出现「正文为空/JSON 被截断」。
+    models.dev 的 context / output 就是用来做这件事的。"""
+    want = int(want or 4096)
+    out_limit = int(cfg.get("outputLimit") or 0)
+    if out_limit > 0:
+        want = min(want, out_limit)
+    ctx = int(cfg.get("contextLimit") or 0)
+    if ctx > 0:
+        avail = ctx - _approx_tokens(messages) - 512
+        if avail > 0:
+            want = min(want, avail)
+    return max(256, want)
+
+
 def chat(cfg: dict, messages: list[dict], temperature: float = 0.3,
-         max_tokens: int = 4096, json_mode: bool = False) -> str:
+         max_tokens: int = 4096, json_mode: bool = False, timeout: int = 180) -> str:
     c = _norm(cfg)
     if not c["apiKey"] and c["provider"] != "custom":
         raise LLMError("还没有填写模型 API Key，请到「模型与账号」里配置")
+    max_tokens = _clamp_tokens(cfg, messages, max_tokens)
 
     if c["provider"] == "anthropic":
         system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
@@ -176,9 +202,13 @@ def chat(cfg: dict, messages: list[dict], temperature: float = 0.3,
                 "x-api-key": c["apiKey"],
                 "anthropic-version": "2023-06-01",
             },
+            timeout=timeout,
         )
         blocks = res.get("content") or []
-        return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        if not text.strip():
+            raise LLMError(f"模型没有输出正文（stop_reason={res.get('stop_reason')}）")
+        return text
 
     payload = {
         "model": c["model"],
@@ -190,11 +220,87 @@ def chat(cfg: dict, messages: list[dict], temperature: float = 0.3,
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
     headers = {"Authorization": f"Bearer {c['apiKey']}"} if c["apiKey"] else {}
-    res = _post(f"{c['baseUrl']}/chat/completions", payload, headers)
+    res = _post(f"{c['baseUrl']}/chat/completions", payload, headers, timeout=timeout)
     try:
-        return res["choices"][0]["message"]["content"] or ""
+        choice = res["choices"][0]
+        text = (choice.get("message") or {}).get("content") or ""
+        reason = choice.get("finish_reason")
     except (KeyError, IndexError):
         raise LLMError(f"模型返回结构异常：{json.dumps(res, ensure_ascii=False)[:300]}") from None
+    if not text.strip():
+        if reason == "length":
+            raise LLMError(
+                f"模型输出被截断（max_tokens={max_tokens} 全被推理占用）。请换非推理模型，或把上限调大"
+            )
+        raise LLMError(f"模型返回空正文（finish_reason={reason}）")
+    return text
+
+
+def _salvage(text: str) -> dict:
+    """JSON 被截断时的兜底：至少把已经写出来的正文捞回来，不让整次拟稿白跑。"""
+    out: dict = {}
+    m = re.search(r'"markdown"\s*:\s*"', text)
+    if m:
+        start = m.end()
+        buf = []
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if ch == "\\" and i + 1 < len(text):
+                esc = text[i + 1]
+                buf.append({"n": "\n", "t": "\t", '"': '"', "\\": "\\"}.get(esc, esc))
+                i += 2
+                continue
+            if ch == '"':
+                break
+            buf.append(ch)
+            i += 1
+        body = "".join(buf).strip()
+        if len(body) >= 80:
+            out["markdown"] = body
+    return out
+
+
+def chat_json(cfg: dict, messages: list[dict], temperature: float = 0.3,
+              max_tokens: int = 8000, retry_tokens: int = 16000,
+              timeout: int = 180, min_chars: int = 0) -> dict:
+    """要 JSON 的调用：一次不够就放大上限重试一次，最后做截断兜底。
+    推理模型会把 max_tokens 花在 reasoning 上，所以这里默认给足余量。"""
+    raw = chat(cfg, messages, temperature=temperature, max_tokens=max_tokens,
+               json_mode=True, timeout=timeout)
+    try:
+        data = extract_json(raw)
+        if not isinstance(data, dict):
+            raise LLMError("模型返回的 JSON 不是对象")
+        if min_chars and len(str(data.get("markdown") or "")) < min_chars:
+            raise LLMError("正文过短")
+        return data
+    except LLMError as first:
+        retry = list(messages)
+        retry.append({"role": "assistant", "content": raw[:1200]})
+        retry.append(
+            {
+                "role": "user",
+                "content": "上面的输出被截断了。请重新输出一份完整且合法闭合的 JSON，"
+                "不要省略字段，正文控制在要求字数下沿，确保最后一个大括号闭合。",
+            }
+        )
+        raw2 = chat(cfg, retry, temperature=temperature, max_tokens=retry_tokens,
+                    json_mode=True, timeout=timeout)
+        try:
+            data = extract_json(raw2)
+            if isinstance(data, dict) and data:
+                return data
+        except LLMError:
+            pass
+        for candidate in (raw2, raw):
+            saved = _salvage(candidate)
+            if saved.get("markdown"):
+                saved.setdefault("doubts", [])
+                saved.setdefault("citations", [])
+                saved["_salvaged"] = True
+                return saved
+        raise first
 
 
 def list_models(cfg: dict) -> dict:
@@ -237,11 +343,15 @@ def list_models(cfg: dict) -> dict:
 
 
 def sync_catalog() -> dict:
-    """从 models.dev 开源目录同步各主流厂商的模型 ID。"""
+    """从 models.dev 开源目录同步各主流厂商的模型 ID 与上下文容量。
+    models.dev 的每个模型都带 limit.context / limit.output，
+    这里一并取回：调用方据此决定一次性最多能塞多少 token。"""
     raw = _get_json(MODEL_CATALOG_URL)
     out = {}
+    limits: dict[str, dict[str, dict]] = {}
     for provider, source_names in CATALOG_SOURCES.items():
         ids = []
+        lim: dict[str, dict] = {}
         for source in source_names:
             item = raw.get(source) if isinstance(raw, dict) else None
             models = item.get("models", {}) if isinstance(item, dict) else {}
@@ -249,14 +359,25 @@ def sync_catalog() -> dict:
                 for key, meta in models.items():
                     if isinstance(meta, dict) and meta.get("type") not in (None, "text"):
                         continue
-                    if str(key).strip():
-                        ids.append(str(key))
+                    if not str(key).strip():
+                        continue
+                    ids.append(str(key))
+                    if isinstance(meta, dict):
+                        limit = meta.get("limit") or {}
+                        ctx = limit.get("context") or limit.get("input")
+                        outp = limit.get("output")
+                        if isinstance(ctx, (int, float)) and ctx > 0:
+                            lim[str(key)] = {
+                                "context": int(ctx),
+                                "output": int(outp) if isinstance(outp, (int, float)) and outp > 0 else 0,
+                            }
         unique = sorted(set(ids))
         if unique:
             out[provider] = unique[:80]
+            limits[provider] = {m: lim[m] for m in unique[:80] if m in lim}
     if not out:
         raise LLMError("模型目录没有返回可用的主流模型")
-    return {"providers": out, "source": MODEL_CATALOG_URL}
+    return {"providers": out, "limits": limits, "source": MODEL_CATALOG_URL}
 
 
 def test_model(cfg: dict) -> dict:

@@ -44,7 +44,6 @@ pub async fn job_end(state: &AppState, id: &str, ok: bool, msg: &str) {
     db.log_event("job", None, if ok { "任务完成" } else { "任务失败" }, msg);
 }
 
-
 /// 智能体出错时返回的是 200 + {ok:false, error}，这里把真实原因透出去，
 /// 别让用户看到「没有返回正文」这种没用的提示。
 fn agent_ok(resp: &Value) -> Result<()> {
@@ -127,7 +126,8 @@ async fn load_terms(state: &AppState) -> Vec<ProfileTerm> {
             })
         })
         .ok();
-    rows.map(|it| it.filter_map(|x| x.ok()).collect()).unwrap_or_default()
+    rows.map(|it| it.filter_map(|x| x.ok()).collect())
+        .unwrap_or_default()
 }
 
 // ---------------- 同步通知 ----------------
@@ -172,12 +172,44 @@ pub async fn start_sync(state: &crate::state::Shared, days: Option<i64>) -> Stri
     job
 }
 
+/// 内核被杀或重启后，库里会留下永远「running」的任务和永远「researching」的问题。
+/// 启动时统一收尾，否则界面会一直转圈，用户以为智能体还在干活。
+pub async fn recover_stale_jobs(state: &AppState) {
+    let db = state.db.lock().await;
+    let jobs = db
+        .conn
+        .execute(
+            "UPDATE jobs SET state='failed', progress=1.0, message=?1, finished_at=?2
+             WHERE state='running'",
+            params!["内核重启，任务已中断，请重新发起", now_iso()],
+        )
+        .unwrap_or(0);
+    let questions = db
+        .conn
+        .execute(
+            "UPDATE questions SET status='inbox' WHERE status='researching'",
+            [],
+        )
+        .unwrap_or(0);
+    if jobs > 0 || questions > 0 {
+        tracing::warn!(jobs, questions, "已清理上次运行残留的进行中任务");
+        db.log_event(
+            "job",
+            None,
+            "清理中断任务",
+            &format!("{jobs} 个任务标记失败，{questions} 个问题退回待阅"),
+        );
+    }
+}
+
 pub async fn bootstrap_if_empty(state: &crate::state::Shared) {
     let should_sync = {
         let db = state.db.lock().await;
         let logged_in = db
             .conn
-            .query_row("SELECT cookie FROM account WHERE id=1", [], |r| r.get::<_, String>(0))
+            .query_row("SELECT cookie FROM account WHERE id=1", [], |r| {
+                r.get::<_, String>(0)
+            })
             .map(|cookie| !cookie.trim().is_empty())
             .unwrap_or(false);
         let questions = db
@@ -206,13 +238,21 @@ async fn run_sync_window(state: &crate::state::Shared, days: Option<i64>) -> Res
     result
 }
 
-async fn sync_inner(state: &crate::state::Shared, job: &str, days: Option<i64>) -> Result<SyncReport> {
+async fn sync_inner(
+    state: &crate::state::Shared,
+    job: &str,
+    days: Option<i64>,
+) -> Result<SyncReport> {
     job_step(
         state,
         job,
         "拉取通知",
         0.12,
-        if days.is_some() { "补齐最近 3 天通知" } else { "读取通知中心" },
+        if days.is_some() {
+            "补齐最近 3 天通知"
+        } else {
+            "读取通知中心"
+        },
     )
     .await;
     let client = zhihu_client(state).await?;
@@ -228,7 +268,10 @@ async fn sync_inner(state: &crate::state::Shared, job: &str, days: Option<i64>) 
         job,
         "归类领域",
         0.45,
-        &format!("读取 {received} 条通知，识别 {} 条邀请/推荐候选", raws.len()),
+        &format!(
+            "读取 {received} 条通知，识别 {} 条邀请/推荐候选",
+            raws.len()
+        ),
     )
     .await;
     let terms = load_terms(state).await;
@@ -330,7 +373,11 @@ async fn sync_inner(state: &crate::state::Shared, job: &str, days: Option<i64>) 
             "sync",
             None,
             "完成一次通知同步",
-            &format!("读取 {received} 条通知，识别 {} 条候选，新增 {added} 条，进入重点队列 {} 条", raws.len(), selected_ids.len()),
+            &format!(
+                "读取 {received} 条通知，识别 {} 条候选，新增 {added} 条，进入重点队列 {} 条",
+                raws.len(),
+                selected_ids.len()
+            ),
         );
     }
 
@@ -340,9 +387,15 @@ async fn sync_inner(state: &crate::state::Shared, job: &str, days: Option<i64>) 
         selected: selected_ids.len(),
         by_domain,
         message: if added == 0 {
-            format!("读取 {received} 条通知，识别 {} 条邀请/推荐，没有新的问题", raws.len())
+            format!(
+                "读取 {received} 条通知，识别 {} 条邀请/推荐，没有新的问题",
+                raws.len()
+            )
         } else {
-            format!("读取 {received} 条通知，新增 {added} 个问题，{} 个进入重点队列", selected_ids.len())
+            format!(
+                "读取 {received} 条通知，新增 {added} 个问题，{} 个进入重点队列",
+                selected_ids.len()
+            )
         },
     };
 
@@ -363,7 +416,9 @@ async fn sync_inner(state: &crate::state::Shared, job: &str, days: Option<i64>) 
 pub async fn run_profile_job(state: &AppState, job: String) -> Result<()> {
     {
         let db = state.db.lock().await;
-        let _ = db.conn.execute("UPDATE profile_meta SET status='running' WHERE id=1", []);
+        let _ = db
+            .conn
+            .execute("UPDATE profile_meta SET status='running' WHERE id=1", []);
     }
     let r = profile_inner(state, &job).await;
     match &r {
@@ -386,7 +441,9 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         let db = state.db.lock().await;
         let tok: String = db
             .conn
-            .query_row("SELECT url_token FROM account WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT url_token FROM account WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap_or_default();
         let ck: String = db
             .conn
@@ -401,10 +458,24 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
     job_step(state, job, "抓取回答", 0.16, "正在获取回答列表").await;
     let client = zhihu_client(state).await?;
     let answers = client.my_answers(&url_token, 3).await.unwrap_or_default();
-    job_step(state, job, "抓取回答", 0.28, &format!("已获取 {} 条回答", answers.len())).await;
+    job_step(
+        state,
+        job,
+        "抓取回答",
+        0.28,
+        &format!("已获取 {} 条回答", answers.len()),
+    )
+    .await;
     job_step(state, job, "抓取文章", 0.34, "正在获取文章列表").await;
     let articles = client.my_articles(&url_token, 2).await.unwrap_or_default();
-    job_step(state, job, "整理样本", 0.42, &format!("已获取 {} 篇文章", articles.len())).await;
+    job_step(
+        state,
+        job,
+        "整理样本",
+        0.42,
+        &format!("已获取 {} 篇文章", articles.len()),
+    )
+    .await;
     let sample = answers.len() + articles.len();
     if sample == 0 {
         anyhow::bail!("没有抓到历史内容，可能是登录态失效");
@@ -430,10 +501,20 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         }))
         .collect();
 
-    job_step(state, job, "整理样本", 0.5, &format!("正在整理 {} 条历史内容", sample)).await;
+    job_step(
+        state,
+        job,
+        "整理样本",
+        0.5,
+        &format!("正在整理 {} 条历史内容", sample),
+    )
+    .await;
     job_step(state, job, "模型归纳", 0.58, "正在归纳主领域与边界").await;
 
-    let model = { let db = state.db.lock().await; load_model(&db) };
+    let model = {
+        let db = state.db.lock().await;
+        load_model(&db)
+    };
     let payload = json!({
         "samples": samples,
         "model": model,
@@ -443,11 +524,19 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
     agent_ok(&resp)?;
     job_step(state, job, "提取词条", 0.76, "正在提取关键词与可迁移领域").await;
 
-    let summary = resp.get("summary").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let summary = resp
+        .get("summary")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let evidence: Vec<String> = resp
         .get("evidence")
         .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let terms = resp
         .get("terms")
@@ -459,7 +548,10 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         let db = state.db.lock().await;
         // 用户手动锁定的词条保留
         let locked: Vec<String> = {
-            let mut stmt = db.conn.prepare("SELECT id FROM profile_terms WHERE locked = 1").ok();
+            let mut stmt = db
+                .conn
+                .prepare("SELECT id FROM profile_terms WHERE locked = 1")
+                .ok();
             stmt.as_mut()
                 .and_then(|s| {
                     s.query_map([], |r| r.get::<_, String>(0))
@@ -468,7 +560,9 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
                 })
                 .unwrap_or_default()
         };
-        let _ = db.conn.execute("DELETE FROM profile_terms WHERE locked = 0", []);
+        let _ = db
+            .conn
+            .execute("DELETE FROM profile_terms WHERE locked = 0", []);
 
         for (i, t) in terms.iter().enumerate() {
             let label = t.get("label").and_then(|x| x.as_str()).unwrap_or("").trim();
@@ -476,9 +570,10 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
                 continue;
             }
             let id = format!("t_{}", Uuid::new_v4().simple());
-            if locked.iter().any(|l| {
-                l.to_lowercase().contains(&label.to_lowercase())
-            }) {
+            if locked
+                .iter()
+                .any(|l| l.to_lowercase().contains(&label.to_lowercase()))
+            {
                 continue;
             }
             let kws = t.get("keywords").cloned().unwrap_or(json!([]));
@@ -501,7 +596,12 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
             "UPDATE profile_meta SET status='ready', summary=?1, evidence=?2, sample_size=?3, updated_at=?4 WHERE id=1",
             params![summary, serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".into()), sample as i64, now_iso()],
         );
-        db.log_event("profile", None, "更新领域画像", &format!("基于 {sample} 篇内容"));
+        db.log_event(
+            "profile",
+            None,
+            "更新领域画像",
+            &format!("基于 {sample} 篇内容"),
+        );
     }
 
     // 画像有了，顺手让模型推荐权威平台
@@ -532,8 +632,18 @@ async fn discover_inner(state: &AppState, job: &str) -> Result<()> {
     if primary.is_empty() {
         anyhow::bail!("领域画像还是空的，先做完画像再来");
     }
-    job_step(state, job, "检索", 0.4, &format!("为「{}」寻找权威来源", primary.join(" / "))).await;
-    let model = { let db = state.db.lock().await; load_model(&db) };
+    job_step(
+        state,
+        job,
+        "检索",
+        0.4,
+        &format!("为「{}」寻找权威来源", primary.join(" / ")),
+    )
+    .await;
+    let model = {
+        let db = state.db.lock().await;
+        load_model(&db)
+    };
     let resp = state
         .agent
         .post(
@@ -542,7 +652,11 @@ async fn discover_inner(state: &AppState, job: &str) -> Result<()> {
         )
         .await?;
     agent_ok(&resp)?;
-    let items = resp.get("sources").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let items = resp
+        .get("sources")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
     {
         let db = state.db.lock().await;
         for s in &items {
@@ -552,7 +666,11 @@ async fn discover_inner(state: &AppState, job: &str) -> Result<()> {
             }
             let existing: Option<String> = db
                 .conn
-                .query_row("SELECT id FROM sources WHERE name = ?1 AND domain = ?2", params![name, s.get("domain").and_then(|x| x.as_str()).unwrap_or("")], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM sources WHERE name = ?1 AND domain = ?2",
+                    params![name, s.get("domain").and_then(|x| x.as_str()).unwrap_or("")],
+                    |r| r.get(0),
+                )
                 .ok();
             if existing.is_some() {
                 continue;
@@ -572,16 +690,48 @@ async fn discover_inner(state: &AppState, job: &str) -> Result<()> {
                 ],
             );
         }
-        let n: i64 = db.conn.query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0)).unwrap_or(0);
-        db.log_event("sources", None, "更新权威平台清单", &format!("共 {n} 个来源"));
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0))
+            .unwrap_or(0);
+        db.log_event(
+            "sources",
+            None,
+            "更新权威平台清单",
+            &format!("共 {n} 个来源"),
+        );
     }
     Ok(())
 }
 
 // ---------------- 出稿（核心流水线） ----------------
 
+/// 同时最多跑两份稿子。三份以上一起打同一个模型 Key，既容易限流，
+/// 也会让每一份都慢到让人以为卡死。
 pub async fn run_research(state: &AppState, question_id: &str) -> Result<()> {
+    // 同一问题已在跑就直接返回，别叠出第二个幽灵任务
+    {
+        let db = state.db.lock().await;
+        let running: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE kind='research' AND question_id=?1 AND state='running'",
+                params![question_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if running > 0 {
+            tracing::info!(target: "jobs", qid = %question_id, "该问题已有拟稿任务在跑，跳过重复启动");
+            return Ok(());
+        }
+    }
+
     let job = job_start(state, "research", Some(question_id), "排队中").await;
+    let _slot = match state.research_slots.acquire().await {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    job_step(state, &job, "准备", 0.05, "已获得拟稿名额，准备检索").await;
     let r = research_inner(state, question_id, &job).await;
     match &r {
         Ok(_) => job_end(state, &job, true, "初稿已就绪，等待人工批阅").await,
@@ -595,6 +745,46 @@ pub async fn run_research(state: &AppState, question_id: &str) -> Result<()> {
         }
     }
     r
+}
+
+/// 调智能体期间持续更新进度。用户至少能看到「已经跑了多少秒」，
+/// 而不是一个永远不动的转圈。
+async fn agent_research_with_progress(
+    state: &AppState,
+    job: &str,
+    payload: &Value,
+    hard_deadline: std::time::Duration,
+) -> Result<Value> {
+    let started = std::time::Instant::now();
+    let fut = state.agent.post("/v1/research", payload);
+    tokio::pin!(fut);
+    let mut last_note = 0u64;
+    loop {
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+                let elapsed = started.elapsed().as_secs();
+                if started.elapsed() > hard_deadline {
+                    anyhow::bail!(
+                        "智能体 {} 秒仍没有返回，已中止。请检查模型网络是否正常，或换一个更快的模型",
+                        hard_deadline.as_secs()
+                    );
+                }
+                let note = elapsed / 15;
+                if note != last_note {
+                    last_note = note;
+                    job_step(
+                        state,
+                        job,
+                        "起草",
+                        0.5,
+                        &format!("智能体正在检索资料、起草并核对（已用 {elapsed} 秒）"),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
 }
 
 async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
@@ -639,7 +829,9 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
 
         let summary: String = db
             .conn
-            .query_row("SELECT summary FROM profile_meta WHERE id=1", [], |r| r.get(0))
+            .query_row("SELECT summary FROM profile_meta WHERE id=1", [], |r| {
+                r.get(0)
+            })
             .unwrap_or_default();
 
         let mut stmt = db.conn.prepare(
@@ -709,10 +901,13 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
         "settings": settings,
         "imagesDir": img_dir.to_string_lossy(),
         "imagesUrlBase": format!("/api/images/{}", qid),
+        "deadlineSeconds": 300,
     });
 
-    job_step(state, job, "起草", 0.45, "生成初稿并标注疑问点").await;
-    let resp = state.agent.post("/v1/research", &payload).await?;
+    job_step(state, job, "起草", 0.45, "检索权威资料、起草并核对疑问点").await;
+    let resp =
+        agent_research_with_progress(state, job, &payload, std::time::Duration::from_secs(420))
+            .await?;
     agent_ok(&resp)?;
 
     let markdown = resp
@@ -724,27 +919,52 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
         anyhow::bail!("智能体没有返回正文");
     }
     let doubts = resp.pointer("/draft/doubts").cloned().unwrap_or(json!([]));
-    let citations = resp.pointer("/draft/citations").cloned().unwrap_or(json!([]));
-    let images = resp.get("images").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let citations = resp
+        .pointer("/draft/citations")
+        .cloned()
+        .unwrap_or(json!([]));
+    let images = resp
+        .get("images")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let warnings: Vec<String> = resp
+        .get("warnings")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     let used_model = resp
         .get("model")
         .and_then(|x| x.as_str())
         .unwrap_or(&model.model)
         .to_string();
 
-    job_step(state, job, "校对与取图", 0.8, &format!("{} 张配图", images.len())).await;
+    let step_note = if warnings.is_empty() {
+        format!("{} 张配图", images.len())
+    } else {
+        format!("{} 张配图；{}", images.len(), warnings.join("；"))
+    };
+    job_step(state, job, "校对与取图", 0.8, &step_note).await;
 
     let word_count = markdown.chars().filter(|c| !c.is_whitespace()).count() as i64;
+    let warnings_json = serde_json::to_string(&warnings).unwrap_or_else(|_| "[]".into());
 
     {
         let db = state.db.lock().await;
         let _ = db.conn.execute(
-            "INSERT INTO drafts (question_id, markdown, doubts, citations, model, word_count, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(question_id) DO UPDATE SET markdown=?2, doubts=?3, citations=?4, model=?5, word_count=?6, updated_at=?7",
-            params![qid, markdown, doubts.to_string(), citations.to_string(), used_model, word_count, now_iso()],
+            "INSERT INTO drafts (question_id, markdown, doubts, citations, model, word_count, updated_at, warnings)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(question_id) DO UPDATE SET markdown=?2, doubts=?3, citations=?4, model=?5, word_count=?6, updated_at=?7, warnings=?8",
+            params![qid, markdown, doubts.to_string(), citations.to_string(), used_model, word_count, now_iso(), warnings_json],
         );
-        let _ = db.conn.execute("DELETE FROM images WHERE question_id=?1", params![qid]);
+        let _ = db
+            .conn
+            .execute("DELETE FROM images WHERE question_id=?1", params![qid]);
         for img in &images {
             let filename = img.get("filename").and_then(|x| x.as_str()).unwrap_or("");
             if filename.is_empty() {
@@ -822,7 +1042,7 @@ pub fn load_settings(db: &crate::db::Db) -> Settings {
 pub fn load_model(db: &crate::db::Db) -> ModelConfig {
     let mut model = db.conn
         .query_row(
-            "SELECT provider, base_url, model, api_key, temperature, verified_at FROM model_config WHERE id=1",
+            "SELECT provider, base_url, model, api_key, temperature, verified_at, context_limit, output_limit FROM model_config WHERE id=1",
             [],
             |r| {
                 let key: String = r.get(3)?;
@@ -834,6 +1054,8 @@ pub fn load_model(db: &crate::db::Db) -> ModelConfig {
                     api_key: key,
                     temperature: r.get(4)?,
                     verified_at: r.get(5)?,
+                    context_limit: r.get(6)?,
+                    output_limit: r.get(7)?,
                 })
             },
         )
@@ -845,6 +1067,8 @@ pub fn load_model(db: &crate::db::Db) -> ModelConfig {
             has_key: false,
             temperature: 0.3,
             verified_at: None,
+            context_limit: 0,
+            output_limit: 0,
         });
     if model.provider == "openrouter" {
         model.provider = "deepseek".into();

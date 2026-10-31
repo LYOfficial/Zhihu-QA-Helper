@@ -137,6 +137,7 @@ async fn main() -> Result<()> {
     let state = state::AppState::new(database, data_dir.clone(), agent_port);
 
     let _agent = spawn_agent(agent_port, &data_dir);
+    tasks::recover_stale_jobs(&state).await;
     scheduler::spawn(state.clone());
     let bootstrap_state = state.clone();
     tokio::spawn(async move {
@@ -154,7 +155,13 @@ async fn main() -> Result<()> {
                 "http://127.0.0.1:31873".parse::<HeaderValue>().unwrap(),
                 "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
             ])
-            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
             .allow_headers(tower_http::cors::Any),
     );
 

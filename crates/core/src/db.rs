@@ -192,6 +192,7 @@ impl Db {
         std::fs::create_dir_all(dir.join("logs"))?;
         let conn = Connection::open(dir.join("zhihu-qa.db"))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         let db = Db {
             conn,
             data_dir: dir.to_path_buf(),
@@ -204,10 +205,8 @@ impl Db {
     fn seed_defaults(&self) -> Result<()> {
         self.conn
             .execute("INSERT OR IGNORE INTO settings (id) VALUES (1)", [])?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO model_config (id) VALUES (1)",
-            [],
-        )?;
+        self.conn
+            .execute("INSERT OR IGNORE INTO model_config (id) VALUES (1)", [])?;
         self.conn.execute(
             "INSERT OR IGNORE INTO profile_meta (id, status) VALUES (1, 'empty')",
             [],
@@ -224,7 +223,11 @@ impl Db {
 
     /// 归档目录：`data/domains/<领域>/<问题标题>.md`
     pub fn archive_draft(&self, domain: &str, title: &str, markdown: &str) -> Result<PathBuf> {
-        let safe_domain = sanitize(if domain.is_empty() { "未分类" } else { domain });
+        let safe_domain = sanitize(if domain.is_empty() {
+            "未分类"
+        } else {
+            domain
+        });
         let dir = self.data_dir.join("domains").join(safe_domain);
         std::fs::create_dir_all(&dir)?;
         let name = format!("{}.md", sanitize(title));
@@ -257,6 +260,41 @@ impl Db {
         )?;
         Ok(freed)
     }
+}
+
+/// 轻量迁移：只做加法，不删不改，老库升级不会丢数据。
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, column: &str| -> bool {
+        let sql = format!("PRAGMA table_info({table})");
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let found = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map(|rows| rows.filter_map(|x| x.ok()).any(|name| name == column))
+            .unwrap_or(false);
+        found
+    };
+    if !has_column("drafts", "warnings") {
+        conn.execute(
+            "ALTER TABLE drafts ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    if !has_column("model_config", "context_limit") {
+        conn.execute(
+            "ALTER TABLE model_config ADD COLUMN context_limit INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column("model_config", "output_limit") {
+        conn.execute(
+            "ALTER TABLE model_config ADD COLUMN output_limit INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn sanitize(s: &str) -> String {

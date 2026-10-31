@@ -75,8 +75,8 @@ export default function InboxPage() {
 
   async function research(item: Question) {
     try {
-      await api.post(`/api/questions/${item.id}/research`);
-      toast("已交给智能体，正在检索资料并起草", "ok");
+      const r = await api.post<{ message?: string }>(`/api/questions/${item.id}/research`);
+      toast(r?.message || "已交给智能体，正在检索资料并起草", "ok");
       setTimeout(() => qs.reload(true), 1200);
       watchJob(item.id, "research", () => qs.reload(true));
     } catch (e) {

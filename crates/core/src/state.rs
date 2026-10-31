@@ -15,6 +15,8 @@ pub struct AppState {
     pub qr_cookie: Mutex<String>,
     /// 界面请求「用应用内浏览器登录」的标记，由桌面壳轮询后打开登录窗口
     pub browser_login_pending: Mutex<bool>,
+    /// 拟稿并发名额：同时最多两份，避免多份稿子抢同一个模型 Key
+    pub research_slots: tokio::sync::Semaphore,
 }
 
 pub type Shared = Arc<AppState>;
@@ -29,6 +31,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION").to_string(),
             qr_cookie: Mutex::new(String::new()),
             browser_login_pending: Mutex::new(false),
+            research_slots: tokio::sync::Semaphore::new(2),
         })
     }
 }
@@ -73,9 +76,7 @@ impl AgentBridge {
             .json(body)
             .send()
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("连不上本地智能体（Python 服务未启动？）：{e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("连不上本地智能体（Python 服务未启动？）：{e}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {

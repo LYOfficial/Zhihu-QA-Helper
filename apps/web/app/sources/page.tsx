@@ -10,7 +10,7 @@ import {
   Stars,
   Toggle,
 } from "@/components/ui";
-import { api, toast } from "@/lib/api";
+import { api, openExternal, toast } from "@/lib/api";
 import { useLoad } from "@/lib/hooks";
 import type { Source } from "@/lib/types";
 
@@ -104,8 +104,10 @@ export default function SourcesPage() {
                         <a
                           className="url"
                           href={s.baseUrl}
-                          target="_blank"
-                          rel="noreferrer noopener"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            void openExternal(s.baseUrl);
+                          }}
                         >
                           {s.baseUrl.replace(/^https?:\/\//, "").replace(/\/$/, "")}
                         </a>

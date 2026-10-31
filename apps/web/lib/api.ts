@@ -61,14 +61,31 @@ export function imageSrc(questionId: string, filename: string): string {
   return `${apiBase()}/api/images/${encodeURIComponent(questionId)}/${encodeURIComponent(filename)}`;
 }
 
-export function openExternal(raw: string): boolean {
+/**
+ * 打开外部链接。
+ * 桌面壳是 Tauri 的 WebView2：`<a target="_blank">` 和 window.open()
+ * 都不会真正唤起浏览器，必须让内核用系统命令打开。
+ * 内核不可用（纯前端开发模式）时才退回 window.open。
+ */
+export async function openExternal(raw: string): Promise<boolean> {
+  let url: URL;
   try {
-    const url = new URL(raw);
+    url = new URL(raw);
     if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("unsupported");
-    window.open(url.toString(), "_blank", "noopener,noreferrer");
-    return true;
   } catch {
-    toast("这个问题没有可用的知乎链接", "err");
+    toast("这个链接不可用", "err");
+    return false;
+  }
+  try {
+    await request<{ ok: boolean }>("/api/open-url", {
+      method: "POST",
+      body: JSON.stringify({ url: url.toString() }),
+    });
+    return true;
+  } catch (e) {
+    const opened = window.open(url.toString(), "_blank", "noopener,noreferrer");
+    if (opened) return true;
+    toast(e instanceof Error ? e.message : "无法打开浏览器", "err");
     return false;
   }
 }

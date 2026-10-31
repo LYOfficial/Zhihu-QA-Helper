@@ -13,10 +13,12 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
 import sys
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -46,20 +48,20 @@ def do_profile(payload: dict) -> dict:
         )
     block = "\n".join(lines)
 
-    raw = llm.chat(
-        cfg,
-        [
-            {"role": "system", "content": prompts.PROFILE_SYSTEM},
-            {"role": "user", "content": f"以下是该答主的 {len(samples)} 条历史内容：\n\n{block}"},
-        ],
-        temperature=0.2,
-        max_tokens=12000,
-        json_mode=True,
-    )
     try:
-        data = llm.extract_json(raw)
+        data = llm.chat_json(
+            cfg,
+            [
+                {"role": "system", "content": prompts.PROFILE_SYSTEM},
+                {"role": "user", "content": f"以下是该答主的 {len(samples)} 条历史内容：\n\n{block}"},
+            ],
+            temperature=0.2,
+            max_tokens=8000,
+            retry_tokens=12000,
+            timeout=120,
+        )
     except llm.LLMError:
-        compact = llm.chat(
+        data = llm.chat_json(
             cfg,
             [
                 {"role": "system", "content": prompts.PROFILE_COMPACT_SYSTEM},
@@ -67,9 +69,9 @@ def do_profile(payload: dict) -> dict:
             ],
             temperature=0.1,
             max_tokens=4000,
-            json_mode=True,
+            retry_tokens=6000,
+            timeout=90,
         )
-        data = llm.extract_json(compact)
 
     terms = []
     for t in data.get("terms") or []:
@@ -109,21 +111,21 @@ def do_sources(payload: dict) -> dict:
     if not domains:
         raise llm.LLMError("领域列表为空")
 
-    raw = llm.chat(
-        cfg,
-        [
-            {"role": "system", "content": prompts.SOURCES_SYSTEM},
-            {
-                "role": "user",
-                "content": "领域：" + "、".join(domains) + "\n请给出这些领域的权威平台清单。",
-            },
-        ],
-        temperature=0.2,
-        max_tokens=4000,
-        json_mode=True,
-    )
     try:
-        data = llm.extract_json(raw)
+        data = llm.chat_json(
+            cfg,
+            [
+                {"role": "system", "content": prompts.SOURCES_SYSTEM},
+                {
+                    "role": "user",
+                    "content": "领域：" + "、".join(domains) + "\n请给出这些领域的权威平台清单。",
+                },
+            ],
+            temperature=0.2,
+            max_tokens=3000,
+            retry_tokens=5000,
+            timeout=90,
+        )
     except llm.LLMError:
         data = {}
     out = []
@@ -197,7 +199,8 @@ def _query_terms(title: str, profile: dict, cfg: dict) -> list[str]:
                 {"role": "user", "content": title},
             ],
             temperature=0,
-            max_tokens=120,
+            max_tokens=300,
+            timeout=25,
         )
         terms = [ln.strip(" -·、") for ln in raw.splitlines() if ln.strip()]
         terms = [t for t in terms if 1 < len(t) < 40][:3]
@@ -252,45 +255,48 @@ def _ensure_image_placeholders(markdown: str, images: list[dict]) -> str:
     return "\n\n".join(paras)
 
 
-def _verify_doubts(doubts: list[dict], docs: list[dict], cfg: dict) -> list[dict]:
-    out = []
+def _verify_doubts(doubts: list[dict], docs: list[dict], cfg: dict, deadline: float) -> list[dict]:
+    out: list[dict] = []
     corpus = "\n\n".join(f"[{d['sourceName']}] {d['text'][:2200]}" for d in docs)[:9000]
-    for d in doubts[:4]:
+
+    def one(d: dict) -> dict:
         text = (d.get("text") or "").strip()
-        if not text:
-            continue
         if not docs:
-            out.append(
-                {
-                    "text": text,
-                    "status": "verified",
-                    "verdict": "本次没有抓到资料，该点未经外部核查，正文已弱化表述",
-                    "source": "",
-                }
-            )
-            continue
+            return {
+                "text": text,
+                "status": "verified",
+                "verdict": "本次没有抓到资料，该点未经外部核查，正文已弱化表述",
+                "source": "",
+            }
+        if time.time() > deadline:
+            return {"text": text, "status": "verified", "verdict": "时间不够，未做外部核查", "source": ""}
         try:
-            raw = llm.chat(
+            v = llm.chat_json(
                 cfg,
                 [
                     {"role": "system", "content": prompts.VERIFY_SYSTEM},
                     {"role": "user", "content": f"待核实说法：{text}\n\n资料摘录：\n{corpus}"},
                 ],
                 temperature=0,
-                max_tokens=300,
-                json_mode=True,
+                max_tokens=800,
+                retry_tokens=1200,
+                timeout=max(20, min(60, int(deadline - time.time()))),
             )
-            v = llm.extract_json(raw)
-            out.append(
-                {
-                    "text": text,
-                    "status": v.get("status") if v.get("status") in ("verified", "corrected", "rejected") else "verified",
-                    "verdict": (v.get("verdict") or "").strip(),
-                    "source": "",
-                }
-            )
+            return {
+                "text": text,
+                "status": v.get("status") if v.get("status") in ("verified", "corrected", "rejected") else "verified",
+                "verdict": (v.get("verdict") or "").strip(),
+                "source": "",
+            }
         except llm.LLMError as e:
-            out.append({"text": text, "status": "verified", "verdict": f"核查调用失败：{e}", "source": ""})
+            return {"text": text, "status": "verified", "verdict": f"核查调用失败：{e}", "source": ""}
+
+    todo = [d for d in doubts[:4] if (d.get("text") or "").strip()]
+    if not todo:
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        for item in pool.map(one, todo):
+            out.append(item)
     return out
 
 
@@ -307,20 +313,43 @@ def do_research(payload: dict) -> dict:
     image_max = int(st.get("imageMax") or 8)
     image_min = int(st.get("imageMin") or 3)
 
+    # 整条流水线的硬时限：不能让用户对着转圈等二十分钟。
+    budget = float(payload.get("deadlineSeconds") or 300)
+    started = time.time()
+    deadline = started + budget
+    timings: dict[str, int] = {}
+
+    def mark(stage: str, at: float) -> None:
+        timings[stage] = int((time.time() - at) * 1000)
+
     warnings: list[str] = []
 
-    # 1) 检索词
-    terms = _query_terms(q.get("title", ""), profile, cfg)
-    # 2) 联网取材
+    # 1) 检索词（模型慢就直接本地切词，不在这上面卡住）
+    t0 = time.time()
+    if deadline - time.time() > 30:
+        terms = _query_terms(q.get("title", ""), profile, cfg)
+    else:
+        terms = [q.get("title", "")[:20]]
+    mark("query", t0)
+
+    # 2) 联网取材：多条检索词并行，任何一个站点失败都不拖累整体
+    t0 = time.time()
     docs: list[dict] = []
-    for t in terms:
-        if len(docs) >= 4:
-            break
-        try:
-            docs.extend(research.gather(t, sources, max_pages=4 - len(docs)))
-        except Exception as e:  # 网络问题不该让整条流程死掉
-            warnings.append(f"检索「{t}」失败：{e}")
-    # 去重（同一 url 只留一次）
+    if terms and deadline - time.time() > 20:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(terms))) as pool:
+            futures = [
+                pool.submit(research.gather, t, sources, 3, deadline)
+                for t in terms
+            ]
+            for fut in concurrent.futures.as_completed(futures, timeout=max(5, deadline - time.time())):
+                try:
+                    docs.extend(fut.result() or [])
+                except Exception as e:  # 网络问题不该让整条流程死掉
+                    warnings.append(f"检索失败：{type(e).__name__}: {e}")
+                if len(docs) >= 4:
+                    break
+    mark("gather", t0)
+
     seen, uniq = set(), []
     for d in docs:
         if d["sourceUrl"] in seen:
@@ -328,14 +357,30 @@ def do_research(payload: dict) -> dict:
         seen.add(d["sourceUrl"])
         uniq.append(d)
     docs = uniq
+    if not docs and deadline - time.time() > 40:
+        # 权威平台全部抓不到（被墙 / 403 / 没有检索入口），退回通用网页检索，
+        # 有真实页面总比凭空写好；风险由下面的 warning 明说。
+        try:
+            docs = research.gather_web(terms[0] if terms else q.get("title", ""), 3, deadline)
+        except Exception as e:
+            warnings.append(f"网页检索失败：{type(e).__name__}: {e}")
+        if docs:
+            warnings.append("权威平台没有取到内容，本次改用通用网页检索兜底，引用需自行复核")
     if not docs:
         warnings.append("没有检索到权威资料，初稿仅凭常识生成，请重点核对数值")
 
-    # 3) 取图
-    cands = research.pick_image_urls(docs, want=image_max)
-    images = research.download_images(cands, img_dir, want=image_max)
+    # 3) 取图（并行，最多占 40 秒，取不到就少图，不阻塞起草）
+    t0 = time.time()
+    images: list[dict] = []
+    if deadline - time.time() > 40:
+        cands = research.pick_image_urls(docs, want=image_max)
+        images = research.download_images(
+            cands, img_dir, want=image_max,
+            deadline=min(deadline, time.time() + 40),
+        )
     if len(images) < image_min:
         warnings.append(f"可用配图只有 {len(images)} 张，低于设定的 {image_min} 张")
+    mark("images", t0)
 
     # 4) 起草
     profile_text = (profile.get("summary") or "").strip()
@@ -353,7 +398,16 @@ def do_research(payload: dict) -> dict:
         docs=_fmt_docs(docs),
         images=_fmt_images(images),
     )
-    raw = llm.chat(
+    t0 = time.time()
+    remaining = max(45, int(deadline - time.time()))
+    # 输出上限跟着模型真实容量走：models.dev 给的 output/context 越大，
+    # 越不需要担心 JSON 被截断；推理模型也不会把预算耗在思考上。
+    out_lim = int(cfg.get("outputLimit") or 0)
+    ctx_lim = int(cfg.get("contextLimit") or 0)
+    headroom = out_lim or (ctx_lim // 2 if ctx_lim else 0)
+    draft_tokens = max(6000, min(24000, headroom)) if headroom else 12000
+    retry_tokens = max(draft_tokens, min(40000, headroom)) if headroom else 20000
+    data = llm.chat_json(
         cfg,
         [
             {
@@ -363,25 +417,54 @@ def do_research(payload: dict) -> dict:
             {"role": "user", "content": user},
         ],
         temperature=float(cfg.get("temperature") or 0.45),
-        max_tokens=4000,
-        json_mode=True,
+        max_tokens=draft_tokens,
+        retry_tokens=retry_tokens,
+        timeout=min(240, remaining),
+        min_chars=max(120, draft_min // 3),
     )
-    data = llm.extract_json(raw)
+    mark("draft", t0)
+    if data.get("_salvaged"):
+        warnings.append("模型输出被截断，已保留已生成的正文字段，请核对结尾是否完整")
+
     markdown = (data.get("markdown") or "").strip()
     if not markdown:
         raise llm.LLMError("模型返回的正文为空")
 
-    doubts = [{"text": (d.get("text") or "").strip()} for d in (data.get("doubts") or [])]
-    doubts = [d for d in doubts if d["text"]][:4]
+    # doubts 可能是 [{"text": ...}]，也可能只是字符串数组，两种都收
+    raw_doubts = data.get("doubts") or []
+    doubts: list[dict] = []
+    for d in raw_doubts:
+        if isinstance(d, dict):
+            t = (d.get("text") or d.get("point") or "").strip()
+        elif isinstance(d, str):
+            t = d.strip()
+        else:
+            t = ""
+        if t:
+            doubts.append({"text": t})
+    doubts = doubts[:4]
+    if not doubts:
+        # 模型没给存疑点时，至少留一条诚实的提醒，不要让「存疑 0」假装万事大吉
+        doubts = [
+            {
+                "text": "本次没有检索到权威资料，正文中的具体数值与机制名称需要自行核对"
+                if not docs
+                else "模型没有标注存疑点，建议重点核对数值与版本信息"
+            }
+        ]
 
-    # 5) 逐条核疑
-    doubts = _verify_doubts(doubts, docs, cfg)
+    # 5) 逐条核疑（并行；时间不够就明确标注未核查，不假装核过）
+    t0 = time.time()
+    doubts = _verify_doubts(doubts, docs, cfg, deadline)
+    mark("verify", t0)
     # 若核查给出了更正，把更正内容作为"批注"留在 doubts 里，正文不自动改，
     # 让答主在批阅台自己决定怎么改——这是本产品的核心主张：AI 不直接定稿。
     markdown = _ensure_image_placeholders(markdown, images)
 
     citations = []
     for c in (data.get("citations") or [])[:6]:
+        if not isinstance(c, dict):
+            continue
         url = (c.get("url") or "").strip()
         if not url.startswith("http"):
             continue
@@ -409,6 +492,8 @@ def do_research(payload: dict) -> dict:
         "model": cfg.get("model", ""),
         "warnings": warnings,
         "sourcesUsed": [{"name": d["sourceName"], "url": d["sourceUrl"]} for d in docs],
+        "elapsedMs": int((time.time() - started) * 1000),
+        "timings": timings,
     }
 
 

@@ -17,8 +17,7 @@ import {
 } from "@/components/ui";
 import { api, imageSrc, openExternal, toast } from "@/lib/api";
 import { useCopy, useLoad } from "@/lib/hooks";
-import { watchJob } from "@/lib/jobwatch";
-import type { Draft, Question, Settings } from "@/lib/types";
+import type { Draft, Job, Question, Settings } from "@/lib/types";
 
 /* ------------------------------------------------------------ markdown 渲染 */
 
@@ -200,6 +199,13 @@ function DeskInner() {
   const [images, setImages] = React.useState<Draft["images"]>([]);
   const [doubts, setDoubts] = React.useState<Draft["doubts"]>([]);
   const [citations, setCitations] = React.useState<Draft["citations"]>([]);
+  const [warnings, setWarnings] = React.useState<string[]>([]);
+  const [liveJob, setLiveJob] = React.useState<{
+    stage: string;
+    message: string;
+    state: string;
+    elapsed: number;
+  } | null>(null);
   const [mode, setMode] = React.useState<"edit" | "preview">("preview");
   const [savedAt, setSavedAt] = React.useState<string>("");
   const [loading, setLoading] = React.useState(false);
@@ -223,6 +229,7 @@ function DeskInner() {
         setImages(d.images || []);
         setDoubts(d.doubts || []);
         setCitations(d.citations || []);
+        setWarnings(d.warnings || []);
         setSavedAt(d.updatedAt ? "已加载" : "");
         dirty.current = false;
         setMode(d.markdown?.trim() ? "preview" : "edit");
@@ -252,6 +259,55 @@ function DeskInner() {
     }, 900);
     return () => clearTimeout(t);
   }, [md, draftId]);
+
+  // 拟稿进行中：跟住后台任务，把阶段和已用时间显示出来。
+  // 之前这里只有一个永不停的转圈，任务中断了也看不出来。
+  React.useEffect(() => {
+    if (!draftId || current?.status !== "researching") {
+      setLiveJob(null);
+      return;
+    }
+    let alive = true;
+    let tries = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = async () => {
+      tries += 1;
+      try {
+        const { jobs } = await api.get<{ jobs: Job[] }>("/api/jobs");
+        if (!alive) return;
+        const job = jobs.find((j) => j.questionId === draftId && j.kind === "research");
+        if (!job) {
+          setLiveJob({ stage: "准备", message: "等待智能体接手…", state: "running", elapsed: 0 });
+        } else {
+          const started = Date.parse(job.startedAt);
+          const elapsed = Number.isFinite(started)
+            ? Math.max(0, Math.round((Date.now() - started) / 1000))
+            : 0;
+          setLiveJob({ stage: job.stage, message: job.message, state: job.state, elapsed });
+          if (job.state === "failed") {
+            toast(`拟稿失败：${job.message}`, "err");
+            await qs.reload(true);
+            return;
+          }
+          if (job.state === "done") {
+            toast("初稿已就绪，可以去批阅了", "ok");
+            await qs.reload(true);
+            return;
+          }
+        }
+      } catch {
+        /* 单次轮询失败忽略 */
+      }
+      if (!alive || tries > 300) return; // 最多跟 10 分钟
+      timer = setTimeout(tick, 2000);
+    };
+    timer = setTimeout(tick, 800);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftId, current?.status]);
 
   const words = md.replace(/\s/g, "").length;
   const min = se.data?.draftMin ?? 500;
@@ -320,9 +376,7 @@ function DeskInner() {
     try {
       await api.post(`/api/questions/${current.id}/research`);
       toast("智能体已接手", "ok");
-      qs.reload(true);
-      const id = current.id;
-      watchJob(id, "research", () => qs.reload(true));
+      await qs.reload(true);
     } catch (e) {
       toast(e instanceof Error ? e.message : "启动失败", "err");
     }
@@ -417,7 +471,48 @@ function DeskInner() {
                 color: "var(--ink-2)",
               }}
             >
-              <Spinner /> 智能体正在检索权威资料、核对疑问点、抓取配图…
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Spinner />
+                <span>
+                  智能体正在检索权威资料、核对疑问点、抓取配图…
+                  {liveJob?.elapsed ? `（已用 ${liveJob.elapsed} 秒）` : ""}
+                </span>
+              </div>
+              {liveJob?.message && (
+                <p style={{ margin: "8px 0 0", fontSize: 11.5, color: "var(--ink-3)", lineHeight: 1.7 }}>
+                  {liveJob.stage ? `${liveJob.stage} · ` : ""}
+                  {liveJob.message}
+                </p>
+              )}
+              <button
+                className="btn btn-sm"
+                style={{ marginTop: 10 }}
+                onClick={() => {
+                  void qs.reload(true);
+                }}
+              >
+                <IconRefresh size={12} /> 刷新状态
+              </button>
+            </div>
+          )}
+
+          {warnings.length > 0 && (
+            <div
+              style={{
+                border: "1px solid var(--rule-2)",
+                borderLeft: "3px solid var(--cinnabar)",
+                padding: "10px 12px",
+                marginBottom: 16,
+                background: "var(--cinnabar-wash)",
+                fontSize: 11.5,
+                lineHeight: 1.75,
+                color: "var(--ink-2)",
+              }}
+            >
+              <b style={{ display: "block", marginBottom: 4 }}>这一稿的已知问题</b>
+              {warnings.map((w, i) => (
+                <div key={i}>· {w}</div>
+              ))}
             </div>
           )}
 
@@ -515,7 +610,13 @@ function DeskInner() {
               <div className="cite" key={i}>
                 <span className="n">{i + 1}</span>
                 <div style={{ minWidth: 0 }}>
-                  <a href={c.url} target="_blank" rel="noreferrer noopener">
+                  <a
+                    href={c.url}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void openExternal(c.url);
+                    }}
+                  >
                     {c.label}
                   </a>
                   <div className="sn">{c.sourceName || citationHost(c.url)}</div>
@@ -550,7 +651,13 @@ function DeskInner() {
                   <b>{current.answerCount}</b> 个回答
                 </span>
                 <span className="sep">·</span>
-                <a href={current.url} target="_blank" rel="noreferrer noopener">
+                <a
+                  href={current.url}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void openExternal(current.url);
+                  }}
+                >
                   在知乎查看 ↗
                 </a>
               </div>

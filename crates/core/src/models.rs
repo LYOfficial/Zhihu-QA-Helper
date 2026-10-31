@@ -178,6 +178,8 @@ pub struct Draft {
     pub doubts: Vec<Doubt>,
     pub citations: Vec<Citation>,
     pub images: Vec<ImageAsset>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub word_count: i64,
     pub updated_at: String,
     pub model: String,
@@ -195,6 +197,12 @@ pub struct ModelConfig {
     pub temperature: f64,
     #[serde(default)]
     pub verified_at: Option<String>,
+    /// 上下文窗口（tokens），来自 models.dev 的 limit.context
+    #[serde(default)]
+    pub context_limit: i64,
+    /// 单次最大输出（tokens），来自 models.dev 的 limit.output
+    #[serde(default)]
+    pub output_limit: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

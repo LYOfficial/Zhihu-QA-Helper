@@ -47,9 +47,13 @@ pub fn router(state: Shared) -> Router {
         .route("/session/qrcode/{token}", get(poll_qrcode))
         .route("/session/cookie", post(login_with_cookie))
         .route("/session/logout", post(logout))
-        .route("/login/browser", post(browser_login_request).get(browser_login_pending))
+        .route(
+            "/login/browser",
+            post(browser_login_request).get(browser_login_pending),
+        )
         .route("/login/browser/done", post(browser_login_done))
         .route("/session/open-browser", post(open_login_in_browser))
+        .route("/open-url", post(open_external))
         .route("/session/refresh", post(refresh_me))
         .route("/profile", get(get_profile).put(put_profile))
         .route("/profile/analyze", post(analyze_profile))
@@ -94,7 +98,11 @@ async fn health(State(st): State<Shared>) -> R {
         ok: db_ok,
         version: st.version.clone(),
         agent,
-        db: if db_ok { "sqlite ok".into() } else { "sqlite error".into() },
+        db: if db_ok {
+            "sqlite ok".into()
+        } else {
+            "sqlite error".into()
+        },
         data_dir: st.data_dir.to_string_lossy().to_string(),
         uptime_seconds: (chrono::Utc::now() - st.started_at).num_seconds().max(0),
     })))
@@ -114,11 +122,15 @@ async fn get_session(State(st): State<Shared>) -> R {
         .ok();
     let sign_mode = db
         .conn
-        .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| r.get::<_, String>(0))
+        .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| {
+            r.get::<_, String>(0)
+        })
         .unwrap_or_else(|_| "auto".into());
     let last_sync: Option<String> = db
         .conn
-        .query_row("SELECT updated_at FROM account WHERE id=1", [], |r| r.get(0))
+        .query_row("SELECT updated_at FROM account WHERE id=1", [], |r| {
+            r.get(0)
+        })
         .ok()
         .filter(|s: &String| !s.is_empty());
 
@@ -157,7 +169,9 @@ async fn create_qrcode(State(st): State<Shared>) -> R {
     let sign_mode = {
         let db = st.db.lock().await;
         db.conn
-            .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| r.get::<_, String>(0))
+            .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| {
+                r.get::<_, String>(0)
+            })
             .unwrap_or_else(|_| "auto".into())
     };
     let mut client = crate::zhihu::ZhihuClient::new(
@@ -287,7 +301,9 @@ async fn login_with_cookie(State(st): State<Shared>, Json(body): Json<Value>) ->
     let sign_mode = {
         let db = st.db.lock().await;
         db.conn
-            .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| r.get::<_, String>(0))
+            .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| {
+                r.get::<_, String>(0)
+            })
             .unwrap_or_else(|_| "auto".into())
     };
     let client = crate::zhihu::ZhihuClient::new(
@@ -303,28 +319,73 @@ async fn login_with_cookie(State(st): State<Shared>, Json(body): Json<Value>) ->
     Ok(Json(json!({ "ok": true, "user": user })))
 }
 
+/// 用系统默认浏览器打开链接。
+/// 桌面壳是 Tauri 的 WebView2，页面里的 `<a target="_blank">` 与 window.open()
+/// 都不会真的唤起浏览器，所以必须交给内核用系统命令打开。
+fn open_in_default_browser(url: &str) -> anyhow::Result<()> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        anyhow::bail!("只允许打开 http/https 链接");
+    }
+    if url.len() > 2048 || url.chars().any(|c| c.is_control()) {
+        anyhow::bail!("链接格式不合法");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // 优先走 url.dll，它按协议交给默认浏览器，不经过 cmd 解析，& 之类字符不会被截断
+        let first = std::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+        if first.is_ok() {
+            return Ok(());
+        }
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("无法唤起默认浏览器：{e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("无法唤起默认浏览器：{e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("无法唤起默认浏览器：{e}"))?;
+    }
+    Ok(())
+}
+
+/// 前端所有外链都走这里：交给系统默认浏览器，而不是在 WebView 里开新窗口。
+async fn open_external(Json(body): Json<Value>) -> R {
+    let url = body
+        .get("url")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        return Err(ApiError(anyhow::anyhow!("缺少 url 参数")));
+    }
+    open_in_default_browser(&url)?;
+    Ok(Json(json!({ "ok": true, "url": url })))
+}
+
 /// 用系统默认浏览器打开知乎登录页。
 /// 这条路走的是用户自己的浏览器会话，软件读不到它的 Cookie，
 /// 所以登录后需要用户把 z_c0 复制回来；好在只需要一次。
 async fn open_login_in_browser() -> R {
     let url = "https://www.zhihu.com/signin";
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(url).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
+    open_in_default_browser(url)?;
     Ok(Json(json!({ "ok": true, "url": url })))
 }
 
@@ -360,7 +421,10 @@ async fn refresh_me(State(st): State<Shared>) -> R {
         "UPDATE account SET name=?1, url_token=?2, avatar_url=?3, headline=?4, answer_count=?5, articles_count=?6, follower_count=?7, updated_at=?8 WHERE id=1",
         params![user.name, user.url_token, user.avatar_url, user.headline, user.answer_count, user.articles_count, user.follower_count, now_iso()],
     );
-    let _ = db.conn.execute("UPDATE account SET cookie=?1 WHERE id=1", params![client.cookie]);
+    let _ = db.conn.execute(
+        "UPDATE account SET cookie=?1 WHERE id=1",
+        params![client.cookie],
+    );
     Ok(Json(json!(user)))
 }
 
@@ -417,13 +481,17 @@ async fn analyze_profile(State(st): State<Shared>) -> R {
             )
             .ok();
         if let Some(id) = running {
-            return Ok(Json(json!({ "ok": true, "message": "画像分析已经在进行中", "jobId": id })));
+            return Ok(Json(
+                json!({ "ok": true, "message": "画像分析已经在进行中", "jobId": id }),
+            ));
         }
     }
     let job_id = tasks::job_start(&st, "profile", None, "读取历史回答").await;
     {
         let db = st.db.lock().await;
-        let _ = db.conn.execute("UPDATE profile_meta SET status='running' WHERE id=1", []);
+        let _ = db
+            .conn
+            .execute("UPDATE profile_meta SET status='running' WHERE id=1", []);
     }
     let st2 = st.clone();
     let job_id2 = job_id.clone();
@@ -432,11 +500,17 @@ async fn analyze_profile(State(st): State<Shared>) -> R {
             tracing::warn!("画像分析失败: {e}");
         }
     });
-    Ok(Json(json!({ "ok": true, "message": "已开始分析历史内容", "jobId": job_id })))
+    Ok(Json(
+        json!({ "ok": true, "message": "已开始分析历史内容", "jobId": job_id }),
+    ))
 }
 
 async fn put_profile(State(st): State<Shared>, Json(body): Json<Value>) -> R {
-    let terms = body.get("terms").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let terms = body
+        .get("terms")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
     let summary = body.get("summary").and_then(|x| x.as_str()).unwrap_or("");
     {
         let db = st.db.lock().await;
@@ -532,7 +606,9 @@ async fn discover_sources(State(st): State<Shared>) -> R {
     tokio::spawn(async move {
         let _ = tasks::run_discover_sources(&st2).await;
     });
-    Ok(Json(json!({ "ok": true, "message": "正在按领域检索权威平台" })))
+    Ok(Json(
+        json!({ "ok": true, "message": "正在按领域检索权威平台" }),
+    ))
 }
 
 // ---------------- 问题 ----------------
@@ -591,7 +667,10 @@ async fn list_questions(State(st): State<Shared>, Query(qp): Query<HashMap<Strin
         args.push(b.clone());
     }
     if let Some(k) = qp.get("q").filter(|s| !s.trim().is_empty()) {
-        where_parts.push(format!("(q.title LIKE ?{0} OR q.excerpt LIKE ?{0})", args.len() + 1));
+        where_parts.push(format!(
+            "(q.title LIKE ?{0} OR q.excerpt LIKE ?{0})",
+            args.len() + 1
+        ));
         args.push(format!("%{}%", k));
     }
     // 默认不展示已回答/已弃用
@@ -622,7 +701,9 @@ async fn list_questions(State(st): State<Shared>, Query(qp): Query<HashMap<Strin
             .conn
             .prepare("SELECT domain, COUNT(*) FROM questions GROUP BY domain ORDER BY 2 DESC")?;
         let rows = dstmt
-            .query_map([], |r| Ok(json!({ "domain": r.get::<_, String>(0)?, "count": r.get::<_, i64>(1)? })))?
+            .query_map([], |r| {
+                Ok(json!({ "domain": r.get::<_, String>(0)?, "count": r.get::<_, i64>(1)? }))
+            })?
             .filter_map(|x| x.ok())
             .collect::<Vec<Value>>();
         rows
@@ -643,17 +724,35 @@ async fn get_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
 
 async fn sync_now(State(st): State<Shared>) -> R {
     let job_id = tasks::start_sync(&st, None).await;
-    Ok(Json(json!({ "ok": true, "jobId": job_id, "message": "开始同步知乎通知" })))
+    Ok(Json(
+        json!({ "ok": true, "jobId": job_id, "message": "开始同步知乎通知" }),
+    ))
 }
 
 async fn sync_recent_now(State(st): State<Shared>) -> R {
     let job_id = tasks::start_sync(&st, Some(3)).await;
-    Ok(Json(json!({ "ok": true, "jobId": job_id, "message": "开始同步最近 3 天的邀请与推荐" })))
+    Ok(Json(
+        json!({ "ok": true, "jobId": job_id, "message": "开始同步最近 3 天的邀请与推荐" }),
+    ))
 }
 
 async fn research_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
     {
         let db = st.db.lock().await;
+        let running: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE kind='research' AND question_id=?1 AND state='running'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if running > 0 {
+            return Ok(Json(json!({
+                "ok": true,
+                "message": "这个问题的稿子正在生成中，稍等片刻"
+            })));
+        }
         let _ = db.conn.execute(
             "UPDATE questions SET status='researching' WHERE id=?1",
             params![id],
@@ -669,8 +768,15 @@ async fn research_question(State(st): State<Shared>, Path(id): Path<String>) -> 
     Ok(Json(json!({ "ok": true, "message": "智能体已开始工作" })))
 }
 
-async fn set_status(State(st): State<Shared>, Path(id): Path<String>, Json(body): Json<Value>) -> R {
-    let status = body.get("status").and_then(|x| x.as_str()).unwrap_or("inbox");
+async fn set_status(
+    State(st): State<Shared>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> R {
+    let status = body
+        .get("status")
+        .and_then(|x| x.as_str())
+        .unwrap_or("inbox");
     let db = st.db.lock().await;
     let _ = db.conn.execute(
         "UPDATE questions SET status=?1 WHERE id=?2",
@@ -701,7 +807,12 @@ async fn mark_answered(State(st): State<Shared>, Path(id): Path<String>) -> R {
             "UPDATE questions SET status='answered', bucket='archived' WHERE id=?1",
             params![id],
         );
-        db.log_event("answered", Some(&id), "标记为已回答", &format!("释放 {} KB", freed / 1024));
+        db.log_event(
+            "answered",
+            Some(&id),
+            "标记为已回答",
+            &format!("释放 {} KB", freed / 1024),
+        );
         freed
     };
     Ok(Json(json!({ "ok": true, "freedBytes": freed })))
@@ -711,7 +822,9 @@ async fn dismiss_question(State(st): State<Shared>, Path(id): Path<String>) -> R
     let freed = {
         let db = st.db.lock().await;
         let freed = db.purge_images(&id).unwrap_or(0);
-        let _ = db.conn.execute("DELETE FROM drafts WHERE question_id=?1", params![id]);
+        let _ = db
+            .conn
+            .execute("DELETE FROM drafts WHERE question_id=?1", params![id]);
         let _ = db.conn.execute(
             "UPDATE questions SET status='dismissed', bucket='archived' WHERE id=?1",
             params![id],
@@ -729,7 +842,9 @@ async fn get_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
     let row = db
         .conn
         .query_row(
-            "SELECT markdown, doubts, citations, model, word_count, updated_at FROM drafts WHERE question_id=?1",
+            "SELECT markdown, doubts, citations, model, word_count, updated_at,
+                    COALESCE(warnings, '[]')
+             FROM drafts WHERE question_id=?1",
             params![qid],
             |r| {
                 Ok((
@@ -739,6 +854,7 @@ async fn get_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
                     r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             },
         )
@@ -767,24 +883,29 @@ async fn get_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
         .collect();
 
     match row {
-        Some((md, doubts, cites, model, wc, upd)) => Ok(Json(json!(Draft {
+        Some((md, doubts, cites, model, wc, upd, warns)) => Ok(Json(json!(Draft {
             question_id: qid,
             markdown: md,
             doubts: serde_json::from_str(&doubts).unwrap_or_default(),
             citations: serde_json::from_str(&cites).unwrap_or_default(),
             images,
+            warnings: serde_json::from_str(&warns).unwrap_or_default(),
             word_count: wc,
             updated_at: upd,
             model,
         }))),
         None => Ok(Json(json!({
             "questionId": qid, "markdown": "", "doubts": [], "citations": [],
-            "images": images, "wordCount": 0, "updatedAt": "", "model": ""
+            "images": images, "warnings": [], "wordCount": 0, "updatedAt": "", "model": ""
         }))),
     }
 }
 
-async fn put_draft(State(st): State<Shared>, Path(qid): Path<String>, Json(body): Json<Value>) -> R {
+async fn put_draft(
+    State(st): State<Shared>,
+    Path(qid): Path<String>,
+    Json(body): Json<Value>,
+) -> R {
     let md = body.get("markdown").and_then(|x| x.as_str()).unwrap_or("");
     let wc = md.chars().filter(|c| !c.is_whitespace()).count() as i64;
     let db = st.db.lock().await;
@@ -797,7 +918,10 @@ async fn put_draft(State(st): State<Shared>, Path(qid): Path<String>, Json(body)
     Ok(Json(json!({ "ok": true, "wordCount": wc })))
 }
 
-async fn get_image(State(st): State<Shared>, Path((qid, name)): Path<(String, String)>) -> Response {
+async fn get_image(
+    State(st): State<Shared>,
+    Path((qid, name)): Path<(String, String)>,
+) -> Response {
     // 防目录穿越
     if name.contains("..") || name.contains('/') || name.contains('\\') {
         return (StatusCode::BAD_REQUEST, "bad name").into_response();
@@ -861,7 +985,9 @@ fn require_model_url(value: &str) -> Result<String, ApiError> {
         || !(value.starts_with("http://") || value.starts_with("https://"))
         || value.len() <= 8
     {
-        return Err(ApiError(anyhow::anyhow!("接口地址必须使用 http:// 或 https://")));
+        return Err(ApiError(anyhow::anyhow!(
+            "接口地址必须使用 http:// 或 https://"
+        )));
     }
     Ok(value.trim_end_matches('/').to_string())
 }
@@ -878,7 +1004,11 @@ async fn get_model(State(st): State<Shared>) -> R {
     let mut m = tasks::load_model(&db);
     // 不回传完整 key，只给掩码
     let masked = if m.api_key.len() > 8 {
-        format!("{}••••{}", &m.api_key[..4], &m.api_key[m.api_key.len() - 4..])
+        format!(
+            "{}••••{}",
+            &m.api_key[..4],
+            &m.api_key[m.api_key.len() - 4..]
+        )
     } else if m.api_key.is_empty() {
         String::new()
     } else {
@@ -906,7 +1036,10 @@ async fn put_model(State(st): State<Shared>, Json(body): Json<Value>) -> R {
         "模型平台",
     )?;
     let base_url = require_model_url(body.get("baseUrl").and_then(|x| x.as_str()).unwrap_or(""))?;
-    let model = require_model_text(body.get("model").and_then(|x| x.as_str()).unwrap_or(""), "模型名")?;
+    let model = require_model_text(
+        body.get("model").and_then(|x| x.as_str()).unwrap_or(""),
+        "模型名",
+    )?;
     let key_in = body.get("apiKey").and_then(|x| x.as_str()).unwrap_or("");
     validate_model_payload(&provider, &base_url, &model)?;
     let temp = body
@@ -914,20 +1047,40 @@ async fn put_model(State(st): State<Shared>, Json(body): Json<Value>) -> R {
         .and_then(|x| x.as_f64())
         .unwrap_or(0.3)
         .clamp(0.0, 1.0);
+    let ctx_in = body.get("contextLimit").and_then(|x| x.as_i64());
+    let out_in = body.get("outputLimit").and_then(|x| x.as_i64());
     let db = st.db.lock().await;
+    let (cur_ctx, cur_out): (i64, i64) = db
+        .conn
+        .query_row(
+            "SELECT context_limit, output_limit FROM model_config WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    // 0 表示「未知」，允许保留；有值时必须落在合理区间，避免手滑写错把请求撑爆
+    let context_limit = ctx_in.unwrap_or(cur_ctx).clamp(0, 20_000_000);
+    let output_limit = out_in.unwrap_or(cur_out).clamp(0, 2_000_000);
     // 传空字符串表示「不修改 key」
     if key_in.is_empty() || key_in.contains('•') {
         let _ = db.conn.execute(
-            "UPDATE model_config SET provider=?1, base_url=?2, model=?3, temperature=?4 WHERE id=1",
-            params![provider, base_url, model, temp],
+            "UPDATE model_config SET provider=?1, base_url=?2, model=?3, temperature=?4,
+                    context_limit=?5, output_limit=?6 WHERE id=1",
+            params![provider, base_url, model, temp, context_limit, output_limit],
         );
     } else {
         let _ = db.conn.execute(
-            "UPDATE model_config SET provider=?1, base_url=?2, model=?3, api_key=?4, temperature=?5 WHERE id=1",
-            params![provider, base_url, model, key_in.trim(), temp],
+            "UPDATE model_config SET provider=?1, base_url=?2, model=?3, api_key=?4, temperature=?5,
+                    context_limit=?6, output_limit=?7 WHERE id=1",
+            params![provider, base_url, model, key_in.trim(), temp, context_limit, output_limit],
         );
     }
-    db.log_event("model", None, "更新模型设置", &format!("{provider} / {model}"));
+    db.log_event(
+        "model",
+        None,
+        "更新模型设置",
+        &format!("{provider} / {model}"),
+    );
     drop(db);
     get_model(State(st)).await
 }
@@ -993,7 +1146,12 @@ async fn get_settings(State(st): State<Shared>) -> R {
 async fn put_settings(State(st): State<Shared>, Json(body): Json<Value>) -> R {
     let db = st.db.lock().await;
     let cur = tasks::load_settings(&db);
-    let g = |k: &str, d: &str| body.get(k).and_then(|x| x.as_str()).unwrap_or(d).to_string();
+    let g = |k: &str, d: &str| {
+        body.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or(d)
+            .to_string()
+    };
     let mut times = body
         .get("cronTimes")
         .and_then(|x| x.as_array())
@@ -1012,11 +1170,31 @@ async fn put_settings(State(st): State<Shared>, Json(body): Json<Value>) -> R {
         .unwrap_or(cur.cron_times.clone());
     times.sort();
     times.dedup();
-    let pick_ratio = body.get("pickRatio").and_then(|x| x.as_f64()).unwrap_or(cur.pick_ratio).clamp(0.1, 0.9);
-    let draft_min = body.get("draftMin").and_then(|x| x.as_i64()).unwrap_or(cur.draft_min).clamp(100, 5000);
-    let draft_max = body.get("draftMax").and_then(|x| x.as_i64()).unwrap_or(cur.draft_max).clamp(draft_min, 5000);
-    let image_min = body.get("imageMin").and_then(|x| x.as_i64()).unwrap_or(cur.image_min).clamp(1, 20);
-    let image_max = body.get("imageMax").and_then(|x| x.as_i64()).unwrap_or(cur.image_max).clamp(image_min, 20);
+    let pick_ratio = body
+        .get("pickRatio")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(cur.pick_ratio)
+        .clamp(0.1, 0.9);
+    let draft_min = body
+        .get("draftMin")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(cur.draft_min)
+        .clamp(100, 5000);
+    let draft_max = body
+        .get("draftMax")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(cur.draft_max)
+        .clamp(draft_min, 5000);
+    let image_min = body
+        .get("imageMin")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(cur.image_min)
+        .clamp(1, 20);
+    let image_max = body
+        .get("imageMax")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(cur.image_max)
+        .clamp(image_min, 20);
 
     let _ = db.conn.execute(
         "UPDATE settings SET cron_times=?1, pick_ratio=?2, draft_min=?3, draft_max=?4,
@@ -1123,7 +1301,9 @@ async fn stats_overview(State(st): State<Shared>) -> R {
     let bytes = count("SELECT COALESCE(SUM(bytes),0) FROM images");
     let avg_fit: f64 = db
         .conn
-        .query_row("SELECT COALESCE(AVG(fit),0) FROM questions", [], |r| r.get(0))
+        .query_row("SELECT COALESCE(AVG(fit),0) FROM questions", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0.0);
     let answers_30d = count("SELECT COUNT(*) FROM questions WHERE status='answered' AND synced_at > date('now','-30 day')");
     let v: i64 = db

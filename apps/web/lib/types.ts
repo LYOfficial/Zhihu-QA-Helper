@@ -132,6 +132,8 @@ export interface Draft {
   doubts: Doubt[];
   citations: Citation[];
   images: ImageAsset[];
+  /** 拟稿过程中的提示：没抓到资料、配图不足、输出被截断等 */
+  warnings?: string[];
   wordCount: number;
   updatedAt: string;
   model: string;
@@ -145,6 +147,10 @@ export interface ModelConfig {
   hasKey: boolean;
   temperature: number;
   verifiedAt: string | null;
+  /** 上下文窗口，来自 models.dev 的 limit.context；0 表示未知 */
+  contextLimit: number;
+  /** 单次最大输出，来自 models.dev 的 limit.output；0 表示未知 */
+  outputLimit: number;
 }
 
 export interface Settings {
