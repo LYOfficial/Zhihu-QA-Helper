@@ -11,9 +11,11 @@ from html import unescape
 import gzip
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
+import socket
 import tempfile
 import time
 import urllib.error
@@ -21,6 +23,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from html.parser import HTMLParser
+from xml.etree import ElementTree
 
 from PIL import Image, ImageOps
 
@@ -48,6 +51,21 @@ def _host(url: str) -> str:
         return (urllib.parse.urlparse(url).hostname or "").lower()
     except ValueError:
         return ""
+
+
+def public_url(url: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        if (parts.scheme not in {"http", "https"} or parts.port not in (None, 80, 443)
+                or parts.username is not None or parts.password is not None or "." not in host):
+            return False
+        if host == "www.minecraft.net" and parts.scheme == "https" and parts.port in (None, 443):
+            return True
+        addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        return bool(addresses) and all(ipaddress.ip_address(item[4][0]).is_global for item in addresses)
+    except (ValueError, OSError):
+        return False
 
 
 def _mark_bad(url: str) -> None:
@@ -143,6 +161,8 @@ class _DocParser(HTMLParser):
         self.content: list[str] = []
         self.images: list[dict] = []
         self.title = ""
+        self.published = ""
+        self.preview = ""
         self._skip = 0
         self._in_title = False
         self._scope = ""
@@ -150,6 +170,12 @@ class _DocParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        if tag == "meta":
+            name, content = a.get("property") or a.get("name"), a.get("content") or ""
+            if name in {"article:published_time", "datePublished", "pubdate"} and not self.published:
+                self.published = content
+            if name in {"og:image", "twitter:image"} and not self.preview:
+                self.preview = content
         if tag in SKIP_TAGS:
             self._skip += 1
         if self._skip:
@@ -211,7 +237,7 @@ class _DocParser(HTMLParser):
         return joined.strip()
 
 
-def parse_doc(html: str, base_url: str, image_markers=None):
+def _parsed_doc(html: str, base_url: str, image_markers=None):
     p = _DocParser(image_markers)
     try:
         p.feed(html)
@@ -225,7 +251,19 @@ def parse_doc(html: str, base_url: str, image_markers=None):
             continue
         if full.startswith(("https://", "http://")):
             imgs.append({**image, "url": full})
-    return p.title, p.text(prefer_content=True), imgs
+    if p.preview and image_markers is None:
+        try:
+            preview = urllib.parse.urljoin(base_url, p.preview)
+            if preview.startswith(("https://", "http://")):
+                imgs.append({"url": preview, "caption": p.title[:160], "cover": True})
+        except ValueError:
+            pass
+    dates = re.search(r'"datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2}[^"<]{0,30})"', html, re.I)
+    return p.title, p.text(prefer_content=True), imgs, p.published or (dates[1] if dates else "")
+
+
+def parse_doc(html: str, base_url: str, image_markers=None):
+    return _parsed_doc(html, base_url, image_markers)[:3]
 
 
 def clean_sample(text: str) -> str:
@@ -241,13 +279,21 @@ def mediawiki_search(base: str, query: str, limit: int = 3) -> list[dict]:
     base = base.rstrip("/")
     url = f"{base}/rest.php/v1/search/page?q={urllib.parse.quote(query)}&limit={limit}"
     try:
-        raw, ctype, charset = fetch(url, timeout=10)
+        raw, ctype, charset = fetch(url, timeout=5, allowed=lambda link: source_matches({"baseUrl": base}, link) and public_url(link))
         data = json.loads(_decode(raw, charset))
-    except Exception:
-        return []
+    except (OSError, ValueError):
+        params = urllib.parse.urlencode({"action": "query", "generator": "search", "gsrsearch": query,
+                                       "gsrlimit": limit, "format": "json", "formatversion": 2})
+        try:
+            raw, _, charset = fetch(f"{base}/api.php?{params}", timeout=4, allowed=lambda link: public_url(link) and _host(link) == _host(base))
+            data = json.loads(_decode(raw, charset)).get("query") or {}
+        except (OSError, ValueError):
+            return []
     pages = []
     for p in (data.get("pages") or [])[:limit]:
-        key = p.get("key") or urllib.parse.quote(p.get("title", ""))
+        key = urllib.parse.quote(p.get("key") or p.get("title", "").replace(" ", "_"), safe="%()/,_-")
+        if not key:
+            continue
         pages.append(
             {
                 "title": p.get("title") or key,
@@ -277,7 +323,8 @@ def source_matches(source: dict, url: str) -> bool:
 
 def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: bool = False) -> dict | None:
     try:
-        raw, ctype, charset = fetch(url, timeout=10)
+        raw, ctype, charset = fetch(url, timeout=7,
+                                   allowed=lambda link: public_url(link) and (not authority or source_matches(source, link)))
     except Exception:
         return None
     if ctype and not any(kind in ctype.lower() for kind in ("html", "text/plain")):
@@ -286,17 +333,19 @@ def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: boo
 
 
 def _make_doc(html: str, url: str, source: dict, authority: bool, allow_image: bool,
-              article_title: str = "") -> dict | None:
-    title, text, imgs = parse_doc(html, url)
+              article_title: str = "", published_at: str = "") -> dict | None:
+    title, text, imgs, published = _parsed_doc(html, url)
     if len(text) < 180:
         return None
     return {
         "sourceName": source.get("name") or _host(url),
         "sourceUrl": url,
         "title": article_title or title,
-        "text": text[:9000],
+        "text": text[:28000],
         "images": imgs,
         "trust": source.get("trust") or 3,
+        "sourceKind": source.get("kind") or "web",
+        "publishedAt": published[:40] or published_at[:40],
         # authority=False 表示这一篇来自通用网页检索兜底，不是用户配置的权威平台。
         # 这类页面只能当背景资料，绝不能作为图源——否则图库里会混进没授权过的站点。
         "authority": authority,
@@ -322,6 +371,11 @@ def _source_pages(source: dict, query: str) -> list[str]:
     host = _host(base)
     if not host or _is_bad(base):
         return []
+    if host == "www.minecraft.net":
+        pages = _minecraft_news_pages()
+        if pages:
+            target = keywords(query)
+            return sorted(pages, key=lambda page: len(keywords(page) & target), reverse=True)[:6]
     if source.get("kind") == "wiki" or "wiki" in host:
         hits = mediawiki_search(base, query, limit=2)
         if hits:
@@ -337,8 +391,27 @@ def _source_pages(source: dict, query: str) -> list[str]:
         except (OSError, ValueError):
             return []
     root = host.removeprefix("www.")
-    hits = web_search(f"site:{root} {query}", limit=4)
-    return [url for url in hits if source_matches(source, url)][:2]
+    return web_search(f"site:{root} {query}", limit=2, timeout=6,
+                      allowed=lambda url: source_matches(source, url))
+
+
+_MINECRAFT_NEWS: tuple[float, list[str]] = (0, [])
+
+
+def _minecraft_news_pages() -> list[str]:
+    global _MINECRAFT_NEWS
+    stamp, pages = _MINECRAFT_NEWS
+    if time.monotonic() - stamp < 240 and pages:
+        return pages
+    origin = "https://www.minecraft.net"
+    try:
+        raw, _, charset = fetch(origin + "/en-us/articles", timeout=5, allowed=lambda url: _host(url) == "www.minecraft.net" and public_url(url))
+    except (OSError, ValueError):
+        return []
+    paths = re.findall(r'href="(/en-us/article/[a-z0-9-]+)"', _decode(raw, charset), flags=re.I)
+    pages = [origin + path for path in dict.fromkeys(paths)][:12]
+    _MINECRAFT_NEWS = (time.monotonic(), pages)
+    return pages
 
 
 def focused_phrase(query: str) -> str:
@@ -358,7 +431,8 @@ def _help_center_docs(source: dict, query: str) -> list[dict]:
     search = f'"{key}"' if key else query
     params = urllib.parse.urlencode({"query": search, "per_page": 4})
     try:
-        raw, _, charset = fetch(f"{origin}/api/v2/help_center/articles/search.json?{params}", timeout=6)
+        raw, _, charset = fetch(f"{origin}/api/v2/help_center/articles/search.json?{params}", timeout=6,
+                                allowed=lambda link: public_url(link) and _host(link) == _host(origin))
         hits = json.loads(_decode(raw, charset)).get("results") or []
     except (OSError, ValueError):
         return []
@@ -367,7 +441,8 @@ def _help_center_docs(source: dict, query: str) -> list[dict]:
         url, body, title = hit.get("html_url"), hit.get("body"), hit.get("title")
         if not all(isinstance(value, str) for value in (url, body, title)) or not source_matches(source, url):
             continue
-        doc = _make_doc(f"<article>{body}</article>", url, source, True, _allow_image(source), title)
+        doc = _make_doc(f"<article>{body}</article>", url, source, True, _allow_image(source), title,
+                        str(hit.get("created_at") or ""))
         if doc:
             docs.append(doc)
     return docs[:2]
@@ -391,31 +466,53 @@ def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float 
                 pages.append((link, source))
                 seen.add(key)
     docs.extend(_parallel(lambda page: _fetch_doc(page[0], page[1], True, _allow_image(page[1])),
-                          pages[: max_pages * 2], 6, deadline))
-    return [doc for doc in docs if doc][:max_pages]
+                          pages[: max_pages * 2], 8, deadline))
+    target = keywords(query)
+    return sorted((doc for doc in docs if doc), key=lambda doc: (
+        4 * len(target & keywords(doc["title"])) + len(target & keywords(doc["text"])),
+        doc.get("publishedAt", ""), doc.get("trust", 0),
+    ), reverse=True)[:max_pages]
 
 
-BING = "https://cn.bing.com/search?q={q}&setlang=zh-CN"
+BING = "https://cn.bing.com/search?{params}"
 
 
-def web_search(query: str, limit: int = 4, timeout: int = 10, allowed=None) -> list[str]:
-    """通用网页检索兜底：配置的权威平台都抓不到内容时（比如站点被墙或 403），
-    至少让拟稿有真实页面可参考，而不是完全凭空写。"""
-    try:
-        raw, _, charset = fetch(BING.format(q=urllib.parse.quote(query)), timeout=timeout)
-    except Exception:
-        return []
+def _search_links(provider, query, timeout, recent):
+    params = {"q": query, "setlang": "zh-CN" if re.search(r"[\u4e00-\u9fff]", query) else "en-US"}
+    if recent:
+        params["filters"] = 'ex1:"ez3"'
+    if provider == "rss":
+        params["format"] = "rss"
+    if provider == "so":
+        endpoint = "https://www.so.com/s?" + urllib.parse.urlencode({"q": query})
+        domain = "so.com"
+    elif provider == "duckduckgo":
+        endpoint = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query, **({"df": "m"} if recent else {})})
+        domain = "duckduckgo.com"
+    else:
+        endpoint = BING.format(params=urllib.parse.urlencode(params))
+        domain = "bing.com"
+    raw, _, charset = fetch(endpoint, timeout=timeout, max_bytes=1_500_000,
+                            allowed=lambda url: _host(url).endswith("." + domain))
     html = _decode(raw, charset)
-    # 只取真正的自然结果块（li.b_algo），否则会把「Google 官网」这类导航链接当成资料
-    links = re.findall(
-        r'<li class="b_algo"[\s\S]{0,4000}?<h2[^>]*>\s*<a[^>]+href="(https?://[^"]+)"',
-        html,
-    )
-    if not links:
-        links = re.findall(r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"]+)"', html)
+    if provider == "rss":
+        return [item.text or "" for item in ElementTree.fromstring(html).findall("./channel/item/link")]
+    if provider == "so":
+        return re.findall(r'\bdata-mdurl="(https?://[^"\s]+)"', html)
+    if provider == "duckduckgo":
+        links = re.findall(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"', html)
+        return [urllib.parse.parse_qs(urllib.parse.urlsplit(unescape(link)).query).get("uddg", [link])[0] for link in links]
+    return re.findall(r'<li\b[^>]*class="[^"]*\bb_algo\b[^"]*"[\s\S]{0,4500}?<h2[^>]*>\s*<a[^>]+href="([^"]+)"', html)
+
+
+def web_search(query: str, limit: int = 4, timeout: int = 7, allowed=None, *, recent=False) -> list[str]:
+    methods = ("so", "html", "rss", "duckduckgo")
+    groups = _parallel(lambda method: _search_links(method, query, timeout, recent), methods, 4, time.time() + timeout)
+    links = [group[index] for index in range(max(map(len, groups), default=0)) for group in groups if index < len(group)]
     skip_hosts = (
         "bing.com", "microsoft.com", "google.com", "google.cn", "googleusercontent.com",
         "about.google", "search.google", "gstatic.com",
+        "360.com", "360kan.com", "so.com", "duckduckgo.com",
     )
     out: list[str] = []
     for u in links:
@@ -429,7 +526,7 @@ def web_search(query: str, limit: int = 4, timeout: int = 10, allowed=None) -> l
                 except (ValueError, UnicodeError):
                     continue
         host = _host(u)
-        if not host or any(bad in host for bad in skip_hosts):
+        if not u.startswith(("https://", "http://")) or not host or any(host == bad or host.endswith("." + bad) for bad in skip_hosts):
             continue
         if u in out or (allowed is not None and not allowed(u)):
             continue
@@ -439,25 +536,46 @@ def web_search(query: str, limit: int = 4, timeout: int = 10, allowed=None) -> l
     return out
 
 
-def gather_web(query: str, max_pages: int = 3, deadline: float | None = None) -> list[dict]:
-    urls = web_search(query, limit=max_pages * 2)
-    if not urls:
-        return []
-    docs: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(urls))) as pool:
-        futures = [pool.submit(_fetch_doc, u, {"name": _host(u), "trust": 2}) for u in urls]
-        for fut in concurrent.futures.as_completed(
-            futures, timeout=None if not deadline else max(5, deadline - time.time())
-        ):
-            try:
-                d = fut.result()
-            except Exception:
-                continue
-            if d:
-                docs.append(d)
-            if len(docs) >= max_pages:
-                break
-    return docs
+COMMUNITY_HOSTS = ("reddit.com", "zhihu.com", "tieba.baidu.com", "bilibili.com", "weibo.com", "xiaoheihe.cn", "x.com")
+
+
+def _host_under(host, sites):
+    return any(host == site or host.endswith("." + site) for site in sites)
+
+
+def gather_web(query: str, max_pages: int = 3, deadline: float | None = None, sources=(), *, recent=False,
+               community_only=False) -> list[dict]:
+    deadline = deadline or time.time() + 14
+    if community_only:
+        sites = ("zhihu.com", "weibo.com", "bilibili.com") if re.search(r"[\u4e00-\u9fff]", query) else ("reddit.com", "x.com")
+        groups = _parallel(lambda site: web_search(f"{query} site:{site}", limit=2, timeout=5, recent=True,
+                                                     allowed=lambda url: _host_under(_host(url), (site,))),
+                           sites, 3, min(deadline, time.time() + 5.5))
+        urls = [url for group in groups for url in group]
+    else:
+        urls = web_search(query, limit=max_pages * 2, timeout=6, recent=recent)
+
+    def read(url):
+        source = None if community_only else next((source for source in sources if source_matches(source, url)), None)
+        if source:
+            return _fetch_doc(url, source, True, _allow_image(source))
+        host = _host(url)
+        kind = "community" if _host_under(host, COMMUNITY_HOSTS) else "web"
+        if _host_under(host, ("gov.cn", "gov.uk", "europa.eu", "who.int", "un.org", "esa.int", "cas.cn", "cnsa.gov.cn")) or host.endswith(".gov"):
+            kind = "official"
+        elif _host_under(host, ("reuters.com", "apnews.com", "xinhuanet.com", "people.com.cn", "cctv.com", "bbc.com", "bbc.co.uk", "cyol.com")):
+            kind = "media"
+        elif _host_under(host, ("wikipedia.org", "minecraft.wiki")):
+            kind = "wiki"
+        parts = urllib.parse.urlsplit(url)
+        origin = parts._replace(path="", query="", fragment="").geturl()
+        return _fetch_doc(url, {"name": host, "trust": 4 if kind == "official" else 2, "kind": kind, "baseUrl": origin},
+                          authority=kind in {"official", "media", "wiki"})
+
+    target = keywords(query)
+    docs = [doc for doc in _parallel(read, urls, 8, deadline) if doc]
+    return sorted(docs, key=lambda doc: (4 * len(target & keywords(doc["title"])) + len(target & keywords(doc["text"])),
+                                        doc.get("trust", 0), doc.get("publishedAt", "")), reverse=True)[:max_pages]
 
 
 def keywords(text: str) -> set[str]:
@@ -570,6 +688,7 @@ def _save_image(item, image, out_dir, seen, fingerprints):
     return {
         "filename": filename, "sourceUrl": item["page"], "imageUrl": item.get("url", ""),
         "sourceName": item["sourceName"], "caption": item["caption"], "bytes": len(content),
+        "autoInsert": item.get("autoInsert", False),
     }
 
 
@@ -594,8 +713,9 @@ def download_images(candidates: list[dict], out_dir: str, want: int = 6,
     os.makedirs(out_dir, exist_ok=True)
 
     def download(item: dict):
+        allowed = item.get("allowed")
         raw, _, _ = fetch(item["url"], referer=item["page"], timeout=5, max_bytes=6_000_000,
-                          allowed=item.get("allowed"))
+                          allowed=lambda link: public_url(link) and (allowed is None or allowed(link)))
         return _normal_image(raw)
 
     existing = existing or []

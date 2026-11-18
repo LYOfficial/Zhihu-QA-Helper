@@ -535,7 +535,6 @@ async fn put_profile(State(st): State<Shared>, Json(body): Json<Value>) -> R {
         .cloned()
         .unwrap_or_default();
     let summary = body.get("summary").and_then(|x| x.as_str()).unwrap_or("");
-    // 文风档案允许答主自己改（尤其是 guide 那段写作指令），传了对象就整体覆盖
     let style = body.get("style").cloned().unwrap_or(Value::Null);
     {
         let db = st.db.lock().await;
@@ -967,18 +966,21 @@ async fn list_images(State(st): State<Shared>, Path(qid): Path<String>) -> R {
     Ok(Json(json!(load_images(&db.conn, &qid)?)))
 }
 
-async fn illustration_question(st: &Shared, qid: &str) -> Result<(String, i64), ApiError> {
+async fn illustration_question(st: &Shared, qid: &str) -> Result<Value, ApiError> {
     let db = st.db.lock().await;
-    let title = db
+    let question = db
         .conn
         .query_row(
-            "SELECT title FROM questions WHERE id=?1 AND status IN ('inbox','pending_review')",
+            "SELECT title, excerpt, tags FROM questions WHERE id=?1 AND status IN ('inbox','pending_review')",
             params![qid],
-            |row| row.get::<_, String>(0),
+            |row| {
+                let tags = serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?).unwrap_or_default();
+                Ok(json!({"title": row.get::<_, String>(0)?, "excerpt": row.get::<_, String>(1)?, "tags": tags}))
+            },
         )
         .optional()?
         .ok_or_else(|| anyhow::anyhow!("当前问题不能补图，请等待拟稿完成或检查归档状态。"))?;
-    Ok((title, tasks::load_settings(&db).image_max))
+    Ok(question)
 }
 
 async fn search_images(
@@ -986,7 +988,15 @@ async fn search_images(
     Path(qid): Path<String>,
     Json(body): Json<Value>,
 ) -> R {
-    let (title, maximum) = illustration_question(&st, &qid).await?;
+    let question = illustration_question(&st, &qid).await?;
+    let (maximum, sources, model) = {
+        let db = st.db.lock().await;
+        (
+            tasks::load_settings(&db).image_max,
+            tasks::research_sources(&db)?,
+            tasks::load_model(&db),
+        )
+    };
     let raw_query = body["query"].as_str().unwrap_or_default().trim();
     let query: String = raw_query.chars().take(110).collect();
     let public_page = if raw_query.starts_with("https://") && raw_query.len() <= 2048 {
@@ -994,10 +1004,11 @@ async fn search_images(
     } else {
         ""
     };
-    let payload = json!({"question": {"title": title}, "supplement": true, "publicPage": public_page,
+    let payload = json!({"question": question, "supplement": true, "publicPage": public_page,
+        "sources": sources, "model": model,
         "settings": {"imageMax": if maximum > 0 { maximum.min(8) } else { 4 }},
-        "material": {"searchTerms": if query.is_empty() { vec![] } else { vec![query] }}});
-    let added = tasks::collect_question_images(&st, &qid, payload, false, true).await?;
+        "imageQueries": if query.is_empty() { vec![] } else { vec![query] }});
+    let (added, _) = tasks::collect_question_images(&st, &qid, payload, false, true).await?;
     Ok(Json(json!({"added": added})))
 }
 
@@ -1031,7 +1042,7 @@ async fn import_image(
         .take(160)
         .collect();
     let payload = json!({"imageData": image, "sourceUrl": url, "caption": caption});
-    let added = tasks::collect_question_images(&st, &qid, payload, true, true).await?;
+    let (added, _) = tasks::collect_question_images(&st, &qid, payload, true, true).await?;
     Ok(Json(json!({"added": added})))
 }
 

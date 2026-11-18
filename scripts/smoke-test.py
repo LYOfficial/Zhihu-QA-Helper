@@ -67,7 +67,9 @@ class Agent(BaseHTTPRequestHandler):
         stage = self.path.rsplit("/", 1)[-1]
         self.calls[stage] += 1
         if stage == "collect":
-            self.send({"docs": [], "warnings": ["回归测试：未连接外部资料站"]})
+            self.send({"docs": [], "plan": {}, "warnings": ["回归测试：未连接外部资料站"]})
+        elif stage == "qualify":
+            self.send({**payload["material"], "findings": []})
         elif stage == "draft":
             if self.calls[stage] == 1:
                 self.send({"ok": False, "error": "回归测试：模拟模型暂时不可用"})
@@ -77,9 +79,20 @@ class Agent(BaseHTTPRequestHandler):
                 ], "citations": []}, "warnings": payload["material"]["warnings"]})
         elif stage == "review":
             self.review_release.wait(10)
-            self.send({"doubts": [{**doubt, "verdict": "现有资料不足"} for doubt in payload["doubts"]]})
+            self.send({"doubts": [{**doubt, "verdict": "现有资料不足", "confidence": 25, "evidence": [{
+                "url": "https://example.org/manual", "label": "信号手册", "sourceName": "发布方", "kind": "official",
+                "publishedAt": "2025-06-01", "quote": "仅适用于演示线路，不覆盖其他设置。", "stance": "context",
+            }]} for doubt in payload["doubts"]]})
         elif stage == "images":
-            self.send({"images": []})
+            if payload.get("supplement"):
+                self.send({"images": []})
+                return
+            filename = "b" * 32 + ".png"
+            folder = Path(payload["imagesDir"])
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / filename).write_bytes((ROOT / "crates/desktop/icons/128x128.png").read_bytes())
+            self.send({"images": [{"filename": filename, "caption": "铁路信号示意", "autoInsert": True,
+                                   "sourceName": "发布方", "sourceUrl": "https://example.org/illustrations"}]})
         elif stage == "import":
             filename = "a" * 32 + ".png"
             if filename in payload["existingImages"]:
@@ -149,7 +162,8 @@ class Smoke:
             job = self.start()
             assert job == self.start(), "重复点击不能创建第二份稿子"
             wait_for(lambda: self.stage()["draftSaved"])
-            assert self.draft()["markdown"] == FIRST_DRAFT
+            assert self.draft()["markdown"] == FIRST_DRAFT + "\n\n[IMG:" + "b" * 32 + ".png]"
+            assert self.draft()["images"][0]["sourceName"] == "发布方"
             self.request("/drafts/rail", "PUT", {"markdown": MANUAL_DRAFT})
         with self.core():
             interrupted = self.stage()
@@ -160,8 +174,9 @@ class Smoke:
             wait_for(lambda: self.stage()["job"]["state"] == "done")
             assert self.draft()["markdown"] == MANUAL_DRAFT
             assert not self.stage()["resumable"]
-            assert Agent.calls["collect"] == 1 and Agent.calls["draft"] == 2
-            print("PASS API：失败后续跑、重复启动合并、重启恢复、保留手工正文")
+            assert Agent.calls["collect"] == 1 and Agent.calls["qualify"] == 1 and Agent.calls["draft"] == 2
+            assert self.draft()["doubts"][0]["evidence"][0]["url"] == "https://example.org/manual"
+            print("PASS API：前置核查、查证出处、自动配图、失败续跑、重启恢复及保留手工正文")
 
     def test_browser(self, output):
         from playwright.sync_api import sync_playwright
@@ -209,7 +224,7 @@ class Smoke:
             page.locator(".modal").get_by_role("button", name="关闭", exact=True).click()
             assert self.draft()["markdown"] == updated
             assets = self.request("/images/rail")
-            assert len(assets) == 1 and assets[0]["sourceUrl"] == "https://example.org/source"
+            assert len(assets) == 2 and any(asset["sourceUrl"] == "https://example.org/source" for asset in assets)
             page.screenshot(path=output / "workbench.png")
             page.set_viewport_size({"width": 820, "height": 600})
             page.screenshot(path=output / "workbench-narrow.png")

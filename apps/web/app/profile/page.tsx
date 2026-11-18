@@ -25,7 +25,7 @@ const STYLE_ROWS: {
   label: string;
 }[] = [
   { key: "voice", label: "语气与人称" },
-  { key: "structure", label: "结构套路" },
+  { key: "structure", label: "结构差异" },
   { key: "sentence", label: "句子节奏" },
   { key: "pacing", label: "详略取舍" },
   { key: "formatting", label: "排版习惯" },
@@ -250,9 +250,9 @@ export default function ProfilePage() {
               </div>
             )}
 
-            {style && (style.guide || style.voice) && (
+            {style && (STYLE_ROWS.some(({ key }) => Boolean(style[key])) || Boolean(style.variants?.length) || Boolean(style.guide)) && (
               <div style={{ margin: "6px 0 30px" }}>
-                <SectionTitle right={<span className="dim">拟稿时会照着这份写</span>}>
+                <SectionTitle right={<span className="dim">按题材参考，不套固定写法</span>}>
                   文章风格
                 </SectionTitle>
                 <div
@@ -336,17 +336,18 @@ export default function ProfilePage() {
                       marginBottom: 6,
                     }}
                   >
-                    <span className="eyebrow">写作指令</span>
+                    <span className="eyebrow">不同题材的文风观察</span>
                     <span className="dim" style={{ fontSize: 11 }}>
-                      这段会原文进拟稿提示词，可以直接改
+                      一行一种写法，可补充适用场景
                     </span>
                   </div>
                   <textarea
                     className="textarea"
                     style={{ minHeight: 110, fontSize: 12.5, lineHeight: 1.8 }}
-                    value={style.guide}
+                    value={(style.variants ?? []).join("\n")}
+                    placeholder="旧画像可重新分析，或在这里补充不同场景的文风。"
                     onChange={(e) => {
-                      setStyle({ ...style, guide: e.target.value });
+                      setStyle({ ...style, variants: e.target.value.split("\n") });
                       setDirty(true);
                     }}
                   />

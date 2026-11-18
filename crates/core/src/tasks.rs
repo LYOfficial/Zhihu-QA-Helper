@@ -551,7 +551,6 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         .and_then(|x| x.as_array())
         .cloned()
         .unwrap_or_default();
-    // 文风档案：拟稿时直接喂给写作模型，缺了也要落一个空对象，别让老库报错
     let style = resp.get("style").cloned().unwrap_or_else(|| json!({}));
 
     {
@@ -860,7 +859,7 @@ pub async fn collect_question_images(
     mut payload: Value,
     import: bool,
     interactive: bool,
-) -> Result<usize> {
+) -> Result<(usize, Vec<String>)> {
     let _slot = if interactive {
         state
             .image_slots
@@ -895,12 +894,13 @@ pub async fn collect_question_images(
             "/v1/research/images"
         },
         &payload,
-        27,
+        50,
     )
     .await?;
     let mut db = state.db.lock().await;
     let tx = db.conn.transaction()?;
     let mut added = 0;
+    let mut suggested = Vec::new();
     for image in result["images"].as_array().into_iter().flatten() {
         let filename = image["filename"].as_str().unwrap_or_default();
         if filename.len() != 36
@@ -912,7 +912,7 @@ pub async fn collect_question_images(
         let Ok(metadata) = std::fs::metadata(img_dir.join(filename)) else {
             continue;
         };
-        added += tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO images (id, question_id, filename, source_url, source_name, caption, bytes, created_at)
              SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS
              (SELECT 1 FROM images WHERE question_id=?2 AND filename=?3)",
@@ -920,9 +920,29 @@ pub async fn collect_question_images(
                 image["sourceUrl"].as_str().unwrap_or_default(), image["sourceName"].as_str().unwrap_or_default(),
                 image["caption"].as_str().unwrap_or_default(), metadata.len() as i64, now_iso()],
         )?;
+        added += inserted;
+        if inserted > 0 && image["autoInsert"] == true && suggested.len() < 2 {
+            suggested.push(filename.to_string());
+        }
     }
     tx.commit()?;
-    Ok(added)
+    Ok((added, suggested))
+}
+
+fn append_draft_illustrations(markdown: &str, filenames: &[String]) -> String {
+    if filenames.is_empty() {
+        return markdown.to_string();
+    }
+    let images = filenames
+        .iter()
+        .map(|filename| format!("[IMG:{filename}]"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let heading = "\n\n### 参考资料\n";
+    match markdown.rsplit_once(heading) {
+        Some((body, references)) => format!("{body}\n\n{images}{heading}{references}"),
+        None => format!("{markdown}\n\n{images}"),
+    }
 }
 
 async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
@@ -982,28 +1002,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             .filter(|v| v.is_object())
             .unwrap_or_else(|| json!({}));
 
-        let mut stmt = db.conn.prepare(
-            "SELECT id, domain, name, base_url, kind, trust, enabled, notes, use_for, discovered_by, ok FROM sources WHERE enabled = 1",
-        )?;
-        let src: Vec<Source> = stmt
-            .query_map([], |r| {
-                Ok(Source {
-                    id: r.get(0)?,
-                    domain: r.get(1)?,
-                    name: r.get(2)?,
-                    base_url: r.get(3)?,
-                    kind: r.get(4)?,
-                    trust: r.get(5)?,
-                    enabled: r.get::<_, i64>(6)? != 0,
-                    notes: r.get(7)?,
-                    use_for: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
-                    discovered_by: r.get(9)?,
-                    ok: r.get::<_, i64>(10)? != 0,
-                })
-            })?
-            .filter_map(|x| x.ok())
-            .collect();
-        drop(stmt);
+        let src = research_sources(&db)?;
 
         let s = load_settings(&db);
         let mut tstmt = db.conn.prepare(
@@ -1061,11 +1060,11 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
         "settings": settings,
         "imagesDir": img_dir.to_string_lossy(),
     });
-    let (material, drafted) = match checkpoint {
+    let (mut material, drafted) = match checkpoint {
         Some((material, drafted)) => (serde_json::from_str(&material)?, drafted),
         None => {
             job_step(state, job, "取材", 0.18, "搜索资料并筛选可引用正文").await;
-            let material = agent_stage(state, "/v1/research/collect", &payload, 50).await?;
+            let material = agent_stage(state, "/v1/research/collect", &payload, 55).await?;
             let db = state.db.lock().await;
             db.conn.execute(
                 "INSERT INTO research_checkpoints (question_id, material) VALUES (?1,?2)",
@@ -1074,10 +1073,71 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             (material, false)
         }
     };
-    payload["material"] = material;
     if !drafted {
-        job_step(state, job, "拟稿", 0.43, "资料已保存，正在生成正文").await;
-        let response = agent_stage(state, "/v1/research/draft", &payload, 145).await?;
+        if material.get("findings").is_none() {
+            job_step(
+                state,
+                job,
+                "查证",
+                0.35,
+                "逐项核对问题前提，补查缺失或冲突的证据",
+            )
+            .await;
+            payload["material"] = material;
+            material = agent_stage(state, "/v1/research/qualify", &payload, 72).await?;
+            state.db.lock().await.conn.execute(
+                "UPDATE research_checkpoints SET material=?2 WHERE question_id=?1",
+                params![qid, material.to_string()],
+            )?;
+        }
+        payload["material"] = material.clone();
+        job_step(
+            state,
+            job,
+            "拟稿与找图",
+            0.55,
+            "按答主文风起草，同时按画面搜索真实配图",
+        )
+        .await;
+        let (draft_result, images) = tokio::join!(
+            agent_stage(state, "/v1/research/draft", &payload, 145),
+            async {
+                if material.get("autoImageFiles").is_some() || settings.image_max == 0 {
+                    return Ok(None);
+                }
+                collect_question_images(state, qid, payload.clone(), false, false)
+                    .await
+                    .map(Some)
+            },
+        );
+        let mut image_warning = None;
+        match images {
+            Ok(Some((added, suggested))) => {
+                material["autoImageFiles"] = json!(suggested);
+                if added == 0 {
+                    image_warning = Some("没有找到能下载且与画面匹配的图片；可在写作台换词补搜。");
+                } else if suggested.is_empty() {
+                    image_warning = Some("备选图已保存；来源或画面仍需目测，未自动插入正文。");
+                }
+            }
+            Err(_) => image_warning = Some("配图搜索未完成，初稿仍可编辑；可在写作台重新搜索。"),
+            Ok(None) => {}
+        }
+        if let Some(message) = image_warning {
+            if let Some(warnings) = material["warnings"].as_array_mut() {
+                warnings.push(json!(message));
+            }
+        }
+        state.db.lock().await.conn.execute(
+            "UPDATE research_checkpoints SET material=?2 WHERE question_id=?1",
+            params![qid, material.to_string()],
+        )?;
+        let mut response = draft_result?;
+        if let (Some(message), Some(warnings)) =
+            (image_warning, response["warnings"].as_array_mut())
+        {
+            warnings.push(json!(message));
+        }
         let markdown = response
             .pointer("/draft/markdown")
             .and_then(Value::as_str)
@@ -1088,6 +1148,9 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             .chars()
             .filter(|character| !character.is_whitespace())
             .count() as i64;
+        let suggested: Vec<String> =
+            serde_json::from_value(material["autoImageFiles"].clone()).unwrap_or_default();
+        let markdown = append_draft_illustrations(markdown, &suggested);
         let mut db = state.db.lock().await;
         let tx = db.conn.transaction()?;
         let written = tx.execute(
@@ -1109,6 +1172,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
         )?;
         tx.commit()?;
     }
+    payload["material"] = material;
 
     let raw_doubts: String = state.db.lock().await.conn.query_row(
         "SELECT doubts FROM drafts WHERE question_id=?1",
@@ -1119,15 +1183,12 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
     job_step(
         state,
         job,
-        "补充核查与配图",
+        "补充核查",
         0.76,
-        "正文已保存并可编辑；正在补充核查与配图",
+        "正文已保存并可编辑；正在联网复核剩余说法",
     )
     .await;
-    let (review, images) = tokio::join!(
-        agent_stage(state, "/v1/research/review", &payload, 42),
-        collect_question_images(state, qid, payload.clone(), false, false),
-    );
+    let review = agent_stage(state, "/v1/research/review", &payload, 54).await;
     let mut db = state.db.lock().await;
     let tx = db.conn.transaction()?;
     if let Ok(review) = &review {
@@ -1136,7 +1197,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             params![qid, review["doubts"].to_string()],
         )?;
     }
-    if review.is_ok() && images.is_ok() {
+    if review.is_ok() {
         tx.execute(
             "DELETE FROM research_checkpoints WHERE question_id=?1",
             params![qid],
@@ -1146,13 +1207,32 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
     if let Err(error) = review {
         anyhow::bail!("正文已保存，核查未完成：{error}");
     }
-    if let Err(error) = images {
-        anyhow::bail!("正文已保存，配图未完成：{error}");
-    }
     Ok(())
 }
 
 // ---------------- 配置读取 ----------------
+
+pub fn research_sources(db: &crate::db::Db) -> Result<Vec<Source>> {
+    let mut statement = db.conn.prepare(
+        "SELECT id, domain, name, base_url, kind, trust, enabled, notes, use_for, discovered_by, ok FROM sources ORDER BY trust DESC, id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(Source {
+            id: row.get(0)?,
+            domain: row.get(1)?,
+            name: row.get(2)?,
+            base_url: row.get(3)?,
+            kind: row.get(4)?,
+            trust: row.get(5)?,
+            enabled: row.get::<_, i64>(6)? != 0,
+            notes: row.get(7)?,
+            use_for: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+            discovered_by: row.get(9)?,
+            ok: row.get::<_, i64>(10)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
 
 pub fn load_settings(db: &crate::db::Db) -> Settings {
     db.conn

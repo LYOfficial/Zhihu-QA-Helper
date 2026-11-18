@@ -8,6 +8,7 @@ import urllib.parse
 from html.parser import HTMLParser
 
 import research
+import investigation
 
 
 MEDIA = (
@@ -21,6 +22,7 @@ MEDIA = (
 
 IMAGE_SITES = (
     ("Minecraft 官网", ("minecraft.net",), ("minecraft.net", "mojang.com")),
+    ("Minecraft Wiki", ("minecraft.wiki",), ("minecraft.wiki",)),
     ("Wikimedia Commons", ("commons.wikimedia.org",), ("upload.wikimedia.org",)),
     ("Pexels", ("pexels.com",), ("images.pexels.com",)),
     ("Unsplash", ("unsplash.com",), ("images.unsplash.com",)),
@@ -51,11 +53,19 @@ def original_url(url, domains):
 
 
 def relevant(phrase, title):
-    query = research.keywords(phrase) - {"我的", "世界", "游戏", "图片", "配图", "photo", "image", "screenshot"}
-    matches = query & research.keywords(title)
-    if len(query) <= 1:
-        return bool(matches)
-    return len(matches) >= 2 and matches != {"minecraft", "mc"}
+    visual_noise = {"我的", "世界", "游戏", "图片", "配图", "截图", "photo", "image", "screenshot", "minecraft", "mc"}
+    def terms(text):
+        normalized = re.sub(r"\boff[ -]?hand\b|副手", " offhand ", text, flags=re.I)
+        normalized = re.sub(r"\b(?:boomerang|throwing[ -]di[sc]c?)\b|回旋飞盘|回旋镖", " boomerang ", normalized, flags=re.I)
+        normalized = re.sub(r"\bbedrock\b|基岩版", " bedrock ", normalized, flags=re.I)
+        return research.keywords(normalized) - visual_noise
+
+    query, image = terms(phrase), terms(title)
+    required = query & {"boomerang", "offhand"}
+    if required and not required <= image:
+        return False
+    matches = query & image
+    return bool(matches) if len(query) <= 1 else len(matches) >= min(2, len(query))
 
 
 def media_page(spec, url):
@@ -155,35 +165,58 @@ def commons_candidates(phrase):
     return candidates
 
 
-def find_candidates(question, terms, topic, deadline):
-    title = str(question.get("title") or "").strip()[:110]
-    phrases = list(dict.fromkeys([term.strip()[:100] for term in terms[:2] if isinstance(term, str) and term.strip()] + [title]))
-    phrases = [phrase for phrase in phrases if phrase]
-    if not phrases:
-        return []
-    requests = ([("bing", phrase) for phrase in phrases[:2]] + [("commons", phrase) for phrase in phrases[:2]]
-                + [(spec, phrase) for phrase in phrases[:2] for spec in MEDIA])
+def find_candidates(plans, sources, docs, deadline):
+    routes = [(plan, phrase) for plan in plans[:3] for phrase in plan["queries"][:2]]
+    requests = [(kind, plan, phrase) for plan, phrase in routes for kind in ("directory", "bing", "commons", *MEDIA)]
+
+    def from_docs(pages, phrase):
+        candidates = []
+        for doc in pages:
+            if not (doc.get("authority") and doc.get("allowImage")):
+                continue
+            source_title = doc.get("title", "")
+            for image in doc.get("images", [])[:50]:
+                uri = image["url"]
+                path = urllib.parse.unquote(urllib.parse.urlsplit(uri).path).rsplit("/", 1)[-1]
+                caption = image.get("caption") or ""
+                if any(hint in path.lower() for hint in research.BAD_IMG_HINTS):
+                    continue
+                matched = relevant(phrase, f"{caption} {path}")
+                if not matched and (not caption or not relevant(phrase, source_title)):
+                    continue
+                auto = matched and doc.get("sourceKind") in {"official", "docs", "wiki"}
+                candidates.append({"url": uri, "page": doc["sourceUrl"], "sourceName": doc["sourceName"],
+                                   "caption": caption or source_title, "autoInsert": auto})
+        return candidates
 
     def search(request):
-        spec, phrase = request
+        spec, plan, phrase = request
+        if spec == "directory":
+            approved = [source for source in sources if research._allow_image(source)]
+            hosts = set(plan.get("hosts") or [])
+            scoped = [source for source in approved if research._host(source["baseUrl"]) in hosts or
+                      research._host(source["baseUrl"]).removeprefix("www.") in hosts]
+            pages = research.gather(phrase, scoped or approved, 5, min(deadline, time.time() + 12))
+            return from_docs([*docs, *pages], phrase), []
         if spec == "bing":
-            return bing_image_candidates(phrase)
+            images, pages = bing_image_candidates(phrase)
+            return images, [(source, url, phrase) for source, url in pages]
         if spec == "commons":
             return commons_candidates(phrase), []
-        return [], [(spec, link) for link in media_urls(spec, phrase)[:2]]
+        return [], [(spec, link, phrase) for link in media_urls(spec, phrase)[:2]]
 
-    groups = research._parallel(search, requests, 10, min(deadline, time.time() + 5.5))
+    groups = research._parallel(search, requests, 18, min(deadline, time.time() + 13))
     pages, files, seen = [], [], set()
     for hits, located in groups:
         files.extend(hits)
-        for spec, link in located:
+        for spec, link, phrase in located:
             key = research.canonical_url(link)
             if key not in seen:
                 seen.add(key)
-                pages.append((spec, link))
-    for group in research._parallel(lambda pair: media_candidates(*pair, topic), pages, 8, deadline):
+                pages.append((spec, link, phrase))
+    for group in research._parallel(lambda entry: media_candidates(*entry), pages[:14], 10, deadline):
         files.extend(group)
-    return files
+    return sorted(files, key=lambda item: bool(item.get("autoInsert")), reverse=True)
 
 
 def page_candidates(url):

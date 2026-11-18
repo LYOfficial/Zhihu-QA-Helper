@@ -63,6 +63,7 @@ export interface ProfileStyle {
   avoid: string[];
   length: string;
   guide: string;
+  variants?: string[];
 }
 
 export interface Profile {
@@ -127,6 +128,16 @@ export interface Doubt {
   status: "open" | "unverified" | "verified" | "corrected" | "rejected";
   verdict: string;
   source: string;
+  confidence?: number | null;
+  evidence?: {
+    url: string;
+    label: string;
+    sourceName: string;
+    kind: string;
+    publishedAt: string;
+    quote: string;
+    stance: "supports" | "refutes" | "context";
+  }[];
 }
 
 export interface ImageAsset {

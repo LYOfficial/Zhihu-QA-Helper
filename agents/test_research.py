@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 
 import llm
 import illustrations
+import investigation
 import main
 import research
 
@@ -132,22 +133,87 @@ class ResearchTests(unittest.TestCase):
         self.assertNotIn("<p>", examples[0]["text"])
         doc = {"title": "手册", "sourceName": "官方", "sourceUrl": "https://manual.example/doc", "text": "铁路信号示意"}
         with patch.object(llm, "chat_json", return_value={
-            "markdown": "正文。\n\n[IMG:fake.png]\n\n![随机图](https://other.example/image.png)",
-            "citations": [{"url": "https://invented.example"}, {"url": doc["sourceUrl"]}],
+            "markdown": "正文。[[S1]][[S99]]\n\n[IMG:fake.png]\n\n![随机图](https://other.example/image.png)",
+            "citations": [{"url": "https://invented.example"}, {"id": "S1", "snippet": "说明信号用途"}],
             "doubts": [{"text": "信号是否默认开启"}],
         }) as call:
-            output = main.write_draft({"question": {"title": "铁路信号"}, "profile": {"samples": examples}, "material": {"docs": [doc]}})
-        self.assertIn("我先放结果。", call.call_args.args[1][1]["content"])
-        self.assertEqual(output["draft"]["markdown"], "正文。")
+            output = main.write_draft({"question": {"title": "铁路信号"}, "profile": {"samples": examples,
+                "style": {"guide": "统一模板哨兵", "variants": ["教程会先给可复现步骤", "短评会先交代例外"]}}, "material": {"docs": [doc]}})
+        prompt = call.call_args.args[1][1]["content"]
+        self.assertIn("我先放结果。", prompt)
+        self.assertIn("教程会先给可复现步骤", prompt)
+        self.assertIn("短评会先交代例外", prompt)
+        self.assertNotIn("统一模板哨兵", prompt)
+        self.assertEqual(output["draft"]["markdown"], "正文。[1]\n\n### 参考资料\n\n[1] 手册 — https://manual.example/doc")
         self.assertEqual([citation["url"] for citation in output["draft"]["citations"]], [doc["sourceUrl"]])
         self.assertEqual(output["draft"]["doubts"][0]["status"], "unverified")
 
     def test_no_evidence_is_not_verification(self):
         doubt = {"text": "最大长度", "status": "unverified"}
-        material = {"docs": [{"sourceName": "手册", "title": "手册", "sourceUrl": "https://manual.example/doc", "text": "默认最大长度为十二节车厢。"}]}
-        with patch.object(llm, "chat_json", return_value={"results": [{"index": 1, "status": "verified", "verdict": "确认", "quote": "未经资料支持的说法"}]}):
-            result = main.review_material({"model": {}, "material": material, "doubts": [doubt]})
+        material = {"docs": [{"sourceName": "手册", "title": "手册", "sourceUrl": "https://manual.example/doc",
+                              "sourceKind": "official", "text": "默认最大长度为十二节车厢。"}]}
+        response = {"results": [{"index": 1, "status": "verified", "verdict": "确认",
+                                "evidence": [{"id": "S1", "stance": "supports", "quote": "未经资料支持的说法，不是在原文里。"}]}]}
+        with patch.object(llm, "chat_json", return_value=response), patch.object(investigation, "gather_queries", return_value=[]) as search:
+            result = main.review_material({"model": {"model": "test", "apiKey": "test"}, "material": material, "doubts": [doubt]})
         self.assertEqual(result["doubts"][0]["status"], "unverified")
+        self.assertEqual(result["doubts"][0]["evidence"], [])
+        self.assertEqual(search.call_args.args[0], ["最大长度"])
+
+    def test_claim_follow_up_requires_source_id_quote_and_preserves_conflict(self):
+        quote = "The throwing disc is coming in the first game drop of 2027."
+        primary = {"sourceName": "Minecraft", "title": "Announcing throwing discs", "sourceUrl": "https://official.example/release",
+                   "sourceKind": "official", "text": quote, "publishedAt": "2026-11-14"}
+        rumor = {**primary, "title": "A player post", "sourceUrl": "https://example.org/post", "sourceKind": "community",
+                 "text": "I thought the throwing disc was already released today."}
+        claim = "飞盘已正式上线"
+        initial = {"results": [{"index": 1, "status": "unverified", "queries": ["Minecraft throwing disc release date"]}]}
+        expected = {"index": 1, "status": "corrected", "verdict": "公告说明计划于 2027 年首个更新推出",
+                    "evidence": [{"id": "S1", "quote": quote, "stance": "refutes"}]}
+        with patch.object(llm, "chat_json", side_effect=[initial, {"results": [expected]}]), \
+                patch.object(investigation, "gather_queries", return_value=[primary]) as search:
+            checks, _ = investigation.investigate_claims([claim], [rumor], [], {"model": "test", "apiKey": "test"})
+        self.assertEqual(search.call_args.args[0], ["Minecraft throwing disc release date"])
+        self.assertEqual(checks[0]["status"], "corrected")
+        self.assertEqual(checks[0]["confidence"], 90)
+        self.assertEqual(checks[0]["evidence"][0]["publishedAt"], "2026-11-14")
+        expected["evidence"].append({"id": "S2", "quote": rumor["text"], "stance": "supports"})
+        with patch.object(llm, "chat_json", return_value={"results": [expected]}):
+            checks = investigation.verify([claim], [primary, rumor], {"model": "test", "apiKey": "test"}, follow_up=False)
+        self.assertEqual(checks[0]["status"], "unverified")
+        self.assertEqual(len(checks[0]["evidence"]), 2)
+
+    def test_minecraft_image_plan_and_official_image_matching(self):
+        question = {"title": "《我的世界》将新增回旋飞盘武器且基岩版解锁完整副手功能，会拓展出哪些新玩法？"}
+        plan = investigation.plan_question(question, {}, [])
+        self.assertEqual(len(plan["images"]), 2)
+        self.assertTrue(all(question["title"] not in group["queries"] for group in plan["images"]))
+        second = plan["images"][1]["queries"][1]
+        self.assertTrue(illustrations.relevant(second, "A throwing disc in the off-hand"))
+        self.assertFalse(illustrations.relevant(second, "A torch in the Bedrock off-hand"))
+        self.assertFalse(illustrations.relevant(second, "Alexa on Amazon Bedrock"))
+
+    def test_web_retrieval_runs_even_with_a_matching_directory(self):
+        official = {"sourceUrl": "https://issuer.example/offhand", "sourceName": "公告", "sourceKind": "official",
+                    "title": "发布副手功能", "text": "发布方公布副手功能当前仅限预览版。"}
+        community = {**official, "sourceUrl": "https://tieba.baidu.com/p/121", "sourceKind": "community",
+                     "text": "我在副手功能预览版发现这个情况。"}
+        with patch.object(research, "gather", return_value=[official]), patch.object(research, "gather_web",
+                side_effect=lambda *args, **opts: [community] if opts.get("community_only") else []) as search:
+            docs = investigation.gather_queries(["副手功能"], [], time.time() + 2, hotspot=True)
+        self.assertTrue(any(call.kwargs.get("recent") for call in search.call_args_list))
+        self.assertEqual({doc["sourceKind"] for doc in docs}, {"official", "community"})
+
+    def test_search_union_keeps_original_result_urls(self):
+        html = '<a data-mdurl="https://www.cas.cn/article">月壤</a><a data-mdurl="https://ai.so.com/search">聚合摘要</a>'
+        rss = '<rss><channel><item><link>https://www.mnr.gov.cn/article</link></item></channel></rss>'
+
+        def response(url, **kwargs):
+            data = html if "so.com" in url else rss if "format=rss" in url else ""
+            return data.encode(), "text/html", "utf-8"
+
+        with patch.object(research, "fetch", side_effect=response):
+            self.assertEqual(research.web_search("嫦娥六号 月壤"), ["https://www.cas.cn/article", "https://www.mnr.gov.cn/article"])
 
     def test_truncated_draft_salvages_without_second_request(self):
         with patch.object(llm, "chat", return_value='{"markdown":"' + "可以保留的草稿。" * 20) as call:

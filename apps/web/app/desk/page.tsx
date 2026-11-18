@@ -32,7 +32,7 @@ function IllustrationTools({ question, disabled, onImages }: {
   const [busy, setBusy] = React.useState<"search" | "import" | null>(null);
   const [notice, setNotice] = React.useState("");
   const base = `/api/images/${encodeURIComponent(question.id)}`;
-  const keywords = query.trim() || question.title;
+  const keywords = query.trim();
 
   async function run(action: "search" | "import") {
     if (busy || disabled) return;
@@ -41,7 +41,7 @@ function IllustrationTools({ question, disabled, onImages }: {
       return;
     }
     setBusy(action);
-    setNotice(action === "search" ? "正在搜索公开图源并筛除重复图片，最多约 25 秒。" : "正在检查图片并去重…");
+    setNotice(action === "search" ? "正在提取画面关键词、查找原图并去重，可能需要约 40 秒。" : "正在检查图片并去重…");
     try {
       let result: { added: number };
       if (action === "search") {
@@ -74,12 +74,12 @@ function IllustrationTools({ question, disabled, onImages }: {
       onClose={() => { if (!busy) setOpen(false); }} width={490}>
       <div className="illustration-tools">
         <label>搜图关键词或公开帖子链接 <input className="input" value={query} onChange={(event) => setQuery(event.target.value)}
-          placeholder={question.title} maxLength={2048} disabled={!!busy} /></label>
+          placeholder="留空自动拆词，也可输入想找的具体画面" maxLength={2048} disabled={!!busy} /></label>
         <div className="illustration-actions">
           <button className="btn btn-sm" disabled={disabled || !!busy} onClick={() => void run("search")}>
             {busy === "search" ? "正在搜图…" : "自动搜图"}
           </button>
-          <button className="btn btn-sm" onClick={() => void openExternal(keywords.startsWith("https://") ? keywords : `https://www.bing.com/images/search?q=${encodeURIComponent(keywords)}`)}>
+          <button className="btn btn-sm" disabled={!keywords} onClick={() => void openExternal(keywords.startsWith("https://") ? keywords : `https://www.bing.com/images/search?q=${encodeURIComponent(keywords)}`)}>
             <IconExternal size={13} /> 浏览器搜图
           </button>
         </div>
@@ -647,7 +647,7 @@ function DeskInner() {
 
           {images.length === 0 ? (
             <p className="dim" style={{ fontSize: 11.5, marginBottom: 18, lineHeight: 1.7 }}>
-              暂无配图。可以点击「找配图」自动搜索，也可以在浏览器找图后导入。备选图不会自动插入正文。
+              暂无配图。可以点击「找配图」按画面搜图，或导入自己找到的图片；补搜不会改动正文。
             </p>
           ) : (
             <div className="img-grid" style={{ marginBottom: 20 }}>
@@ -689,7 +689,7 @@ function DeskInner() {
                 color: tab === "doubt" ? "var(--ink)" : "var(--ink-3)",
               }}
             >
-              存疑 {doubts.length}
+              核查 {doubts.length}
             </button>
             <button
               className="btn btn-sm"
@@ -707,7 +707,7 @@ function DeskInner() {
           {tab === "doubt" ? (
             doubts.length === 0 ? (
               <p className="dim" style={{ fontSize: 11.5, lineHeight: 1.7 }}>
-                没有存疑点。这通常意味着资料足够扎实，但仍建议你自己扫一眼数值。
+                没有逐项核查记录，不代表正文事实已全部核实。
               </p>
             ) : (
               doubts.map((d, i) => (
@@ -723,7 +723,20 @@ function DeskInner() {
                             : d.status === "verified" && d.source ? "资料支持 · " : "未核实 · "}
                       </b>
                       {d.verdict}
-                      {d.source && <button className="btn btn-sm" onClick={() => void openExternal(d.source)}>查看核查来源</button>}
+                      {d.confidence != null && (
+                        <div className="dim" style={{ marginTop: 4 }}>
+                          {d.confidence ? `证据把握 ${d.confidence}%（助手估计，非实测准确率）` : "证据不足，无法估计把握"}
+                        </div>
+                      )}
+                      {d.source && !d.evidence?.length && <button className="btn btn-sm" onClick={() => void openExternal(d.source)}>查看核查来源</button>}
+                      {d.evidence?.map((entry) => (
+                        <details key={entry.url} style={{ marginTop: 6 }}>
+                          <summary>{entry.stance === "supports" ? "支持" : entry.stance === "refutes" ? "反证" : "背景"} · {entry.sourceName}</summary>
+                          <button className="btn btn-sm" onClick={() => void openExternal(entry.url)}>{entry.label || "阅读原文"}</button>
+                          <div className="dim">{({ official: "官方/发布方", docs: "原始文档", wiki: "维基", media: "媒体", community: "社区个案" } as Record<string, string>)[entry.kind] || "网页"}{entry.publishedAt ? ` · ${entry.publishedAt.slice(0, 10)}` : ""}</div>
+                          <blockquote style={{ margin: "5px 0", overflowWrap: "anywhere" }}>{entry.quote}</blockquote>
+                        </details>
+                      ))}
                     </div>
                   )}
                 </div>
@@ -747,7 +760,7 @@ function DeskInner() {
                   >
                     {c.label}
                   </a>
-                  <div className="sn">{c.sourceName || citationHost(c.url)}</div>
+                  <div className="sn">{c.sourceName || citationHost(c.url)}{c.snippet ? ` · ${c.snippet}` : ""}</div>
                 </div>
               </div>
             ))

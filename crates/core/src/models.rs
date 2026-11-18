@@ -71,7 +71,7 @@ pub struct ProfileTerm {
     pub note: String,
 }
 
-/// 文风档案：画像分析顺带归纳的写作习惯，直接喂给拟稿提示词。
+/// 文风档案：画像归纳的多种情境写法，拟稿时作为参考。
 /// 字段全部给默认值，老库没有这段 JSON 时也能正常反序列化。
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -87,6 +87,7 @@ pub struct ProfileStyle {
     pub avoid: Vec<String>,
     pub length: String,
     pub guide: String,
+    pub variants: Vec<String>,
 }
 
 impl ProfileStyle {
@@ -97,6 +98,7 @@ impl ProfileStyle {
             && self.voice.trim().is_empty()
             && self.structure.trim().is_empty()
             && self.signature.is_empty()
+            && self.variants.is_empty()
     }
 }
 
@@ -185,6 +187,22 @@ pub struct Doubt {
     pub verdict: String,
     #[serde(default)]
     pub source: String,
+    #[serde(default)]
+    pub confidence: Option<u8>,
+    #[serde(default)]
+    pub evidence: Vec<ClaimEvidence>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimEvidence {
+    pub url: String,
+    pub label: String,
+    pub source_name: String,
+    pub kind: String,
+    pub published_at: String,
+    pub quote: String,
+    pub stance: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
