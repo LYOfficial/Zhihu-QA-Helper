@@ -148,6 +148,7 @@ pub struct Question {
     pub domain: String,
     pub sub_domain: String,
     pub fit: f64,
+    pub fit_evaluated: bool,
     pub status: String, // inbox | researching | pending_review | answered | dismissed
     pub bucket: String, // queue | selected | archived
     pub answer_count: i64,
@@ -263,6 +264,7 @@ pub struct Settings {
     pub draft_max: i64,
     pub image_min: i64,
     pub image_max: i64,
+    pub verify_timeout_seconds: i64,
     pub auto_sync: bool,
     pub minimize_to_tray: bool,
     pub auto_launch: bool,

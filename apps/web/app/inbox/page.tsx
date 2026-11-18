@@ -10,6 +10,7 @@ import {
   SectionTitle,
 } from "@/components/ui";
 import { api, toast } from "@/lib/api";
+import { clearDraftRecovery } from "@/lib/draft-recovery";
 import { useLoad } from "@/lib/hooks";
 import { watchJob } from "@/lib/jobwatch";
 import type { DomainCount, Job, Question } from "@/lib/types";
@@ -28,6 +29,7 @@ export default function InboxPage() {
   const [domain, setDomain] = React.useState("all");
   const [kw, setKw] = React.useState("");
   const [confirmDismiss, setConfirmDismiss] = React.useState<Question | null>(null);
+  const [restoring, setRestoring] = React.useState(false);
   const [syncJob, setSyncJob] = React.useState<Job | null>(null);
 
   const qs = useLoad<{ questions: Question[]; domains: DomainCount[] }>(() =>
@@ -90,11 +92,27 @@ export default function InboxPage() {
       const r = await api.post<{ freedBytes?: number }>(
         `/api/questions/${confirmDismiss.id}/dismiss`
       );
+      clearDraftRecovery(confirmDismiss.id);
       toast(`已弃用，释放 ${Math.round((r.freedBytes ?? 0) / 1024)} KB 本地空间`, "ok");
       setConfirmDismiss(null);
       qs.reload(true);
     } catch (e) {
       toast(e instanceof Error ? e.message : "操作失败", "err");
+    }
+  }
+
+  async function restore(item: Question) {
+    if (restoring) return;
+    setRestoring(true);
+    try {
+      await api.post(`/api/questions/${item.id}/restore`);
+      clearDraftRecovery(item.id);
+      await qs.reload(true);
+      toast("已恢复到待解答，可在「待阅」中查看", "ok");
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "恢复失败", "err");
+    } finally {
+      setRestoring(false);
     }
   }
 
@@ -241,6 +259,8 @@ export default function InboxPage() {
               q={item}
               onResearch={research}
               onDismiss={setConfirmDismiss}
+              onRestore={restore}
+              restoreDisabled={restoring}
             />
           ))}
         </div>
@@ -254,7 +274,7 @@ export default function InboxPage() {
         >
           <p style={{ fontSize: 12.5, color: "var(--ink-2)", lineHeight: 1.8 }}>
             会删除本地已生成的正稿与配图，释放磁盘空间，并把这个问题标记为「弃用」。
-            知乎上的问题本身不受影响，之后仍可以手动找回。
+            之后可从「已弃用」恢复问题，但已删除的稿件与配图不会恢复。
           </p>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 20 }}>
             <button className="btn" onClick={() => setConfirmDismiss(null)}>

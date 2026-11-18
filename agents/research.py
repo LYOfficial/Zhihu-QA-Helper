@@ -34,7 +34,7 @@ UA = (
 
 BAD_IMG_HINTS = (
     "logo", "icon", "sprite", "avatar", "favicon", "banner", "button",
-    "arrow", "loading", "placeholder", "1x1", "pixel",
+    "arrow", "loading", "placeholder", "1x1", "pixel", "/blank.",
 )
 
 TEXT_TAGS = {"p", "li", "td", "th", "h1", "h2", "h3", "h4", "dd", "dt", "blockquote"}
@@ -163,6 +163,7 @@ class _DocParser(HTMLParser):
         self.title = ""
         self.published = ""
         self.preview = ""
+        self.description = ""
         self._skip = 0
         self._in_title = False
         self._scope = ""
@@ -176,6 +177,8 @@ class _DocParser(HTMLParser):
                 self.published = content
             if name in {"og:image", "twitter:image"} and not self.preview:
                 self.preview = content
+            if name in {"og:description", "description"} and not self.description:
+                self.description = content.strip()
         if tag in SKIP_TAGS:
             self._skip += 1
         if self._skip:
@@ -191,11 +194,18 @@ class _DocParser(HTMLParser):
         ):
             self._scope, self._depth = tag, 1
         if tag == "img" and self._scope:
-            src = a.get("data-original") or a.get("data-src") or a.get("src") or ""
-            if src and not any(
+            variants = [item.split() for item in (a.get("data-srcset") or a.get("srcset") or "").split(",") if item.strip()]
+            def width(variant):
+                size = re.fullmatch(r"(\d+(?:\.\d+)?)([wx])", variant[1]) if len(variant) > 1 else None
+                return float(size[1]) * (1000 if size[2] == "x" else 1) if size else 0
+
+            responsive = max(variants, key=width)[0] if variants and not variants[0][0].startswith("data:") else ""
+            urls = dict.fromkeys((a.get("data-original"), a.get("data-actualsrc"), a.get("data-src"), responsive, a.get("src")))
+            if not any(
                 (a.get(dim) or "").isdigit() and int(a[dim]) < 100 for dim in ("width", "height")
             ):
-                self.images.append({"url": src, "caption": (a.get("alt") or a.get("title") or "")[:160]})
+                caption = (a.get("alt") or a.get("title") or "")[:160]
+                self.images.extend({"url": src, "caption": caption} for src in urls if src and not src.startswith("data:"))
         if tag in TEXT_TAGS or tag == "br":
             self.chunks.append("\n")
             if self._scope:
@@ -238,6 +248,9 @@ class _DocParser(HTMLParser):
 
 
 def _parsed_doc(html: str, base_url: str, image_markers=None):
+    include_preview = image_markers is None
+    if include_preview and _host(base_url) in {"www.minecraft.net", "minecraft.net"}:
+        image_markers = CONTENT_MARKERS | {"article-grid-a", "article-head", "article-head__image", "article-media", "MC_Carousel"}
     p = _DocParser(image_markers)
     try:
         p.feed(html)
@@ -251,7 +264,7 @@ def _parsed_doc(html: str, base_url: str, image_markers=None):
             continue
         if full.startswith(("https://", "http://")):
             imgs.append({**image, "url": full})
-    if p.preview and image_markers is None:
+    if p.preview and include_preview:
         try:
             preview = urllib.parse.urljoin(base_url, p.preview)
             if preview.startswith(("https://", "http://")):
@@ -259,7 +272,10 @@ def _parsed_doc(html: str, base_url: str, image_markers=None):
         except ValueError:
             pass
     dates = re.search(r'"datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2}[^"<]{0,30})"', html, re.I)
-    return p.title, p.text(prefer_content=True), imgs, p.published or (dates[1] if dates else "")
+    text = p.text(prefer_content=True)
+    if _host_under(_host(base_url), ("bilibili.com",)) and urllib.parse.urlsplit(base_url).path.startswith("/video/"):
+        text = f"【视频页面简介，不是视频转录】\n{p.description}" if len(p.description) >= 40 else ""
+    return p.title, text, imgs, p.published or (dates[1] if dates else "")
 
 
 def parse_doc(html: str, base_url: str, image_markers=None):
@@ -335,7 +351,7 @@ def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: boo
 def _make_doc(html: str, url: str, source: dict, authority: bool, allow_image: bool,
               article_title: str = "", published_at: str = "") -> dict | None:
     title, text, imgs, published = _parsed_doc(html, url)
-    if len(text) < 180:
+    if len(text) < (50 if source.get("kind") == "community" else 180):
         return None
     return {
         "sourceName": source.get("name") or _host(url),
@@ -346,8 +362,6 @@ def _make_doc(html: str, url: str, source: dict, authority: bool, allow_image: b
         "trust": source.get("trust") or 3,
         "sourceKind": source.get("kind") or "web",
         "publishedAt": published[:40] or published_at[:40],
-        # authority=False 表示这一篇来自通用网页检索兜底，不是用户配置的权威平台。
-        # 这类页面只能当背景资料，绝不能作为图源——否则图库里会混进没授权过的站点。
         "authority": authority,
         "allowImage": allow_image,
     }
@@ -536,7 +550,11 @@ def web_search(query: str, limit: int = 4, timeout: int = 7, allowed=None, *, re
     return out
 
 
-COMMUNITY_HOSTS = ("reddit.com", "zhihu.com", "tieba.baidu.com", "bilibili.com", "weibo.com", "xiaoheihe.cn", "x.com")
+COMMUNITY_SITES = {"bilibili.com": "哔哩哔哩", "xiaoheihe.cn": "小黑盒", "zhihu.com": "知乎",
+                   "tieba.baidu.com": "百度贴吧", "weibo.com": "微博", "reddit.com": "Reddit", "x.com": "X"}
+NEWS_SITES = {"xinhuanet.com": "新华网", "news.cn": "新华网", "people.com.cn": "人民网", "cctv.com": "央视网",
+              "thepaper.cn": "澎湃新闻", "caixin.com": "财新", "cyol.com": "中青在线", "reuters.com": "Reuters",
+              "apnews.com": "AP", "bbc.com": "BBC", "bbc.co.uk": "BBC"}
 
 
 def _host_under(host, sites):
@@ -544,32 +562,36 @@ def _host_under(host, sites):
 
 
 def gather_web(query: str, max_pages: int = 3, deadline: float | None = None, sources=(), *, recent=False,
-               community_only=False) -> list[dict]:
+               lane="web") -> list[dict]:
     deadline = deadline or time.time() + 14
-    if community_only:
-        sites = ("zhihu.com", "weibo.com", "bilibili.com") if re.search(r"[\u4e00-\u9fff]", query) else ("reddit.com", "x.com")
-        groups = _parallel(lambda site: web_search(f"{query} site:{site}", limit=2, timeout=5, recent=True,
+    if lane in {"discussion", "news"}:
+        chinese = lane == "discussion" or bool(re.search(r"[\u4e00-\u9fff]", query))
+        sites = tuple(COMMUNITY_SITES)[:5] if lane == "discussion" else (
+            ("news.cn", "people.com.cn", "cctv.com", "thepaper.cn", "caixin.com") if chinese else ("reuters.com", "apnews.com", "bbc.com"))
+        groups = _parallel(lambda site: web_search(f"{query} site:{site}", limit=2, timeout=5, recent=recent,
                                                      allowed=lambda url: _host_under(_host(url), (site,))),
-                           sites, 3, min(deadline, time.time() + 5.5))
+                           sites, 5, min(deadline, time.time() + 5.5))
         urls = [url for group in groups for url in group]
     else:
         urls = web_search(query, limit=max_pages * 2, timeout=6, recent=recent)
 
     def read(url):
-        source = None if community_only else next((source for source in sources if source_matches(source, url)), None)
-        if source:
-            return _fetch_doc(url, source, True, _allow_image(source))
         host = _host(url)
-        kind = "community" if _host_under(host, COMMUNITY_HOSTS) else "web"
+        community = next((label for site, label in COMMUNITY_SITES.items() if _host_under(host, (site,))), "")
+        media = next((label for site, label in NEWS_SITES.items() if _host_under(host, (site,))), "")
+        source = next((source for source in sources if source_matches(source, url)), None)
+        if source and not (community or media):
+            return _fetch_doc(url, source, True, _allow_image(source))
+        kind = "community" if community else "web"
         if _host_under(host, ("gov.cn", "gov.uk", "europa.eu", "who.int", "un.org", "esa.int", "cas.cn", "cnsa.gov.cn")) or host.endswith(".gov"):
             kind = "official"
-        elif _host_under(host, ("reuters.com", "apnews.com", "xinhuanet.com", "people.com.cn", "cctv.com", "bbc.com", "bbc.co.uk", "cyol.com")):
+        elif media:
             kind = "media"
         elif _host_under(host, ("wikipedia.org", "minecraft.wiki")):
             kind = "wiki"
         parts = urllib.parse.urlsplit(url)
         origin = parts._replace(path="", query="", fragment="").geturl()
-        return _fetch_doc(url, {"name": host, "trust": 4 if kind == "official" else 2, "kind": kind, "baseUrl": origin},
+        return _fetch_doc(url, {"name": community or media or host, "trust": {"official": 4, "media": 3}.get(kind, 2), "kind": kind, "baseUrl": origin},
                           authority=kind in {"official", "media", "wiki"})
 
     target = keywords(query)

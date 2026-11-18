@@ -165,7 +165,48 @@ def commons_candidates(phrase):
     return candidates
 
 
-def find_candidates(plans, sources, docs, deadline):
+def source_candidates(docs, phrases=()):
+    ranked, used = [], set()
+    for index, doc in enumerate(docs[:12]):
+        page = doc["sourceUrl"]
+        for image in doc.get("images", [])[:45]:
+            uri = image["url"]
+            path = urllib.parse.unquote(urllib.parse.urlsplit(uri).path).lower()
+            if any(hint in path for hint in (*research.BAD_IMG_HINTS, "watermark", "thumbnail")) or path.endswith((".svg", ".svgz", ".gif")):
+                continue
+            key = research.canonical_url(uri)
+            if key in used:
+                continue
+            used.add(key)
+            caption = image.get("caption", "")
+            matched = any(relevant(phrase, f"{caption} {path.rsplit('/', 1)[-1]}") for phrase in phrases)
+            score = (not image.get("cover"), matched, -index)
+            ranked.append((score, {"url": uri, "page": page, "sourceName": doc.get("sourceName") or research._host(page),
+                                   "caption": caption or doc.get("title", ""),
+                                   "autoInsert": matched and doc.get("sourceKind") in {"official", "docs", "wiki"}}))
+    return [item for _, item in sorted(ranked, key=lambda entry: entry[0], reverse=True)]
+
+
+def read_source(ref):
+    url = ref["url"]
+    scheme = urllib.parse.urlsplit(url).scheme
+    if scheme not in {"http", "https"} or not research.public_url(url):
+        return []
+    spec = next((site for site in MEDIA if media_page(site, url)), None)
+    if spec:
+        return media_candidates(spec, url, "")
+    original_host = research._host(url).removeprefix("www.")
+    def allowed(link):
+        return research._host(link).removeprefix("www.") == original_host and research.public_url(link)
+
+    raw, ctype, charset = research.fetch(url, timeout=6, allowed=allowed)
+    if ctype and "html" not in ctype.lower():
+        return []
+    title, _, images = research.parse_doc(research._decode(raw, charset), url)
+    return source_candidates([{"sourceUrl": url, "sourceName": ref.get("sourceName"), "title": title, "images": images}])
+
+
+def find_candidates(plans, sources, deadline):
     routes = [(plan, phrase) for plan in plans[:3] for phrase in plan["queries"][:2]]
     requests = [(kind, plan, phrase) for plan, phrase in routes for kind in ("directory", "bing", "commons", *MEDIA)]
 
@@ -197,7 +238,7 @@ def find_candidates(plans, sources, docs, deadline):
             scoped = [source for source in approved if research._host(source["baseUrl"]) in hosts or
                       research._host(source["baseUrl"]).removeprefix("www.") in hosts]
             pages = research.gather(phrase, scoped or approved, 5, min(deadline, time.time() + 12))
-            return from_docs([*docs, *pages], phrase), []
+            return from_docs(pages, phrase), []
         if spec == "bing":
             images, pages = bing_image_candidates(phrase)
             return images, [(source, url, phrase) for source, url in pages]

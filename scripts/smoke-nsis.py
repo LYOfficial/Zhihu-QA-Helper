@@ -16,6 +16,7 @@ from importlib import import_module
 
 smoke = import_module("smoke-test")
 BASE = "http://127.0.0.1:18787"
+VERSION = json.loads((Path(__file__).resolve().parents[1] / "crates/desktop/tauri.conf.json").read_text(encoding="utf-8"))["version"]
 
 
 class LegacyCore(BaseHTTPRequestHandler):
@@ -36,7 +37,7 @@ def request(path, data=None):
         return json.load(response)
 
 
-def test_nsis(extracted, screenshots, live_search):
+def test_nsis(extracted, screenshots, live_search, live_sources):
     desktop = extracted / "zhihu-qa-helper.exe"
     assert desktop.is_file() and (extracted / "runtime/web/index.html").is_file()
     old = None
@@ -57,12 +58,16 @@ def test_nsis(extracted, screenshots, live_search):
             process = subprocess.Popen([str(desktop)], cwd=extracted, env=env)
             try:
                 health = smoke.wait_for(lambda: (value if (value := request("/api/health"))["agent"] else None), 35)
-                assert health["version"] == "0.1.1" and Path(health["dataDir"]) == data, health
+                assert health["version"] == VERSION and Path(health["dataDir"]) == data, health
                 with sqlite3.connect(data / "zhihu-qa.db") as db:
                     db.execute("UPDATE settings SET auto_sync=0")
                     db.execute("INSERT INTO account(id,name,cookie) VALUES (1,'离线测试账号','fixture')")
                     db.execute("INSERT INTO questions(id,title,domain) VALUES ('test','Steam locomotive','铁路')")
                     db.execute("INSERT INTO drafts(question_id,markdown) VALUES ('test',?)", (smoke.MANUAL_DRAFT,))
+                    if live_sources:
+                        citation = {"url": "https://www.minecraft.net/en-us/article/twitchcon-gamedrop-features",
+                                    "label": "Minecraft TwitchCon 公告", "sourceName": "Minecraft 官网", "snippet": "官方公告"}
+                        db.execute("UPDATE drafts SET citations=? WHERE question_id='test'", (json.dumps([citation]),))
                 screenshots.mkdir(parents=True, exist_ok=True)
                 with sync_playwright() as playwright:
                     debug_url = f"http://127.0.0.1:{debug_port}"
@@ -81,6 +86,14 @@ def test_nsis(extracted, screenshots, live_search):
                     editor = page.get_by_role("textbox", name="回答正文")
                     editor.wait_for()
                     smoke.wait_for(lambda: editor.input_value() == smoke.MANUAL_DRAFT)
+                    if live_sources:
+                        page.get_by_role("button", name="从来源提图", exact=True).click()
+                        page.get_by_role("status").filter(has_text="正文未改动").wait_for(timeout=35_000)
+                        official = request("/api/images/test")
+                        assert len(official) >= 3 and all(asset["sourceUrl"] == citation["url"] for asset in official), official
+                        page.screenshot(path=screenshots / "nsis-source-images.png")
+                        page.locator(".modal").get_by_role("button", name="关闭", exact=True).click()
+                        print(f"PASS 来源提图：安装版从 Minecraft 官网抓到 {len(official)} 张图，保留原文出处")
                     page.get_by_role("button", name="找配图", exact=True).click()
                     if live_search:
                         page.get_by_role("button", name="自动搜图").click()
@@ -133,5 +146,6 @@ if __name__ == "__main__":
     parser.add_argument("extracted", type=Path)
     parser.add_argument("--screenshots", type=Path, required=True)
     parser.add_argument("--live-search", action="store_true")
+    parser.add_argument("--live-sources", action="store_true")
     args = parser.parse_args()
-    test_nsis(args.extracted.resolve(), args.screenshots.resolve(), args.live_search)
+    test_nsis(args.extracted.resolve(), args.screenshots.resolve(), args.live_search, args.live_sources)

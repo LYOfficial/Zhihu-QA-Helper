@@ -518,7 +518,7 @@ export default function ProfilePage() {
             有未保存的修改
           </span>
           <span className="dim" style={{ fontSize: 11.5 }}>
-            改动会影响之后所有问题的领域归类与契合度计算
+            保存后会重新归类待阅问题、更新契合度和重点队列，不会启动拟稿
           </span>
           <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
             <button

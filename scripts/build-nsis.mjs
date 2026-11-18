@@ -7,6 +7,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const desktop = resolve(root, "crates/desktop");
 const python = process.env.ZHIHU_QA_BUILD_PYTHON || "python";
 const buildDir = resolve(root, "target/nsis-build");
+const artwork = resolve(buildDir, "artwork");
 
 function run(command, args, cwd = root) {
   const result = spawnSync(command, args, {
@@ -20,6 +21,7 @@ if (process.platform !== "win32" || process.arch !== "x64") {
   throw new Error("请使用 Windows x64、x64 Node.js 与 x64 Python 构建此安装包。");
 }
 run(python, ["-c", "import struct; import PyInstaller, PIL; assert struct.calcsize('P') == 8"]);
+run(python, ["scripts/generate-nsis-artwork.py", artwork]);
 run(process.execPath, ["../../node_modules/next/dist/bin/next", "build"], resolve(root, "apps/web"));
 run("cargo", ["build", "--locked", "--release", "-p", "zhihu-qa-core"]);
 run(python, ["-m", "PyInstaller", "--noconfirm", "--onedir", "--exclude-module", "numpy",
@@ -33,5 +35,10 @@ const resources = {
 for (const resource of Object.keys(resources)) {
   if (!existsSync(resolve(desktop, resource))) throw new Error(`缺少安装资源：${resource}`);
 }
+const nsis = {
+  headerImage: relative(desktop, resolve(artwork, "installer-header.bmp")).replaceAll("\\", "/"),
+  sidebarImage: relative(desktop, resolve(artwork, "installer-sidebar.bmp")).replaceAll("\\", "/"),
+};
 run(process.execPath, [resolve(root, "node_modules/@tauri-apps/cli/tauri.js"),
-  "build", "--ci", "--features", "installed-runtime", "--bundles", "nsis", "--config", JSON.stringify({ bundle: { resources } })], desktop);
+  "build", "--ci", "--features", "installed-runtime", "--bundles", "nsis", "--config",
+  JSON.stringify({ bundle: { resources, windows: { nsis } } })], desktop);

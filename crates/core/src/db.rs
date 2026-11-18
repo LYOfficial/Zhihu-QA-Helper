@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS questions (
   domain        TEXT NOT NULL DEFAULT '',
   sub_domain    TEXT NOT NULL DEFAULT '',
   fit           REAL NOT NULL DEFAULT 0,
+  fit_evaluated INTEGER NOT NULL DEFAULT 0,
   status        TEXT NOT NULL DEFAULT 'inbox',    -- inbox|researching|pending_review|answered|dismissed
   bucket        TEXT NOT NULL DEFAULT 'queue',    -- queue|selected|archived
   answer_count  INTEGER NOT NULL DEFAULT 0,
@@ -125,7 +126,8 @@ CREATE TABLE IF NOT EXISTS settings (
   auto_sync     INTEGER NOT NULL DEFAULT 1,
   minimize_to_tray INTEGER NOT NULL DEFAULT 1,
   auto_launch   INTEGER NOT NULL DEFAULT 0,
-  sign_mode     TEXT NOT NULL DEFAULT 'auto'
+  sign_mode     TEXT NOT NULL DEFAULT 'auto',
+  verify_timeout_seconds INTEGER NOT NULL DEFAULT 180
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -137,7 +139,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   message     TEXT NOT NULL DEFAULT '',
   state       TEXT NOT NULL DEFAULT 'running',
   started_at  TEXT NOT NULL DEFAULT '',
-  finished_at TEXT
+  finished_at TEXT,
+  verify_started_ms INTEGER,
+  verify_seconds INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -294,6 +298,15 @@ fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !has_column("settings", "verify_timeout_seconds") {
+        conn.execute("ALTER TABLE settings ADD COLUMN verify_timeout_seconds INTEGER NOT NULL DEFAULT 180", [])?;
+    }
+    if !has_column("jobs", "verify_started_ms") {
+        conn.execute("ALTER TABLE jobs ADD COLUMN verify_started_ms INTEGER", [])?;
+    }
+    if !has_column("jobs", "verify_seconds") {
+        conn.execute("ALTER TABLE jobs ADD COLUMN verify_seconds INTEGER", [])?;
+    }
     if !has_column("model_config", "context_limit") {
         conn.execute(
             "ALTER TABLE model_config ADD COLUMN context_limit INTEGER NOT NULL DEFAULT 0",
@@ -312,7 +325,106 @@ fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !has_column("questions", "fit_evaluated") {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "ALTER TABLE questions ADD COLUMN fit_evaluated INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute("UPDATE questions SET fit_evaluated=1 WHERE fit>0", [])?;
+        crate::tasks::refresh_inbox_fit(&tx)?;
+        tx.commit()?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_inbox_is_rescored_without_touching_drafts_or_status() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(&SCHEMA.replace("  fit_evaluated INTEGER NOT NULL DEFAULT 0,\n", ""))?;
+        conn.execute_batch(
+            "INSERT INTO profile_terms (id, kind, label, weight, keywords)
+             VALUES ('primary', 'primary', 'Minecraft 原版机制解析', 0.9, '[\"我的世界\",\"基岩版\"]');
+             INSERT INTO questions (id, title, domain, fit, status, bucket)
+             VALUES ('match', '我的世界基岩版配装', '未分类', 0, 'inbox', 'queue'),
+                    ('miss', '如何选显示器', '未分类', 0, 'inbox', 'queue'),
+                    ('draft', '我的世界基岩版', '原有领域', 0.8, 'pending_review', 'selected'),
+                    ('archive', '我的世界基岩版', '原有领域', 0.7, 'answered', 'archived');
+             INSERT INTO drafts (question_id, markdown) VALUES ('draft', '手动编辑的原稿');",
+        )?;
+        let question = |id: &str| {
+            conn.query_row(
+                "SELECT fit, fit_evaluated, domain, status, bucket FROM questions WHERE id=?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+        };
+        migrate(&conn)?;
+        let matched = question("match")?;
+        assert!((matched.0 - 0.6366666666666667).abs() < 1e-12);
+        assert!(matched.1);
+        assert_eq!(matched.2, "Minecraft 原版机制解析");
+        assert_eq!(matched.3, "inbox");
+        assert_eq!(matched.4, "selected");
+        assert_eq!(
+            question("miss")?,
+            (0.0, true, "未分类".into(), "inbox".into(), "queue".into())
+        );
+
+        conn.execute("DELETE FROM profile_terms", [])?;
+        migrate(&conn)?;
+        assert_eq!(question("match")?, matched);
+        crate::tasks::refresh_inbox_fit(&conn)?;
+        assert_eq!(
+            question("match")?,
+            (0.0, false, "未分类".into(), "inbox".into(), "queue".into())
+        );
+        assert_eq!(
+            question("draft")?,
+            (
+                0.8,
+                true,
+                "原有领域".into(),
+                "pending_review".into(),
+                "selected".into()
+            )
+        );
+        assert_eq!(
+            question("archive")?,
+            (
+                0.7,
+                true,
+                "原有领域".into(),
+                "answered".into(),
+                "archived".into()
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT markdown FROM drafts WHERE question_id='draft'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "手动编辑的原稿"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
 }
 
 pub fn sanitize(s: &str) -> String {

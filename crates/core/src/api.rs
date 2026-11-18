@@ -70,7 +70,9 @@ pub fn router(state: Shared) -> Router {
         .route("/questions/{id}/status", post(set_status))
         .route("/questions/{id}/answered", post(mark_answered))
         .route("/questions/{id}/dismiss", post(dismiss_question))
+        .route("/questions/{id}/restore", post(restore_question))
         .route("/drafts/{qid}", get(get_draft).put(put_draft))
+        .route("/drafts/{qid}/reset", post(reset_draft))
         .route("/images/{qid}", get(list_images).post(search_images))
         .route(
             "/images/{qid}/import",
@@ -537,8 +539,9 @@ async fn put_profile(State(st): State<Shared>, Json(body): Json<Value>) -> R {
     let summary = body.get("summary").and_then(|x| x.as_str()).unwrap_or("");
     let style = body.get("style").cloned().unwrap_or(Value::Null);
     {
-        let db = st.db.lock().await;
-        let _ = db.conn.execute("DELETE FROM profile_terms", []);
+        let mut db = st.db.lock().await;
+        let tx = db.conn.transaction()?;
+        tx.execute("DELETE FROM profile_terms", [])?;
         for (i, t) in terms.iter().enumerate() {
             let label = t.get("label").and_then(|x| x.as_str()).unwrap_or("").trim();
             if label.is_empty() {
@@ -550,7 +553,7 @@ async fn put_profile(State(st): State<Shared>, Json(body): Json<Value>) -> R {
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("t_{}", Uuid::new_v4().simple()));
-            let _ = db.conn.execute(
+            tx.execute(
                 "INSERT INTO profile_terms (id, kind, label, weight, keywords, locked, note, ord)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
@@ -563,19 +566,21 @@ async fn put_profile(State(st): State<Shared>, Json(body): Json<Value>) -> R {
                     t.get("note").and_then(|x| x.as_str()).unwrap_or(""),
                     i as i64
                 ],
-            );
+            )?;
         }
         if style.is_object() {
-            let _ = db.conn.execute(
+            tx.execute(
                 "UPDATE profile_meta SET summary=?1, style=?2, updated_at=?3 WHERE id=1",
                 params![summary, style.to_string(), now_iso()],
-            );
+            )?;
         } else {
-            let _ = db.conn.execute(
+            tx.execute(
                 "UPDATE profile_meta SET summary=?1, updated_at=?2 WHERE id=1",
                 params![summary, now_iso()],
-            );
+            )?;
         }
+        tasks::refresh_inbox_fit(&tx)?;
+        tx.commit()?;
         db.log_event("profile", None, "手动修订领域词条", "");
     }
     get_profile(State(st)).await
@@ -656,6 +661,7 @@ fn row_to_question(r: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {
         domain: r.get(7)?,
         sub_domain: r.get(8)?,
         fit: r.get(9)?,
+        fit_evaluated: r.get(23)?,
         status: r.get(10)?,
         bucket: r.get(11)?,
         answer_count: r.get(12)?,
@@ -678,7 +684,8 @@ const Q_SELECT: &str = "SELECT q.id, q.zhihu_id, q.question_id, q.source, q.titl
     (SELECT COUNT(*) FROM drafts d WHERE d.question_id = q.id) AS has_draft,
     (SELECT COUNT(*) FROM images i WHERE i.question_id = q.id) AS image_count,
     COALESCE((SELECT d.word_count FROM drafts d WHERE d.question_id = q.id), 0) AS word_count,
-    COALESCE((SELECT json_array_length(d.doubts) FROM drafts d WHERE d.question_id = q.id), 0) AS doubt_count
+    COALESCE((SELECT json_array_length(d.doubts) FROM drafts d WHERE d.question_id = q.id), 0) AS doubt_count,
+    q.fit_evaluated
     FROM questions q";
 
 async fn list_questions(State(st): State<Shared>, Query(qp): Query<HashMap<String, String>>) -> R {
@@ -774,14 +781,14 @@ async fn research_question(State(st): State<Shared>, Path(id): Path<String>) -> 
 
 async fn research_status(State(st): State<Shared>, Path(id): Path<String>) -> R {
     let db = st.db.lock().await;
-    let job = db
+    let entry = db
         .conn
         .query_row(
-            "SELECT id, stage, progress, message, state, started_at, finished_at
+            "SELECT id, stage, progress, message, state, started_at, finished_at, verify_started_ms, verify_seconds
          FROM jobs WHERE kind='research' AND question_id=?1 ORDER BY rowid DESC LIMIT 1",
             params![id],
             |row| {
-                Ok(Job {
+                let job = Job {
                     id: row.get(0)?,
                     kind: "research".into(),
                     question_id: Some(id.clone()),
@@ -791,7 +798,9 @@ async fn research_status(State(st): State<Shared>, Path(id): Path<String>) -> R 
                     state: row.get(4)?,
                     started_at: row.get(5)?,
                     finished_at: row.get(6)?,
-                })
+                };
+                let timing = row.get::<_, Option<i64>>(7)?.zip(row.get::<_, Option<i64>>(8)?);
+                Ok((job, timing))
             },
         )
         .optional()?;
@@ -803,9 +812,11 @@ async fn research_status(State(st): State<Shared>, Path(id): Path<String>) -> R 
             |row| row.get::<_, bool>(0),
         )
         .optional()?;
-    Ok(Json(
-        json!({ "job": job, "resumable": checkpoint.is_some(), "draftSaved": checkpoint == Some(true) }),
-    ))
+    let verification = entry.as_ref().filter(|(job, _)| job.state == "running")
+        .and_then(|(_, timing)| *timing)
+        .map(|(started_ms, seconds)| json!({"startedMs": started_ms, "limitSeconds": seconds}));
+    Ok(Json(json!({ "job": entry.map(|(job, _)| job), "verification": verification,
+        "resumable": checkpoint.is_some(), "draftSaved": checkpoint == Some(true) })))
 }
 
 async fn set_status(
@@ -875,6 +886,19 @@ async fn dismiss_question(State(st): State<Shared>, Path(id): Path<String>) -> R
         freed
     };
     Ok(Json(json!({ "ok": true, "freedBytes": freed })))
+}
+
+async fn restore_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
+    let db = st.db.lock().await;
+    let changed = db.conn.execute(
+        "UPDATE questions SET status='inbox', bucket='queue' WHERE id=?1 AND status='dismissed'",
+        params![id],
+    )?;
+    if changed == 0 {
+        return Err(anyhow::anyhow!("只有已弃用的问题可以恢复。").into());
+    }
+    db.log_event("restore", Some(&id), "恢复问题到待解答", "");
+    Ok(Json(json!({ "ok": true })))
 }
 
 fn ensure_not_researching(db: &crate::db::Db, id: &str) -> anyhow::Result<()> {
@@ -989,12 +1013,33 @@ async fn search_images(
     Json(body): Json<Value>,
 ) -> R {
     let question = illustration_question(&st, &qid).await?;
-    let (maximum, sources, model) = {
+    let source_only = body["fromSources"].as_bool() == Some(true);
+    let (maximum, sources, model, pages) = {
         let db = st.db.lock().await;
+        let mut pages = Vec::new();
+        if source_only {
+            if let Some((citations, doubts)) = db.conn.query_row(
+                "SELECT citations, doubts FROM drafts WHERE question_id=?1", params![qid],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).optional()? {
+                let citations: Vec<Citation> = serde_json::from_str(&citations).unwrap_or_default();
+                let doubts: Vec<Doubt> = serde_json::from_str(&doubts).unwrap_or_default();
+                let links = citations.into_iter().map(|c| (c.url, c.source_name))
+                    .chain(doubts.into_iter().flat_map(|d| d.evidence.into_iter().map(|e| (e.url, e.source_name))));
+                let mut seen = std::collections::HashSet::new();
+                for (url, name) in links {
+                    if url.len() <= 2048 && (url.starts_with("https://") || url.starts_with("http://")) && seen.insert(url.clone()) {
+                        pages.push(json!({"url": url, "sourceName": name}));
+                    }
+                    if pages.len() >= 8 { break; }
+                }
+            }
+        }
         (
             tasks::load_settings(&db).image_max,
             tasks::research_sources(&db)?,
             tasks::load_model(&db),
+            pages,
         )
     };
     let raw_query = body["query"].as_str().unwrap_or_default().trim();
@@ -1005,7 +1050,7 @@ async fn search_images(
         ""
     };
     let payload = json!({"question": question, "supplement": true, "publicPage": public_page,
-        "sources": sources, "model": model,
+        "sources": sources, "model": model, "sourceOnly": source_only, "sourcePages": pages,
         "settings": {"imageMax": if maximum > 0 { maximum.min(8) } else { 4 }},
         "imageQueries": if query.is_empty() { vec![] } else { vec![query] }});
     let (added, _) = tasks::collect_question_images(&st, &qid, payload, false, true).await?;
@@ -1072,6 +1117,27 @@ async fn put_draft(
         params![qid, md, wc, now_iso()],
     )?;
     Ok(Json(json!({ "ok": true, "wordCount": wc })))
+}
+
+async fn reset_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
+    let mut db = st.db.lock().await;
+    let tx = db.conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE questions SET status='inbox' WHERE id=?1 AND status='pending_review'
+         AND NOT EXISTS (SELECT 1 FROM jobs WHERE question_id=?1 AND kind='research' AND state='running')",
+        params![qid],
+    )?;
+    if changed == 0 {
+        return Err(anyhow::anyhow!("只有已结束拟稿、等待批阅的问题可以清空稿件。").into());
+    }
+    tx.execute("DELETE FROM drafts WHERE question_id=?1", params![qid])?;
+    tx.execute(
+        "DELETE FROM research_checkpoints WHERE question_id=?1",
+        params![qid],
+    )?;
+    tx.commit()?;
+    db.log_event("draft_reset", Some(&qid), "清空稿件，等待重新拟稿", "");
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn get_image(
@@ -1352,9 +1418,10 @@ async fn put_settings(State(st): State<Shared>, Json(body): Json<Value>) -> R {
         .unwrap_or(cur.image_max)
         .clamp(image_min, 20);
 
-    let _ = db.conn.execute(
+    db.conn.execute(
         "UPDATE settings SET cron_times=?1, pick_ratio=?2, draft_min=?3, draft_max=?4,
-         image_min=?5, image_max=?6, auto_sync=?7, minimize_to_tray=?8, auto_launch=?9, sign_mode=?10 WHERE id=1",
+         image_min=?5, image_max=?6, auto_sync=?7, minimize_to_tray=?8, auto_launch=?9, sign_mode=?10,
+         verify_timeout_seconds=?11 WHERE id=1",
         params![
             serde_json::to_string(&times).unwrap_or_else(|_| "[]".into()),
             pick_ratio,
@@ -1366,8 +1433,9 @@ async fn put_settings(State(st): State<Shared>, Json(body): Json<Value>) -> R {
             body.get("minimizeToTray").and_then(|x| x.as_bool()).unwrap_or(cur.minimize_to_tray) as i64,
             body.get("autoLaunch").and_then(|x| x.as_bool()).unwrap_or(cur.auto_launch) as i64,
             if g("signMode", &cur.sign_mode).is_empty() { cur.sign_mode } else { g("signMode", &cur.sign_mode) },
+            body.get("verifyTimeoutSeconds").and_then(Value::as_i64).unwrap_or(cur.verify_timeout_seconds).clamp(30, 180),
         ],
-    );
+    )?;
     Ok(Json(json!(tasks::load_settings(&db))))
 }
 

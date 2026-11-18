@@ -1,77 +1,90 @@
 <p align="center">
-  <img src="apps/web/public/logo.svg" width="128" alt="知乎答主助手 Logo" />
+  <img src="apps/web/public/logo.svg" width="88" height="88" alt="知乎答主助手图标" />
 </p>
 
 <h1 align="center">知乎答主助手</h1>
 
 <p align="center">
-  <strong>让每一次回答，都像批阅奏章一样从容。</strong><br />
-  面向垂直领域答主的 Windows 桌面工作台
+  <strong>擅长的问题先答，引用和配图都能回到原文。</strong><br />
+  给知乎长文答主的 Windows 桌面工作台
 </p>
 
 <p align="center">
-  <a href="https://github.com/LYOfficial/Zhihu-QA-Helper/releases"><img src="https://img.shields.io/github/v/release/LYOfficial/Zhihu-QA-Helper?display_name=tag&label=Release&color=1772F6" alt="Latest release" /></a>
-  <a href="https://github.com/LYOfficial/Zhihu-QA-Helper/blob/main/LICENSE"><img src="https://img.shields.io/github/license/LYOfficial/Zhihu-QA-Helper?color=1772F6" alt="License" /></a>
-  <a href="https://github.com/LYOfficial/Zhihu-QA-Helper/issues"><img src="https://img.shields.io/github/issues/LYOfficial/Zhihu-QA-Helper?color=1772F6" alt="Open issues" /></a>
-  <a href="https://github.com/LYOfficial/Zhihu-QA-Helper/stargazers"><img src="https://img.shields.io/github/stars/LYOfficial/Zhihu-QA-Helper?style=flat&color=1772F6" alt="GitHub stars" /></a>
+  <a href="#快速开始"><img src="https://img.shields.io/badge/Windows-10%20%2F%2011-1772F6?style=flat-square" alt="支持 Windows 10 和 11" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL%20v3-1772F6?style=flat-square" alt="GPL v3 开源许可证" /></a>
 </p>
 
 <p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#功能特性">功能特性</a> ·
-  <a href="#工作流程">工作流程</a> ·
+  <a href="#功能实拍">功能实拍</a> ·
+  <a href="#快速开始"><strong>快速开始</strong></a> ·
   <a href="#本地开发">本地开发</a> ·
-  <a href="#检查与构建">检查与构建</a> ·
   <a href="https://github.com/LYOfficial/Zhihu-QA-Helper/issues">问题反馈</a>
 </p>
 
----
-
-知乎答主助手把知乎通知、领域画像、权威资料、配图和人工编辑集中到一个本地工作台中。智能体负责把问题、资料、存疑点和配图摆到案头，答主亲自批阅、改写和发布，在提升效率的同时保留最终判断权。
-
 <p align="center">
-  <img src="shots/app-home.png" width="960" alt="知乎答主助手案头界面" />
+  <a href="img/03.png"><img src="img/03.png" width="100%" alt="写作台左侧是带配图的《我的世界》回答预览，右侧是带 Minecraft 官方来源链接的候选图库" /></a>
 </p>
 
-## 功能特性
+**写作台 · 先从资料原文找图。** 回答《我的世界》新机制时，可以直接从官方更新文章提取演示图，不够再按具体画面搜索。候选图保留来源链接；「从来源提图」只补充图库，不改已有正文。用图前仍需确认水印和转载许可。
 
-- **通知同步**：使用知乎账号登录，按设定时间同步邀请回答和推荐回答；首次登录或本地问题为空时，自动补齐最近 3 天的内容。
-- **领域画像**：从历史回答与文章中归纳主领域、子领域和附属领域，同时总结语气、句式、排版和不同题材的写法。拟稿参考这些观察及最多四段原文，不再套用固定写作指令；旧画像可重新分析，也可以手动补充场景观察。
-- **智能筛选**：根据个人领域画像计算问题契合度，将内容划分为重点队列和待阅队列。
-- **联网取材与查证**：先拆分题目的实体、时间、版本和有待核实的前提，并行检索领域资料、通用网页，热点另查近期报道及公开讨论。优先核对发布方，证据不足时换关键词补查。讨论帖只代表个案，不能据此断言整体舆情。正文以 `[1]` 等标号对应原始链接；写作台逐条展示原文证据、时间、支持或反证和助手估计的证据把握（不是实测准确率）。
-- **独立搜图**：按要展示的画面生成中英文关键词，从官方公告、允许的领域 Wiki、Wikimedia Commons 和公开平台找图。上限允许时，新初稿自动带入最多两张图注或文件名能直接匹配主题的官方/领域图；其他候选保留在图库。写作台也可换词、粘贴支持的公开帖子链接或导入本地图片，不改已有正文。使用前请确认图示内容、水印与转载许可。
-- **分阶段拟稿**：先保存资料与前置核查，起草时并行找图，保存初稿后再联网补查剩余疑点。可继续中断的任务；补查不会覆盖手工改动。未找到证据时明确说明缺口，不当成结论。
-- **写作台**：支持 Markdown 编辑、预览、自动保存和跳转知乎。未入库的正文可在同一应用恢复；所有图文仍由答主人工审阅和发布。
-- **模型库**：自动同步 `models.dev` 开源目录，覆盖 OpenAI、Claude、DeepSeek、智谱 GLM、Kimi、通义千问和 MiniMax；网络不可用时使用内置清单。目录里每个模型的 `limit.context` / `limit.output` 会一并存入配置，拟稿时按真实上下文容量决定一次性能喂多少资料、输出上限开多大，不会再把长文截断成半截 JSON。
-- **本地化体验**：提供知乎现代蓝与宣纸印章黄两套主题；数据保存在本机，Tauri 托盘常驻，关闭窗口后仍可定时值守。
-- **归档清理**：已回答或弃用的问题会归档正文，并清理对应的本地图片缓存。
+> [!NOTE]
+> 助手会同步选题、联网查资料和准备初稿，**不会代你发布知乎回答**。正文与配图由你审阅，在知乎手动发布。
 
-## 工作流程
+## 功能实拍
 
-```text
-知乎登录
-   ↓
-同步邀请与推荐（首次补齐最近 3 天）
-   ↓
-领域画像与契合度筛选
-   ├── 待阅队列：答主随时手动启动拟稿
-   └── 重点队列：联网取材 → 查证前提 → 拟稿与搜图 → 补查疑点
-                                      ↓
-                              批阅台人工定稿
-                                      ↓
-                         复制内容 → 知乎发布 → 归档清理
-```
+从同步邀请到审稿归档，下面用同一组《我的世界》选题展示工作台怎么用。点击图片可查看原尺寸。
 
-> 智能体不会自动发布知乎回答。最终正文始终由答主人工编辑、确认并发布。
+### 01 · 案头概览：打开就知道先做什么
+
+待审的稿件、值得关注的问题、下一次同步时间都在首页。不必逐条翻知乎通知，也能看出哪篇已经备好图文、哪条还没开始。应用可在托盘值守，关闭窗口后仍能定时同步邀请和推荐。
+
+[![案头概览显示待批稿件、重点队列、同步时间和近期拟稿动态](img/01.png)](img/01.png)
+
+### 02 · 问题收件箱：按领域和状态找值得答的题
+
+收进来的问题按契合度排序，也能按领域、处理状态或标题筛选。重点队列优先准备，其他问题仍可手动拟稿。弃用后可以把**问题**恢复到待解答，但不会找回已删除的草稿和配图。
+
+[![问题收件箱显示状态标签、领域筛选、标题搜索和契合度排序](img/02.png)](img/02.png)
+
+### 03 · 写作画像：参考旧文，不套统一模板
+
+从历史回答和文章提炼语气、人称、句子节奏及不同题材的结构，判定依据也能查看。拟稿按题材参考这些观察和原文片段：教程可以先讲机制，再带读者验证；社区短评不必写成同一套教程结构。
+
+[![领域画像展示历史作品中的判断依据，并按语气、结构和句子节奏记录写作风格](img/05.png)](img/05.png)
+
+### 04 · 领域权重：你的专长，由你校准
+
+可以把《我的世界》拆成红石逻辑、装置应用、版本差异等细分领域，再补充别名、修改关键词和权重。系统用这些词匹配新问题的标题与标签；修改画像可重算契合度，不会因此启动拟稿。
+
+[![主领域和子领域列表支持修改匹配关键词及调节权重](img/06.png)](img/06.png)
+
+### 05 · 资料来源：先看它能证明什么
+
+资料页把官方公告、Wiki、数据站和社区分开，标出可信度建议和用途，可逐站启用。查新机制先看官方更新，找玩家实测再看社区。热点取材也会查近期新闻和哔哩哔哩、小黑盒、知乎、贴吧等公开内容；社区帖子可以提供线索，不能当作普遍结论。
+
+[![资料来源页列出官方公告、技术社区、数据站和 Minecraft Wiki，并标明用途和启用状态](img/07.png)](img/07.png)
+
+### 06 · 证据核查：把确认的事实和没证实的推断分开
+
+正文的引用编号旁有可回查的来源。比如官方说「任一只手都能接盘」，并不等于「副手可以主动投盘」；核查卡片会保留原文、出处、日期和仍需验证的问题。**证据把握是助手的估计，不是实测准确率。**
+
+核查显示当前阶段、已用时间和剩余时间，单轮默认上限 3 分钟，可在设置里调整。复核超时也会保留已保存的正文，可以继续核查或先用 Markdown 编辑；不满意的初稿可清空重拟，并保留候选配图。
+
+[![写作台把带编号的正文和核查卡片并排展示，显示未核实的说法、证据把握及官方原文](img/04.png)](img/04.png)
+
+### 07 · 活动统计：回看收了什么、答了什么
+
+以近 14 天的收录与回答记录、领域分布和本地存储用量回顾产出：哪些题收得多，哪些真正答完，缓存图片占了多少空间。页面的「节省时间」是估算，不是实际计时。
+
+[![活动统计显示收录与回答趋势、选题领域分布、初稿统计和本地存储用量](img/08.png)](img/08.png)
 
 ## 快速开始
 
-1. 从 [GitHub Releases](https://github.com/LYOfficial/Zhihu-QA-Helper/releases) 下载适用于 Windows 的版本，或按照[本地开发](#本地开发)说明从源码运行。
-2. 启动应用并完成知乎登录；登录异常时，可尝试应用内浏览器或默认浏览器 Cookie 兜底方式。
-3. 在「设置 → 大模型」中选择平台并填写 API Key，模型清单会自动同步。
-4. 等待通知同步与领域画像生成，在案头选择问题，核查资料并完成人工定稿。
+1. **安装。** 在 Windows 10/11 上运行简体中文 x64 NSIS 安装包。若 [GitHub Releases](https://github.com/LYOfficial/Zhihu-QA-Helper/releases) 没有可下载的安装包，可[自行构建](#检查与构建)或[从源码运行](#本地开发)。
+2. **登录并配置模型。** 完成知乎登录后，在「设置 → 大模型」中选择平台并填写 API Key。登录异常时，可尝试应用内浏览器或默认浏览器 Cookie 兜底方式。
+3. **同步并开始批阅。** 首次登录或收件箱为空时会尝试补齐最近 3 天的通知。画像生成后，从案头选一道题，核对资料、编辑草稿，再复制内容到知乎手动发布。发布后可回到工作台标记已回答，归档正文并清理本地配图。
 
-正式分发面向 Windows 10/11。如果系统提示缺少 WebView2，请先安装 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
+安装版已内置智能体和 Python 运行时，无需另装 Node.js、Rust 或 Python。如果系统提示缺少 WebView2，请先安装 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
 
 从旧版升级前，请先在系统托盘退出旧版（关窗不等于退出），再运行新安装包。不要删除用户数据目录：原有登录、配置和草稿仍从原目录读取。
 
@@ -84,7 +97,7 @@
 | 本地内核 | Rust、Axum、SQLite | 本地 API、数据存储、知乎同步与任务调度 |
 | 智能体 | Python + Pillow | 模型适配、资料整理、图片筛选、领域画像与初稿生成 |
 
-所有服务默认只监听本机回环地址。知乎 Cookie、草稿、图片和数据库均保存在本机数据目录中。
+本地服务默认只监听回环地址。知乎 Cookie、草稿、图片和数据库保存在本机；同步、检索和调用所选模型需要联网，拟稿所需的输入会发给所选模型服务。
 
 ## 本地开发
 
@@ -95,8 +108,6 @@
 - Rust stable 与 MSVC Build Tools
 - Python 3.10 或更高版本
 - WebView2 Runtime
-
-Windows 安装版已内置智能体和 Python 运行时，无需另外安装 Node.js、Rust 或 Python。
 
 ### 启动项目
 
@@ -115,7 +126,7 @@ npm run dev:core
 npm run dev:agent
 ```
 
-首次启动后，在「设置 → 大模型」选择平台并填写 API Key。模型清单会自动从 `models.dev` 同步；网络不可用时可以使用内置清单。选中模型后，设置页会显示它的上下文与单次输出上限（例如 `1M tokens`），拟稿流程据此决定资料预算，避免长文被截断。
+模型清单从 `models.dev` 同步，网络不可用时会使用内置清单。设置页可查看模型的上下文与单次输出上限，拟稿会据此分配资料与正文的长度预算。初稿的去套话处理借鉴了 [no-ai-slop-zh](https://github.com/shenxianpeng/no-ai-slop-zh) 的最小编辑思路，改表达时保留事实和引用。
 
 ## 检查与构建
 
@@ -161,7 +172,7 @@ python -m pip install -r agents/requirements-build.txt
 npm run build:nsis
 ```
 
-使用 Windows x64、对应架构的 Node.js/Python 和 MSVC 工具链构建。输出位于 `target\nsis-build\release\bundle\nsis\`，安装包内含前端、本地内核及图像处理依赖。可用 `ZHIHU_QA_BUILD_PYTHON` 指定构建环境中的 Python 路径。
+使用 Windows x64、对应架构的 Node.js/Python 和 MSVC 工具链构建。输出位于 `target\nsis-build\release\bundle\nsis\`，简体中文安装包使用软件图标，页眉和侧栏从品牌资源生成。安装包内含前端、本地内核及图像处理依赖。可用 `ZHIHU_QA_BUILD_PYTHON` 指定构建环境中的 Python 路径。
 
 回归检查：`python -m unittest discover -s agents -v`、`cargo test --locked -p zhihu-qa-core`。
 构建后可运行 `python scripts/smoke-test.py`；它使用临时数据库和模拟模型测试断点续跑，不会访问你的知乎账号。选装 Playwright 后，加上 `--screenshots shots/smoke` 可验证界面并输出截图。
@@ -186,8 +197,9 @@ data/
 
 - `models.dev` 是模型名称目录，不代表当前账号一定拥有对应模型权限；实际调用结果由所选平台 API 决定。
 - 知乎接口和风控策略可能变化，登录失败时优先尝试应用内浏览器或 Cookie 兜底方式。
+- 界面可在现代蓝和宣纸印章主题之间切换；截图展示的是现代主题。
 - 本项目是第三方工具，不代表知乎官方。
 
-## License
+## 开源许可
 
 本项目基于 [GNU General Public License v3.0](LICENSE) 开源。

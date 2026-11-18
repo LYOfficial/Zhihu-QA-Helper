@@ -567,9 +567,17 @@ export default function SettingsPage() {
                 }
               />
               <p className="hint" style={{ marginTop: 6 }}>
-                初稿正文不会自动带图。这里只限制从权威平台抓多少张备选，抓到的图放在批阅台左栏，由你决定插哪张、插在哪。
+                拟稿优先从取材原文抓图，不足再按画面搜图。图片都可在写作台的配图库里查看来源。
               </p>
             </div>
+          </div>
+
+          <div className="field">
+            <label htmlFor="verify-timeout">每轮核查最长 {settings.verifyTimeoutSeconds ?? 180} 秒</label>
+            <input id="verify-timeout" className="range" type="range" min={30} max={180} step={15}
+              value={settings.verifyTimeoutSeconds ?? 180}
+              onChange={(e) => saveSettings({ verifyTimeoutSeconds: Number(e.target.value) })} />
+            <p className="hint">默认 180 秒。前置查证和正文保存后的复核各用一轮；调整后在下次启动或续跑时生效。</p>
           </div>
 
           {/* 桌面 */}

@@ -78,7 +78,7 @@ class Agent(BaseHTTPRequestHandler):
                     {"text": "是否必须设置出口信号", "status": "unverified", "verdict": "尚未核查"},
                 ], "citations": []}, "warnings": payload["material"]["warnings"]})
         elif stage == "review":
-            self.review_release.wait(10)
+            self.review_release.wait(50)
             self.send({"doubts": [{**doubt, "verdict": "现有资料不足", "confidence": 25, "evidence": [{
                 "url": "https://example.org/manual", "label": "Railroad signalling reference: operating conditions and section boundaries in the test configuration", "sourceName": "发布方", "kind": "official",
                 "publishedAt": "2025-06-01", "quote": "仅适用于演示线路，不覆盖其他设置。", "stance": "context",
@@ -156,16 +156,28 @@ class Smoke:
     def test_workflow(self):
         with self.core():
             self.seed()
+            assert self.request("/settings")["verifyTimeoutSeconds"] == 180
+            self.request("/settings", "PUT", {"verifyTimeoutSeconds": 90})
+            assert self.request("/settings")["verifyTimeoutSeconds"] == 90
             self.start()
             wait_for(lambda: self.stage()["job"]["state"] == "failed")
             assert self.stage()["resumable"] and not self.stage()["draftSaved"]
             job = self.start()
             assert job == self.start(), "重复点击不能创建第二份稿子"
             wait_for(lambda: self.stage()["draftSaved"])
+            timing = wait_for(lambda: self.stage().get("verification"))
+            assert timing["limitSeconds"] == 90 and timing["startedMs"] > 0
             assert self.draft()["markdown"] == FIRST_DRAFT + "\n\n[IMG:" + "b" * 32 + ".png]"
             assert self.draft()["images"][0]["sourceName"] == "发布方"
+            try:
+                self.request("/drafts/rail/reset", "POST")
+            except urllib.error.HTTPError as error:
+                assert error.code == 400
+            else:
+                raise AssertionError("拟稿任务进行中不能清空稿件")
             self.request("/drafts/rail", "PUT", {"markdown": MANUAL_DRAFT})
         with self.core():
+            assert self.request("/settings")["verifyTimeoutSeconds"] == 90
             interrupted = self.stage()
             assert interrupted["draftSaved"] and interrupted["job"]["state"] == "failed"
             assert self.draft()["markdown"] == MANUAL_DRAFT
@@ -237,9 +249,55 @@ class Smoke:
             page.get_by_role("combobox", name="切换问题").select_option("other")
             page.get_by_role("heading", name="另一条测试问题").wait_for()
             assert editor.input_value() == ""
+
+            page.get_by_role("button", name="弃用", exact=True).click()
+            page.get_by_role("button", name="确认弃用").click()
+            wait_for(lambda: self.request("/questions/other")["status"] == "dismissed")
+            page.goto(self.base + "/inbox/")
+            page.get_by_role("button", name="已弃用").click()
+            page.get_by_role("button", name="恢复到待解答").click()
+            page.get_by_role("button", name="恢复到待解答").wait_for(state="detached")
+            page.get_by_role("button", name="待阅").click()
+            page.get_by_role("button", name="另一条测试问题").wait_for()
+            restored = self.request("/questions/other")
+            assert (restored["status"], restored["bucket"]) == ("inbox", "queue")
+
+            page.goto(self.base + "/desk/?id=rail")
+            reset = page.get_by_role("button", name="清空并重新拟稿")
+            reset.click()
+            page.get_by_role("button", name="取消").click()
+            assert self.draft()["markdown"] == updated
+            editor.fill(updated + "\n\n清空前的最新改动。")
+            reset.click()
+            page.get_by_role("button", name="确认清空").click()
+            page.get_by_role("button", name="生成初稿").wait_for()
+            assert self.request("/questions/rail")["status"] == "inbox"
+            blank = self.draft()
+            assert blank["markdown"] == "" and blank["wordCount"] == 0
+            assert not any(blank[field] for field in ("doubts", "citations", "warnings"))
+            assert blank["images"] == assets and not self.stage()["resumable"]
+            page.reload()
+            page.get_by_role("button", name="生成初稿").wait_for()
+            assert editor.input_value() == "" and self.draft()["markdown"] == ""
+            previous_job = self.stage()["job"]["id"]
+            collect_count = Agent.calls["collect"]
+            Agent.review_release.clear()
+            try:
+                page.get_by_role("button", name="生成初稿").click()
+                timer = page.get_by_role("progressbar", name="本轮核查已用时间")
+                timer.wait_for(timeout=20_000)
+                assert timer.get_attribute("max") == "90"
+                wait_for(lambda: int(timer.get_attribute("value")) >= 31, timeout=37)
+                assert self.stage()["job"]["state"] == "running"
+                page.screenshot(path=output / "verification-timer.png")
+            finally:
+                Agent.review_release.set()
+            wait_for(lambda: self.stage()["job"]["id"] != previous_job and self.stage()["job"]["state"] == "done")
+            assert Agent.calls["collect"] == collect_count + 1 and FIRST_DRAFT in self.draft()["markdown"]
             assert not errors, errors
             browser.close()
             print("PASS 界面：登录可重试、Logo 对齐、刷新恢复、搜图、导入去重、窄窗口、切换问题")
+            print("PASS 界面：恢复弃用问题、清空重拟稿，以及补充核查超过旧 29 秒仍显示剩余时间")
 
 
 def main():

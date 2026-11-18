@@ -30,7 +30,7 @@ import research  # noqa: E402
 import illustrations
 import investigation
 
-VERSION = "0.1.1"
+VERSION = "0.1.0"
 DATA_DIR = os.path.join(os.getcwd(), "data")
 
 
@@ -316,9 +316,10 @@ def qualify_material(payload: dict) -> dict:
     sources = investigation.source_catalog(question, payload.get("sources"))
     warnings = list(material.get("warnings") or [])
     try:
-        findings, docs = investigation.investigate_claims(claims, docs, sources, payload.get("model") or {})
+        findings, docs = investigation.investigate_claims(claims, docs, sources, payload.get("model") or {},
+                                                          budget=investigation.verification_budget(payload))
     except llm.LLMError:
-        findings = investigation.verify(claims, docs, {}, follow_up=False)
+        findings = investigation.verify(claims, docs, {})
         warnings.append("模型未完成前置核查；请查看原文并检查初稿中的条件分析。")
     return {**material, "docs": docs, "plan": plan, "findings": findings, "warnings": warnings}
 
@@ -357,7 +358,28 @@ def _draft_references(markdown, entries, exposed):
     return markdown, citations
 
 
+def _edit_draft(markdown, cfg, user, timeout):
+    def protected(text):
+        return ([line for line in text.splitlines() if re.search(r"\[\[?S\d+\]\]?", line, re.I)],
+                sorted(re.findall(r"[0-9]+(?:[.\-/][0-9]+)*%?", text)),
+                re.findall(r"```[\s\S]*?```|https?://[^\s)]+", text))
+
+    try:
+        result = llm.chat_json(cfg, [{"role": "system", "content": prompts.STYLE_EDIT_SYSTEM},
+                                    {"role": "user", "content": user + "\n\n【待编辑初稿】\n" + markdown}],
+                               temperature=0, max_tokens=min(9000, max(2000, len(markdown) * 3)),
+                               retry_tokens=0, timeout=timeout)
+    except llm.LLMError:
+        return markdown
+    edited = result.get("markdown")
+    if (isinstance(edited, str) and not result.get("_salvaged") and
+            len(markdown) * 0.7 <= len(edited) <= len(markdown) * 1.12 and protected(edited) == protected(markdown)):
+        return edited.strip()
+    return markdown
+
+
 def write_draft(payload: dict) -> dict:
+    started = time.monotonic()
     question, profile, cfg = (payload.get(key) or {} for key in ("question", "profile", "model"))
     material = payload.get("material") or {}
     settings = payload.get("settings") or {}
@@ -399,6 +421,10 @@ def write_draft(payload: dict) -> dict:
         raise llm.LLMError("模型没有返回有效正文。资料已保存，可以直接重试拟稿。")
     if data.get("_salvaged"):
         warnings.append("模型返回不完整，已保留可读正文。请检查结尾是否完整。")
+    else:
+        remaining = min(35, int(137 - (time.monotonic() - started)))
+        if remaining >= 12:
+            markdown = _strip_images(_edit_draft(markdown, cfg, user, remaining))
     doubts = list(findings)
     covered = {item["text"] for item in doubts}
     for entry in (data.get("doubts") or [])[:4]:
@@ -421,7 +447,8 @@ def review_material(payload: dict) -> dict:
     if not model.get("apiKey") or not model.get("model"):
         return {"doubts": doubts}
     suggestions = investigation.focused_queries([query for index in pending for query in doubts[index].get("queries", [])], "")
-    results, _ = investigation.investigate_claims(claims, docs, sources, model, after_draft=True, suggested=suggestions)
+    results, _ = investigation.investigate_claims(claims, docs, sources, model, budget=investigation.verification_budget(payload),
+                                                  after_draft=True, suggested=suggestions)
     updated = list(doubts)
     for index, result in zip(pending, results):
         prior = doubts[index]
@@ -440,6 +467,27 @@ def collect_images(payload: dict) -> dict:
     limit = maximum if payload.get("supplement") else max(0, maximum - len(payload.get("existingImages") or []))
     if not limit:
         return {"images": []}
+    existing = list(payload.get("existingImages") or [])
+    folder = payload["imagesDir"]
+    refs = payload.get("sourcePages") or []
+    preferred = []
+    if refs:
+        for candidates in research._parallel(illustrations.read_source, refs[:8], 8, time.time() + 8):
+            preferred.extend(candidates)
+    if payload.get("sourceOnly"):
+        for item in preferred:
+            item["autoInsert"] = False
+        return {"images": research.download_images(preferred[:32], folder, limit, time.time() + 12, existing)}
+
+    if docs and not payload.get("supplement"):
+        visual = (material.get("plan") or {}).get("images", [])
+        phrases = [phrase for item in visual for phrase in item["queries"]]
+        allowed_docs = [doc for doc in docs if doc.get("allowImage") or doc.get("sourceKind") in {"official", "wiki", "media", "community"}]
+        preferred.extend(illustrations.source_candidates(allowed_docs, phrases))
+    saved = research.download_images(preferred[:28], folder, limit, time.time() + 10, existing)
+    if len(saved) >= limit:
+        return {"images": saved}
+    existing.extend(asset["filename"] for asset in saved)
     page = payload.get("publicPage")
     if page:
         candidates = illustrations.page_candidates(page)
@@ -450,15 +498,15 @@ def collect_images(payload: dict) -> dict:
         else:
             plan = material.get("plan") or investigation.plan_question(question, payload.get("model") or {}, sources, images_only=True)
             visual = plan["images"]
-        candidates = illustrations.find_candidates(visual, sources, docs, time.time() + 17)
+        candidates = illustrations.find_candidates(visual, sources, time.time() + 15)
     ranked, seen = [], set()
     for item in candidates:
         key = research.canonical_url(item["url"])
         if key not in seen:
             ranked.append(item)
             seen.add(key)
-    return {"images": research.download_images(ranked[:32], payload["imagesDir"], limit,
-                                                time.time() + 10, payload.get("existingImages"))}
+    return {"images": saved + research.download_images(ranked[:32], folder, limit - len(saved),
+                                                        time.time() + 10, existing)}
 
 
 # ---------------------------------------------------------------- HTTP

@@ -4,17 +4,21 @@ import { useRouter } from "next/navigation";
 import React from "react";
 import type { Question } from "@/lib/types";
 import { openExternal } from "@/lib/api";
-import { relTime, FitMeter, IconPlay, IconQuill, IconTrash } from "./ui";
+import { relTime, FitMeter, IconPlay, IconQuill, IconRefresh, IconTrash } from "./ui";
 
 export default function MemorialRow({
   q,
   onResearch,
   onDismiss,
+  onRestore,
+  restoreDisabled,
   compact,
 }: {
   q: Question;
   onResearch?: (q: Question) => void;
   onDismiss?: (q: Question) => void;
+  onRestore?: (q: Question) => void;
+  restoreDisabled?: boolean;
   compact?: boolean;
 }) {
   const router = useRouter();
@@ -22,16 +26,18 @@ export default function MemorialRow({
   return (
     <article className="memorial" data-status={q.status}>
       <div className="memorial-score">
-        <b className={q.fit < 0.6 ? "low" : ""}>{(q.fit * 100).toFixed(0)}</b>
-        <span>契合</span>
-        <FitMeter value={q.fit} />
+        <b className={q.fit < 0.6 ? "low" : ""}>
+          {q.fitEvaluated ? (q.fit * 100).toFixed(0) : "—"}
+        </b>
+        <span>{!q.fitEvaluated ? "待评分" : q.fit === 0 ? "未匹配" : "契合"}</span>
+        {q.fitEvaluated && <FitMeter value={q.fit} />}
       </div>
 
       <div className="memorial-body">
         <button
           className="memorial-title"
-          onClick={() => router.push(`/desk?id=${q.id}`)}
-          title="打开批阅台"
+          onClick={() => q.status === "dismissed" ? openExternal(q.url) : router.push(`/desk?id=${q.id}`)}
+          title={q.status === "dismissed" ? "在知乎打开" : "打开批阅台"}
         >
           {q.title}
         </button>
@@ -92,12 +98,16 @@ export default function MemorialRow({
           </button>
         ) : q.status === "researching" ? (
           <span className="stamp">拟稿</span>
-        ) : (
-          <button className="play-btn" title="让智能体开始拟稿" onClick={() => onResearch?.(q)}>
+        ) : q.status === "dismissed" && onRestore ? (
+          <button className="btn btn-sm" disabled={restoreDisabled} onClick={() => onRestore(q)}>
+            <IconRefresh size={13} /> 恢复到待解答
+          </button>
+        ) : q.status === "inbox" && onResearch ? (
+          <button className="play-btn" title="让智能体开始拟稿" onClick={() => onResearch(q)}>
             <IconPlay size={11} />
           </button>
-        )}
-        {onDismiss && q.status !== "pending_review" && (
+        ) : null}
+        {onDismiss && q.status === "inbox" && (
           <button className="btn-icon" title="弃用这个问题" onClick={() => onDismiss(q)}>
             <IconTrash size={14} />
           </button>

@@ -101,6 +101,7 @@ export interface Question {
   domain: string;
   subDomain: string;
   fit: number;
+  fitEvaluated: boolean;
   status: QuestionStatus;
   bucket: Bucket;
   answerCount: number;
@@ -186,6 +187,7 @@ export interface Settings {
   draftMax: number;
   imageMin: number;
   imageMax: number;
+  verifyTimeoutSeconds: number;
   autoSync: boolean;
   minimizeToTray: boolean;
   autoLaunch: boolean;

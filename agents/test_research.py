@@ -179,7 +179,7 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(checks[0]["evidence"][0]["publishedAt"], "2026-11-14")
         expected["evidence"].append({"id": "S2", "quote": rumor["text"], "stance": "supports"})
         with patch.object(llm, "chat_json", return_value={"results": [expected]}):
-            checks = investigation.verify([claim], [primary, rumor], {"model": "test", "apiKey": "test"}, follow_up=False)
+            checks = investigation.verify([claim], [primary, rumor], {"model": "test", "apiKey": "test"})
         self.assertEqual(checks[0]["status"], "unverified")
         self.assertEqual(len(checks[0]["evidence"]), 2)
 
@@ -199,10 +199,46 @@ class ResearchTests(unittest.TestCase):
         community = {**official, "sourceUrl": "https://tieba.baidu.com/p/121", "sourceKind": "community",
                      "text": "我在副手功能预览版发现这个情况。"}
         with patch.object(research, "gather", return_value=[official]), patch.object(research, "gather_web",
-                side_effect=lambda *args, **opts: [community] if opts.get("community_only") else []) as search:
+                side_effect=lambda *args, **opts: [community] if opts.get("lane") == "discussion" else []) as search:
             docs = investigation.gather_queries(["副手功能"], [], time.time() + 2, hotspot=True)
         self.assertTrue(any(call.kwargs.get("recent") for call in search.call_args_list))
+        self.assertTrue(any(call.kwargs.get("lane") == "news" for call in search.call_args_list))
         self.assertEqual({doc["sourceKind"] for doc in docs}, {"official", "community"})
+
+    def test_verification_uses_stage_budget_instead_of_old_short_timeout(self):
+        material = {"docs": [{"sourceUrl": "https://example.com/doc", "sourceName": "手册", "title": "手册",
+                              "text": "手册说明铁路信号的适用范围。"}]}
+        payload = {"material": material, "model": {"model": "fixture", "apiKey": "fixture"},
+                   "settings": {"verifyTimeoutSeconds": 120}, "doubts": [{"text": "核对适用范围", "status": "open"}]}
+        with patch.object(investigation, "gather_queries", return_value=[]), \
+                patch.object(llm, "chat_json", return_value={"results": []}) as model:
+            main.review_material(payload)
+        self.assertGreater(model.call_args.kwargs["timeout"], 100)
+        self.assertLessEqual(model.call_args.kwargs["timeout"], 120)
+
+    def test_source_gallery_reads_body_carousel_without_search_or_autoinsertion(self):
+        page = "https://www.minecraft.net/en-us/article/example"
+        html = '''<title>游戏更新</title><header><img src="/logo.png"></header>
+        <div class="article-grid-a"><div class="MC_Carousel"><img data-src="/assets/disc.jpg" alt="投掷飞盘"></div>
+        <img src="/placeholder.png" srcset="/small.jpg 320w, /assets/offhand.jpg 1280w" alt="副手"></div>'''
+        with patch.object(research, "fetch", return_value=(html.encode(), "text/html", "utf-8")), \
+                patch.object(research, "public_url", return_value=True), \
+                patch.object(research, "download_images", return_value=[]) as download, \
+                patch.object(illustrations, "find_candidates") as search:
+            main.collect_images({"sourcePages": [{"url": page, "sourceName": "官网"}], "sourceOnly": True,
+                                 "supplement": True, "imagesDir": "unused"})
+        candidates = download.call_args.args[0]
+        self.assertEqual([entry["url"].rsplit("/", 1)[-1] for entry in candidates], ["disc.jpg", "offhand.jpg"])
+        self.assertTrue(all(entry["page"] == page and not entry["autoInsert"] for entry in candidates))
+        search.assert_not_called()
+
+    def test_style_editor_keeps_cited_lines_and_numbers(self):
+        draft = "先看现场。\n\n预览版在 26.70.26 支持这项功能。[[S1]]"
+        bad = "先看现场。\n\n正式版在 26.70.26 支持这项功能。[[S1]]"
+        good = draft.replace("先看现场。", "先看怎么跑。")
+        with patch.object(llm, "chat_json", side_effect=[{"markdown": bad}, {"markdown": good}]):
+            self.assertEqual(main._edit_draft(draft, {}, "", 20), draft)
+            self.assertEqual(main._edit_draft(draft, {}, "", 20), good)
 
     def test_search_union_keeps_original_result_urls(self):
         html = '<a data-mdurl="https://www.cas.cn/article">月壤</a><a data-mdurl="https://ai.so.com/search">聚合摘要</a>'

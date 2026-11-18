@@ -25,10 +25,14 @@ pub async fn job_start(state: &AppState, kind: &str, qid: Option<&str>, msg: &st
 }
 
 pub async fn job_step(state: &AppState, id: &str, stage: &str, progress: f64, msg: &str) {
+    job_stage(state, id, stage, progress, msg, None).await;
+}
+
+async fn job_stage(state: &AppState, id: &str, stage: &str, progress: f64, msg: &str, verify_seconds: Option<i64>) {
     let db = state.db.lock().await;
     let _ = db.conn.execute(
-        "UPDATE jobs SET stage=?1, progress=?2, message=?3 WHERE id=?4",
-        params![stage, progress, msg, id],
+        "UPDATE jobs SET stage=?1, progress=?2, message=?3, verify_started_ms=?4, verify_seconds=?5 WHERE id=?6",
+        params![stage, progress, msg, verify_seconds.map(|_| chrono::Utc::now().timestamp_millis()), verify_seconds, id],
     );
     tracing::info!(target: "jobs", job_id = %id, stage, progress, "任务进度：{msg}");
     db.log_event("job", None, &format!("任务阶段：{stage}"), msg);
@@ -105,29 +109,69 @@ fn classify(title: &str, tags: &[String], terms: &[ProfileTerm]) -> (String, Str
     (best.0, best.1, best.2)
 }
 
-async fn load_terms(state: &AppState) -> Vec<ProfileTerm> {
-    let db = state.db.lock().await;
-    let mut stmt = match db.conn.prepare(
+fn load_terms(conn: &rusqlite::Connection) -> Result<Vec<ProfileTerm>> {
+    let mut stmt = conn.prepare(
         "SELECT id, kind, label, weight, keywords, locked, note FROM profile_terms ORDER BY ord, weight DESC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(ProfileTerm {
-                id: r.get(0)?,
-                kind: r.get(1)?,
-                label: r.get(2)?,
-                weight: r.get(3)?,
-                keywords: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
-                locked: r.get::<_, i64>(5)? != 0,
-                note: r.get(6)?,
-            })
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ProfileTerm {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            label: row.get(2)?,
+            weight: row.get(3)?,
+            keywords: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+            locked: row.get::<_, i64>(5)? != 0,
+            note: row.get(6)?,
         })
-        .ok();
-    rows.map(|it| it.filter_map(|x| x.ok()).collect())
-        .unwrap_or_default()
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn prioritize(
+    conn: &rusqlite::Connection,
+    candidates: &mut [(String, f64)],
+) -> Result<Vec<String>> {
+    candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let limit = (candidates.len() * 2).div_ceil(5);
+    let mut selected = Vec::new();
+    let mut update = conn.prepare("UPDATE questions SET bucket='selected' WHERE id=?1")?;
+    for (id, _) in candidates
+        .iter()
+        .take(limit)
+        .take_while(|(_, fit)| *fit > 0.0)
+    {
+        update.execute([id])?;
+        selected.push(id.clone());
+    }
+    Ok(selected)
+}
+
+pub(crate) fn refresh_inbox_fit(conn: &rusqlite::Connection) -> Result<()> {
+    let terms = load_terms(conn)?;
+    let mut select = conn.prepare(
+        "SELECT id, title, tags FROM questions
+         WHERE status='inbox' AND bucket IN ('queue', 'selected')
+         ORDER BY synced_at DESC, id",
+    )?;
+    let questions = select
+        .query_map([], |row| {
+            let tags =
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?).unwrap_or_default();
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, tags))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut update = conn.prepare(
+        "UPDATE questions SET domain=?2, sub_domain=?3, fit=?4, fit_evaluated=?5, bucket='queue'
+         WHERE id=?1",
+    )?;
+    let mut candidates = Vec::with_capacity(questions.len());
+    for (id, title, tags) in questions {
+        let (domain, sub, fit) = classify(&title, &tags, &terms);
+        update.execute(params![id, domain, sub, fit, !terms.is_empty()])?;
+        candidates.push((id, fit));
+    }
+    prioritize(conn, &mut candidates)?;
+    Ok(())
 }
 
 // ---------------- 同步通知 ----------------
@@ -275,32 +319,30 @@ async fn sync_inner(
         ),
     )
     .await;
-    let terms = load_terms(state).await;
-    let mut added = 0usize;
-    let mut inserted: Vec<(String, f64)> = Vec::new();
-
-    {
-        let db = state.db.lock().await;
+    let (added, selected_ids) = {
+        let mut db = state.db.lock().await;
+        let tx = db.conn.transaction()?;
+        let terms = load_terms(&tx)?;
+        let mut inserted = Vec::new();
         for rq in &raws {
-            let exists: Option<String> = db
-                .conn
+            let exists: Option<String> = tx
                 .query_row(
                     "SELECT id FROM questions WHERE question_id = ?1 LIMIT 1",
                     params![rq.question_id],
                     |r| r.get(0),
                 )
-                .ok();
+                .optional()?;
             if exists.is_some() {
                 continue;
             }
             let (domain, sub, fit) = classify(&rq.title, &rq.tags, &terms);
             let id = Uuid::new_v4().to_string();
-            let ok = db.conn.execute(
+            tx.execute(
                 "INSERT INTO questions
                  (id, zhihu_id, question_id, source, title, excerpt, url, domain, sub_domain,
                   fit, status, bucket, answer_count, follower_count, asker_name, asker_headline,
-                  tags, created_at, synced_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'inbox','queue',?11,?12,?13,?14,?15,?16,?16)",
+                  tags, created_at, synced_at, fit_evaluated)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'inbox','queue',?11,?12,?13,?14,?15,?16,?16,?17)",
                 params![
                     id,
                     rq.zhihu_id,
@@ -318,38 +360,19 @@ async fn sync_inner(
                     rq.asker_headline,
                     serde_json::to_string(&rq.tags).unwrap_or_else(|_| "[]".into()),
                     now_iso(),
+                    !terms.is_empty(),
                 ],
-            );
-            if ok.is_ok() {
-                added += 1;
-                inserted.push((id, fit));
-            }
+            )?;
+            inserted.push((id, fit));
         }
-    }
-
-    // 挑「擅长系数最近」的前 40%
-    inserted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let pick_n = ((inserted.len() as f64) * 0.4).ceil() as usize;
-    let selected_ids: Vec<String> = inserted
-        .iter()
-        .take(pick_n)
-        .filter(|(_, f)| *f > 0.0)
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    {
-        let db = state.db.lock().await;
-        for id in &selected_ids {
-            let _ = db.conn.execute(
-                "UPDATE questions SET bucket = 'selected' WHERE id = ?1",
-                params![id],
-            );
-        }
-        let _ = db.conn.execute(
+        let selected_ids = prioritize(&tx, &mut inserted)?;
+        tx.execute(
             "UPDATE account SET updated_at = ?1 WHERE id = 1",
             params![now_iso()],
-        );
-    }
+        )?;
+        tx.commit()?;
+        (inserted.len(), selected_ids)
+    };
 
     job_step(state, job, "归档", 0.9, "写入领域目录").await;
 
@@ -553,21 +576,21 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         .unwrap_or_default();
     let style = resp.get("style").cloned().unwrap_or_else(|| json!({}));
 
+    job_step(state, job, "更新契合度", 0.84, "正在按新画像重算待阅问题").await;
     {
-        let db = state.db.lock().await;
+        let mut db = state.db.lock().await;
+        let tx = db.conn.transaction()?;
         let current_account: String =
-            db.conn
-                .query_row("SELECT zhihu_id FROM account WHERE id=1", [], |row| {
-                    row.get(0)
-                })?;
+            tx.query_row("SELECT zhihu_id FROM account WHERE id=1", [], |row| {
+                row.get(0)
+            })?;
         anyhow::ensure!(
             current_account == account_id && !account_id.is_empty(),
             "分析期间账号已切换，未保存文风样本"
         );
         // 用户手动锁定的词条保留
         let locked: Vec<String> = {
-            let mut stmt = db
-                .conn
+            let mut stmt = tx
                 .prepare("SELECT id FROM profile_terms WHERE locked = 1")
                 .ok();
             stmt.as_mut()
@@ -578,9 +601,7 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
                 })
                 .unwrap_or_default()
         };
-        let _ = db
-            .conn
-            .execute("DELETE FROM profile_terms WHERE locked = 0", []);
+        tx.execute("DELETE FROM profile_terms WHERE locked = 0", [])?;
 
         for (i, t) in terms.iter().enumerate() {
             let label = t.get("label").and_then(|x| x.as_str()).unwrap_or("").trim();
@@ -595,7 +616,7 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
                 continue;
             }
             let kws = t.get("keywords").cloned().unwrap_or(json!([]));
-            let _ = db.conn.execute(
+            tx.execute(
                 "INSERT INTO profile_terms (id, kind, label, weight, keywords, locked, note, ord)
                  VALUES (?1,?2,?3,?4,?5,0,?6,?7)",
                 params![
@@ -607,10 +628,10 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
                     t.get("note").and_then(|x| x.as_str()).unwrap_or(""),
                     i as i64
                 ],
-            );
+            )?;
         }
 
-        let _ = db.conn.execute(
+        tx.execute(
             "UPDATE profile_meta SET status='ready', summary=?1, evidence=?2, sample_size=?3, style=?4, updated_at=?5 WHERE id=1",
             params![
                 summary,
@@ -619,8 +640,8 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
                 style.to_string(),
                 now_iso()
             ],
-        );
-        db.conn.execute(
+        )?;
+        tx.execute(
             "INSERT OR REPLACE INTO writing_samples (account_id, samples) VALUES (?1, ?2)",
             params![
                 account_id,
@@ -630,6 +651,8 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
                     .to_string()
             ],
         )?;
+        refresh_inbox_fit(&tx)?;
+        tx.commit()?;
         db.log_event(
             "profile",
             None,
@@ -669,7 +692,7 @@ pub async fn run_discover_sources(state: &AppState) -> Result<()> {
 }
 
 async fn discover_inner(state: &AppState, job: &str) -> Result<()> {
-    let terms = load_terms(state).await;
+    let terms = load_terms(&state.db.lock().await.conn)?;
     let primary: Vec<String> = terms
         .iter()
         .filter(|t| t.kind == "primary" || t.kind == "sub")
@@ -894,7 +917,7 @@ pub async fn collect_question_images(
             "/v1/research/images"
         },
         &payload,
-        50,
+        65,
     )
     .await?;
     let mut db = state.db.lock().await;
@@ -952,7 +975,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             .conn
             .query_row(
                 "SELECT id, zhihu_id, question_id, source, title, excerpt, url, domain, sub_domain, fit,
-                        status, bucket, answer_count, follower_count, asker_name, asker_headline, tags, created_at, synced_at
+                        status, bucket, answer_count, follower_count, asker_name, asker_headline, tags, created_at, synced_at, fit_evaluated
                  FROM questions WHERE id = ?1",
                 params![qid],
                 |r| {
@@ -967,6 +990,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
                         domain: r.get(7)?,
                         sub_domain: r.get(8)?,
                         fit: r.get(9)?,
+                        fit_evaluated: r.get(19)?,
                         status: r.get(10)?,
                         bucket: r.get(11)?,
                         answer_count: r.get(12)?,
@@ -1075,16 +1099,24 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
     };
     if !drafted {
         if material.get("findings").is_none() {
-            job_step(
+            job_stage(
                 state,
                 job,
                 "查证",
                 0.35,
                 "逐项核对问题前提，补查缺失或冲突的证据",
+                Some(settings.verify_timeout_seconds),
             )
             .await;
-            payload["material"] = material;
-            material = agent_stage(state, "/v1/research/qualify", &payload, 72).await?;
+            payload["material"] = material.clone();
+            match agent_stage(state, "/v1/research/qualify", &payload, settings.verify_timeout_seconds as u64).await {
+                Ok(result) => material = result,
+                Err(error) => {
+                    let mut warnings = material["warnings"].as_array().cloned().unwrap_or_default();
+                    warnings.push(json!(format!("前置核查未完成：{error} 初稿将按已取得的资料限定结论。")));
+                    material["warnings"] = json!(warnings);
+                }
+            }
             state.db.lock().await.conn.execute(
                 "UPDATE research_checkpoints SET material=?2 WHERE question_id=?1",
                 params![qid, material.to_string()],
@@ -1096,7 +1128,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             job,
             "拟稿与找图",
             0.55,
-            "按答主文风起草，同时按画面搜索真实配图",
+            "按答主文风起草，优先从取材原文抓图，不足再按画面搜索",
         )
         .await;
         let (draft_result, images) = tokio::join!(
@@ -1115,7 +1147,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             Ok(Some((added, suggested))) => {
                 material["autoImageFiles"] = json!(suggested);
                 if added == 0 {
-                    image_warning = Some("没有找到能下载且与画面匹配的图片；可在写作台换词补搜。");
+                    image_warning = Some("没有取得可用图片；可从引用与核查来源重新抓取，或换词补搜。");
                 } else if suggested.is_empty() {
                     image_warning = Some("备选图已保存；来源或画面仍需目测，未自动插入正文。");
                 }
@@ -1180,15 +1212,16 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
         |row| row.get(0),
     )?;
     payload["doubts"] = serde_json::from_str(&raw_doubts)?;
-    job_step(
+    job_stage(
         state,
         job,
         "补充核查",
         0.76,
         "正文已保存并可编辑；正在联网复核剩余说法",
+        Some(settings.verify_timeout_seconds),
     )
     .await;
-    let review = agent_stage(state, "/v1/research/review", &payload, 54).await;
+    let review = agent_stage(state, "/v1/research/review", &payload, settings.verify_timeout_seconds as u64).await;
     let mut db = state.db.lock().await;
     let tx = db.conn.transaction()?;
     if let Ok(review) = &review {
@@ -1238,7 +1271,7 @@ pub fn load_settings(db: &crate::db::Db) -> Settings {
     db.conn
         .query_row(
             "SELECT cron_times, pick_ratio, draft_min, draft_max, image_min, image_max,
-                    auto_sync, minimize_to_tray, auto_launch, sign_mode FROM settings WHERE id=1",
+                    auto_sync, minimize_to_tray, auto_launch, sign_mode, verify_timeout_seconds FROM settings WHERE id=1",
             [],
             |r| {
                 Ok(Settings {
@@ -1253,6 +1286,7 @@ pub fn load_settings(db: &crate::db::Db) -> Settings {
                     minimize_to_tray: r.get::<_, i64>(7)? != 0,
                     auto_launch: r.get::<_, i64>(8)? != 0,
                     sign_mode: r.get(9)?,
+                    verify_timeout_seconds: r.get::<_, i64>(10)?.clamp(30, 180),
                     data_dir: db.data_dir.to_string_lossy().to_string(),
                 })
             },
@@ -1264,6 +1298,7 @@ pub fn load_settings(db: &crate::db::Db) -> Settings {
             draft_max: 1000,
             image_min: 3,
             image_max: 10,
+            verify_timeout_seconds: 180,
             auto_sync: true,
             minimize_to_tray: true,
             auto_launch: false,

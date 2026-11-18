@@ -17,35 +17,40 @@ import {
   Spinner,
 } from "@/components/ui";
 import { api, imageSrc, openExternal, toast } from "@/lib/api";
+import { clearDraftRecovery, recoveryKey } from "@/lib/draft-recovery";
 import { useCopy, useLoad } from "@/lib/hooks";
 import type { Draft, Job, Question, Settings } from "@/lib/types";
 
-function IllustrationTools({ question, disabled, onImages }: {
+function IllustrationTools({ question, disabled, hasSources, onImages }: {
   question: Question;
   disabled: boolean;
+  hasSources: boolean;
   onImages: (id: string, assets: Draft["images"]) => void;
 }) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [sourceUrl, setSourceUrl] = React.useState("");
   const [file, setFile] = React.useState<File | null>(null);
-  const [busy, setBusy] = React.useState<"search" | "import" | null>(null);
+  const [busy, setBusy] = React.useState<"search" | "sources" | "import" | null>(null);
   const [notice, setNotice] = React.useState("");
   const base = `/api/images/${encodeURIComponent(question.id)}`;
   const keywords = query.trim();
 
-  async function run(action: "search" | "import") {
+  async function run(action: "search" | "sources" | "import") {
     if (busy || disabled) return;
     if (action === "import" && (!file || file.size > 6_000_000)) {
       setNotice("请选择不超过 6 MB 的 PNG、JPEG 或 WebP 图片。");
       return;
     }
     setBusy(action);
-    setNotice(action === "search" ? "正在提取画面关键词、查找原图并去重，可能需要约 40 秒。" : "正在检查图片并去重…");
+    setNotice(action === "search" ? "正在提取画面关键词、查找原图并去重。" : action === "sources"
+      ? "正在读取引用与核查来源，提取正文图片并去重…" : "正在检查图片并去重…");
     try {
       let result: { added: number };
       if (action === "search") {
         result = await api.post(base, { query: query.trim() });
+      } else if (action === "sources") {
+        result = await api.post(base, { fromSources: true });
       } else if (file) {
         const imageData = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
@@ -60,6 +65,7 @@ function IllustrationTools({ question, disabled, onImages }: {
       onImages(question.id, await api.get<Draft["images"]>(base));
       setNotice(result.added ? `已加入 ${result.added} 张备选图，正文未改动。` : action === "import"
         ? "已有相同或相似的图片，未重复添加。"
+        : action === "sources" ? "没有新增图片：原文可能没有可下载的正文图，也可能已在图库中。"
         : "没有新增合适的配图。试试更短的关键词、英文名称，或在浏览器找到后导入。");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "配图操作未完成，请重试。");
@@ -69,7 +75,10 @@ function IllustrationTools({ question, disabled, onImages }: {
   }
 
   return <>
-    <button className="btn btn-sm" onClick={() => setOpen(true)} disabled={disabled}>找配图</button>
+    <div className="illustration-actions">
+      {hasSources && <button className="btn btn-sm" onClick={() => { setOpen(true); void run("sources"); }} disabled={disabled || !!busy}>从来源提图</button>}
+      <button className="btn btn-sm" onClick={() => setOpen(true)} disabled={disabled}>找配图</button>
+    </div>
     {open && createPortal(<Modal title="找配图" sub="图片只加入备选，不改正文。使用前请核对可见水印、出处和转载许可。"
       onClose={() => { if (!busy) setOpen(false); }} width={490}>
       <div className="illustration-tools">
@@ -79,6 +88,9 @@ function IllustrationTools({ question, disabled, onImages }: {
           <button className="btn btn-sm" disabled={disabled || !!busy} onClick={() => void run("search")}>
             {busy === "search" ? "正在搜图…" : "自动搜图"}
           </button>
+          {hasSources && <button className="btn btn-sm" disabled={disabled || !!busy} onClick={() => void run("sources")}>
+            {busy === "sources" ? "正在提图…" : "从引用与核查来源提图"}
+          </button>}
           <button className="btn btn-sm" disabled={!keywords} onClick={() => void openExternal(keywords.startsWith("https://") ? keywords : `https://www.bing.com/images/search?q=${encodeURIComponent(keywords)}`)}>
             <IconExternal size={13} /> 浏览器搜图
           </button>
@@ -120,10 +132,21 @@ function citationHost(url: string) {
   }
 }
 
-type ResearchStatus = { job: Job | null; resumable: boolean; draftSaved: boolean };
+type Verification = { startedMs: number; limitSeconds: number };
+type ResearchStatus = { job: Job | null; resumable: boolean; draftSaved: boolean; verification?: Verification | null };
 
-function recoveryKey(id: string) {
-  return `zhihu-qa:draft-recovery:${id}`;
+function VerificationTimer({ startedMs, limitSeconds }: Verification) {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const elapsed = Math.min(limitSeconds, Math.max(0, Math.floor((now - startedMs) / 1000)));
+  const clock = (seconds: number) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  return <div className="verification-timer" aria-live="off">
+    <progress max={limitSeconds} value={elapsed} aria-label="本轮核查已用时间" />
+    <span>本轮已用 {clock(elapsed)} / {clock(limitSeconds)} · 剩余 {clock(limitSeconds - elapsed)}</span>
+  </div>;
 }
 
 const writes = new Map<string, Promise<unknown>>();
@@ -338,7 +361,9 @@ function DeskInner() {
   const [mode, setMode] = React.useState<"edit" | "preview">("preview");
   const [savedAt, setSavedAt] = React.useState<string>("");
   const [loading, setLoading] = React.useState(false);
-  const [confirm, setConfirm] = React.useState<null | "answered" | "dismiss">(null);
+  const [confirm, setConfirm] = React.useState<null | "answered" | "dismiss" | "reset">(null);
+  const [resetting, setResetting] = React.useState(false);
+  const resetInProgress = React.useRef(false);
   const [tab, setTab] = React.useState<"doubt" | "source">("doubt");
   const taRef = React.useRef<HTMLTextAreaElement>(null);
   const dirty = React.useRef(false);
@@ -368,17 +393,18 @@ function DeskInner() {
     setLoading(true);
     setLoadedId("");
     const update = async () => {
-      let nextDelay = 0;
+      let nextDelay = 1600;
       try {
+        if (resetInProgress.current) return;
         const status = await api.get<ResearchStatus>(`/api/questions/${draftId}/research`);
-        if (!alive) return;
+        if (!alive || resetInProgress.current) return;
         setResearchStatus(status);
         nextDelay = status.job?.state === "running" ? 1600 : 6000;
         const currentMarker = `${status.job?.id}:${status.job?.state}:${status.draftSaved}`;
         if (first || currentMarker !== marker) {
           await writes.get(draftId)?.catch(() => {});
           const data = await api.get<Draft>(`/api/drafts/${draftId}`);
-          if (!alive) return;
+          if (!alive || resetInProgress.current) return;
           let recovered: string | null = null;
           try { recovered = localStorage.getItem(recoveryKey(draftId)); } catch {}
           serverMarkdown.current = data.markdown || "";
@@ -400,7 +426,7 @@ function DeskInner() {
         }
         setDraftError("");
       } catch (error) {
-        if (!alive) return;
+        if (!alive || resetInProgress.current) return;
         setDraftError(error instanceof Error ? error.message : "暂时无法读取工作台");
         nextDelay = 4000;
       } finally {
@@ -415,9 +441,10 @@ function DeskInner() {
   }, [draftId, refreshKey, qs.reload]);
 
   React.useEffect(() => {
-    if (!draftId || loadedId !== draftId || !dirty.current) return;
+    if (!draftId || loadedId !== draftId || !dirty.current || resetting) return;
     let alive = true;
     const timer = setTimeout(() => {
+      if (resetInProgress.current) return;
       void persistDraft(draftId, md).then(() => {
         if (alive) setSavedAt("已保存");
       }).catch(() => {
@@ -425,10 +452,10 @@ function DeskInner() {
       });
     }, 550);
     return () => { alive = false; clearTimeout(timer); };
-  }, [md, draftId, loadedId, refreshKey]);
+  }, [md, draftId, loadedId, refreshKey, resetting]);
 
   function editMarkdown(markdown: string) {
-    if (!draftId || loadedId !== draftId) return;
+    if (!draftId || loadedId !== draftId || resetInProgress.current) return;
     dirty.current = true;
     try {
       localStorage.setItem(recoveryKey(draftId), markdown);
@@ -528,13 +555,43 @@ function DeskInner() {
     try {
       await writes.get(current.id)?.catch(() => {});
       await api.post(`/api/questions/${current.id}/dismiss`);
-      try { localStorage.removeItem(recoveryKey(current.id)); } catch {}
+      clearDraftRecovery(current.id);
       toast("已弃用，本地素材已清理", "ok");
       setConfirm(null);
       await qs.reload(true);
       router.push("/desk");
     } catch (e) {
       toast(e instanceof Error ? e.message : "操作失败", "err");
+    }
+  }
+
+  async function resetDraft() {
+    if (!draftId || resetInProgress.current) return;
+    resetInProgress.current = true;
+    setResetting(true);
+    try {
+      await writes.get(draftId)?.catch(() => {});
+      await api.post(`/api/drafts/${draftId}/reset`);
+      clearDraftRecovery(draftId);
+      if (viewedDraft.current === draftId) {
+        dirty.current = false;
+        serverMarkdown.current = "";
+        setMd("");
+        setDoubts([]);
+        setCitations([]);
+        setWarnings([]);
+        setSavedAt("");
+        setMode("edit");
+      }
+      await qs.reload(true);
+      refresh();
+      setConfirm(null);
+      toast("已清空稿件，可重新生成初稿", "ok");
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "清空稿件失败", "err");
+    } finally {
+      resetInProgress.current = false;
+      setResetting(false);
     }
   }
 
@@ -566,9 +623,9 @@ function DeskInner() {
   }
 
   const processing = liveJob?.state === "running" || starting || (!researchStatus && current.status === "researching");
-  const canEdit = loadedId === draftId && (!processing || !!serverMarkdown.current);
+  const canEdit = !resetting && loadedId === draftId && (!processing || !!serverMarkdown.current);
   const progress = Math.round((liveJob?.progress ?? 0) * 100);
-  const canStart = !processing && loadedId === draftId && (!!researchStatus?.resumable || (!current.hasDraft && !md.trim()));
+  const canStart = !resetting && !processing && loadedId === draftId && (!!researchStatus?.resumable || (!current.hasDraft && !md.trim()));
 
   return (
     <div className="desk">
@@ -604,8 +661,12 @@ function DeskInner() {
           </div>
           <div style={{ fontSize: 11.5, color: "var(--ink-3)" }}>
             {current.domain}
-            {current.subDomain ? ` / ${current.subDomain}` : ""} · 契合{" "}
-            {(current.fit * 100).toFixed(0)}
+            {current.subDomain ? ` / ${current.subDomain}` : ""} ·{" "}
+            {!current.fitEvaluated
+              ? "待评分"
+              : current.fit === 0
+                ? "未匹配"
+                : `契合 ${(current.fit * 100).toFixed(0)}`}
           </div>
         </div>
 
@@ -639,6 +700,7 @@ function DeskInner() {
 
           <SectionTitle count={images.length} right={<IllustrationTools key={draftId} question={current}
             disabled={processing || loadedId !== draftId}
+            hasSources={citations.some((item) => !!item.url) || doubts.some((item) => !!item.evidence?.length)}
             onImages={(id, assets) => { if (viewedDraft.current === id) setImages(assets); }} />}>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
               <IconImage size={13} /> 配图
@@ -647,7 +709,7 @@ function DeskInner() {
 
           {images.length === 0 ? (
             <p className="dim" style={{ fontSize: 11.5, marginBottom: 18, lineHeight: 1.7 }}>
-              暂无配图。可以点击「找配图」按画面搜图，或导入自己找到的图片；补搜不会改动正文。
+              暂无配图。可从引用和核查原文提图，也可按画面搜图或手动导入；补图不会改动正文。
             </p>
           ) : (
             <div className="img-grid" style={{ marginBottom: 20 }}>
@@ -837,7 +899,8 @@ function DeskInner() {
               {processing && <span className="mono">{progress}%</span>}
             </div>
             {processing && <progress max={100} value={progress} aria-label="拟稿进度" />}
-            <p>{draftError || liveJob?.message || "先保存资料和正文，再补充核查与配图。"}</p>
+            {processing && researchStatus?.verification && <VerificationTimer {...researchStatus.verification} />}
+            <p>{draftError || (liveJob?.state !== "done" && liveJob?.message) || "先保存资料和正文，再补充核查与配图。"}</p>
             {canStart && <button className="btn btn-primary btn-sm" onClick={runAgent}>
               {researchStatus?.resumable ? "继续上次任务" : "生成初稿"}
             </button>}
@@ -896,7 +959,7 @@ function DeskInner() {
           </span>
           <span className="dim" style={{ fontSize: 11, marginLeft: 8 }}>
             {savedAt.startsWith("保存失败") ? (
-              <button className="btn btn-sm" onClick={() => void persistDraft(draftId, md).then(
+              <button className="btn btn-sm" disabled={resetting} onClick={() => void persistDraft(draftId, md).then(
                 () => setSavedAt("已保存"), () => toast("仍无法保存，正文保留在本机恢复区", "err"),
               )}>{savedAt}</button>
             ) : savedAt}
@@ -921,6 +984,11 @@ function DeskInner() {
           <button className="btn btn-sm" disabled={processing || loadedId !== draftId} onClick={() => setConfirm("dismiss")}>
             <IconX size={13} /> 弃用
           </button>
+          {current.status === "pending_review" && !processing && (
+            <button className="btn btn-sm" disabled={!canEdit} onClick={() => setConfirm("reset")}>
+              <IconRefresh size={13} /> 清空并重新拟稿
+            </button>
+          )}
           <button className="btn btn-sm btn-primary" disabled={processing || !canEdit || !md.trim()} onClick={() => setConfirm("answered")}>
             <IconCheck size={13} /> 标记已回答
           </button>
@@ -961,7 +1029,7 @@ function DeskInner() {
       {confirm === "dismiss" && (
         <Modal title="弃用这个问题？" sub={current.title} onClose={() => setConfirm(null)}>
           <p style={{ fontSize: 12.5, lineHeight: 1.8, color: "var(--ink-2)" }}>
-            会删除本地已生成的正文与配图。如果只是暂时不想答，可以先留着。
+            会删除本地草稿和配图。之后可以从「已弃用」恢复问题，但已删除的内容不会恢复。
           </p>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 20 }}>
             <button className="btn" onClick={() => setConfirm(null)}>
@@ -969,6 +1037,19 @@ function DeskInner() {
             </button>
             <button className="btn btn-red" onClick={dismiss}>
               确认弃用
+            </button>
+          </div>
+        </Modal>
+      )}
+      {confirm === "reset" && (
+        <Modal title="清空稿件并重新拟稿？" sub={current.title} onClose={() => { if (!resetting) setConfirm(null); }}>
+          <p style={{ fontSize: 12.5, lineHeight: 1.8, color: "var(--ink-2)" }}>
+            会清空正文（含手工修改）、引用与核查记录，此操作不可撤销。备选配图会保留；清空后可手动生成新稿。
+          </p>
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 20 }}>
+            <button className="btn" disabled={resetting} onClick={() => setConfirm(null)}>取消</button>
+            <button className="btn btn-red" disabled={resetting} onClick={resetDraft}>
+              {resetting ? "正在清空…" : "确认清空"}
             </button>
           </div>
         </Modal>
