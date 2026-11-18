@@ -1,4 +1,5 @@
 import io
+import json
 import tempfile
 import time
 import unittest
@@ -27,6 +28,33 @@ def illustration(variant="PNG", size=400, alternate=False):
 
 
 class ResearchTests(unittest.TestCase):
+    def test_svg_title_does_not_swallow_article(self):
+        body = "The off-hand can hold a torch in this preview. " * 7
+        title, text, images = research.parse_doc(
+            f'<title>Preview release</title><svg><title>Menu icon</title></svg>'
+            f'<div>Outside the article</div><article><p>{body}</p><img src="/off-hand.jpg" alt="Off-hand torch"></article>',
+            "https://manual.example/preview",
+        )
+        self.assertEqual(title, "Preview release")
+        self.assertIn("off-hand can hold a torch", text)
+        self.assertNotIn("Outside the article", text)
+        self.assertEqual(len(images), 1)
+
+    def test_help_center_search_uses_article_body_and_explicit_image_permission(self):
+        endpoint = "https://manual.example/hc/en-us/articles/preview"
+        entry = {"html_url": endpoint, "title": "Preview release", "body":
+                 '<p>' + "The off-hand can hold a torch. " * 8 + '</p><img src="/off-hand.jpg" alt="Off-hand torch">'}
+        other = {**entry, "html_url": "https://manual.example/hc/other/preview"}
+        source = {"name": "Manual", "baseUrl": "https://manual.example/hc/en-us", "useFor": ["fact"]}
+        raw = json.dumps({"results": [other, entry]}).encode()
+        with patch.object(research, "fetch", return_value=(raw, "application/json", "utf-8")) as fetch:
+            docs = research.gather('Minecraft "off-hand"', [source])
+            self.assertEqual([doc["sourceUrl"] for doc in docs], [endpoint])
+            self.assertIn("query=%22off-hand%22", fetch.call_args.args[0])
+            self.assertFalse(research.pick_image_urls(docs, 3, "off-hand"))
+            docs = research.gather('Minecraft "off-hand"', [{**source, "useFor": ["fact", "image"]}])
+            self.assertEqual(len(research.pick_image_urls(docs, 3, "off-hand")), 1)
+
     def test_relevant_images_only_and_canonical_url(self):
         title, _, images = research.parse_doc('''<title>铁路信号教程</title>
             <header><img src="/railway-header.png" alt="铁路信号"></header>

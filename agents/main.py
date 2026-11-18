@@ -298,6 +298,23 @@ def _strip_images(markdown: str) -> str:
     return markdown.strip()
 
 
+def _search_terms(title: str, tags: list[str], model: dict) -> list[str]:
+    if not model.get("model") or not model.get("apiKey"):
+        return []
+    try:
+        plan = llm.chat_json(model, [
+            {"role": "system", "content": "Return JSON {\"queries\":[\"query one\",\"query two\"]}. Write two focused search queries, preferably using the terminology of English-language documentation. Each query addresses one distinct feature. Put the bare canonical feature name (one or two words) in double quotes, with any product or version outside those quotes. Omit terms such as functionality, support, full, gameplay, addition, and new. Translate terms without assuming the claim is true. Do not answer the question."},
+            {"role": "user", "content": title + "\n" + " ".join(tags[:5])},
+        ], temperature=0, max_tokens=900, retry_tokens=0, timeout=7)
+    except llm.LLMError:
+        return []
+    terms = plan.get("queries")
+    if not isinstance(terms, list):
+        return []
+    return list(dict.fromkeys(" ".join(term.split())[:110] for term in terms
+                              if isinstance(term, str) and term.strip()))[:2]
+
+
 def collect_material(payload: dict) -> dict:
     question = payload["question"]
     title = str(question.get("title") or "").strip()[:180]
@@ -306,12 +323,21 @@ def collect_material(payload: dict) -> dict:
     compact = " ".join(tags[:3]).strip() or query[:40]
     queries = list(dict.fromkeys(item for item in (query, compact) if item))
     sources = sorted(payload.get("sources") or [], key=lambda s: -int(s.get("trust") or 3))[:8]
-    deadline = time.time() + 18
+    deadline = time.time() + 24
     docs = []
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    enriched_terms = []
+
+    def collect_enriched():
+        terms = _search_terms(title, tags, payload.get("model") or {})
+        enriched = research._parallel(lambda term: research.gather(term, sources, 4, deadline), terms, 2, deadline)
+        return terms, [doc for group in enriched for doc in group]
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     try:
         futures = [pool.submit(research.gather, term, sources, 4, deadline) for term in queries]
-        done, _ = concurrent.futures.wait(futures, timeout=max(0, deadline - time.time()))
+        enriched = pool.submit(collect_enriched) if sources and title else None
+        all_futures = [*futures, enriched] if enriched else futures
+        done, _ = concurrent.futures.wait(all_futures, timeout=max(0, deadline - time.time()))
         for future in futures:
             if future not in done:
                 continue
@@ -319,6 +345,9 @@ def collect_material(payload: dict) -> dict:
                 docs.extend(future.result())
             except (OSError, ValueError):
                 continue
+        if enriched in done and enriched.exception() is None:
+            enriched_terms, translated_docs = enriched.result()
+            docs.extend(translated_docs)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     warnings = []
@@ -331,14 +360,20 @@ def collect_material(payload: dict) -> dict:
             warnings.append("配置的来源没有取到正文，这些网页仅作线索，请自行复核。")
     if not docs:
         warnings.append("没有取得可引用资料。请核实版本、数值和其他事实后再使用初稿。")
-    target = research.keywords(title)
+    target = research.keywords(" ".join([title, *enriched_terms]))
+    focused = research.keywords(" ".join(research.focused_phrase(term) for term in enriched_terms))
     unique = {}
     for doc in docs:
         unique.setdefault(research.canonical_url(doc["sourceUrl"]), doc)
-    ranked = sorted(unique.values(), key=lambda doc: (
-        len(target & research.keywords(doc.get("title", ""))), doc.get("trust", 0),
-    ), reverse=True)
-    return {"docs": ranked[:6], "warnings": warnings}
+
+    def rank(doc):
+        heading = research.keywords(doc.get("title", ""))
+        body = research.keywords(doc.get("text", ""))
+        return 4 * len(focused & heading) + len(focused & body), len(target & heading), doc.get("trust", 0)
+
+    relevant = [doc for doc in unique.values() if rank(doc)[0] > 0]
+    ranked = sorted(relevant or unique.values(), key=rank, reverse=True)
+    return {"docs": ranked[:6], "warnings": warnings, "searchTerms": enriched_terms}
 
 
 def write_draft(payload: dict) -> dict:
@@ -425,7 +460,8 @@ def review_material(payload: dict) -> dict:
 def collect_images(payload: dict) -> dict:
     docs = payload.get("material", {}).get("docs") or []
     question = payload.get("question") or {}
-    topic = str(question.get("title") or "") + " " + " ".join(question.get("tags") or [])
+    terms = payload.get("material", {}).get("searchTerms") or []
+    topic = " ".join([str(question.get("title") or ""), *(question.get("tags") or []), *terms])
     maximum = max(0, min(20, int(payload.get("settings", {}).get("imageMax", 8))))
     candidates = research.pick_image_urls(docs, maximum, topic)
     return {"images": research.download_images(candidates, payload["imagesDir"], maximum, time.time() + 20)}

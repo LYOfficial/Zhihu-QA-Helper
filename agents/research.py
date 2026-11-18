@@ -35,9 +35,8 @@ BAD_IMG_HINTS = (
 TEXT_TAGS = {"p", "li", "td", "th", "h1", "h2", "h3", "h4", "dd", "dt", "blockquote"}
 SKIP_TAGS = {"script", "style", "noscript", "svg", "nav", "footer", "form", "iframe", "header", "aside"}
 CONTENT_MARKERS = {"mw-content-text", "mw-parser-output", "article-content", "article-body", "post-content", "main-content"}
+FEATURE_QUALIFIERS = {"full", "complete", "support", "functionality", "gameplay", "addition", "new", "feature"}
 
-# 被站点拒绝（403/404/DNS 失败）后，短时间内不再重试同一域名。
-# 否则三个检索词会各撞一次墙，白等好几轮超时。
 _BAD_HOSTS: dict[str, float] = {}
 _BAD_TTL = 600.0
 
@@ -108,7 +107,7 @@ def fetch(url: str, referer: str = "", timeout: int = 12, max_bytes: int = 3_000
                 charset = m.group(1)
             return raw, ctype, charset
     except urllib.error.HTTPError as e:
-        if e.code in (401, 403, 404, 410, 451):
+        if e.code == 451:
             _mark_bad(url)
         raise
     except (urllib.error.URLError, OSError):
@@ -121,6 +120,7 @@ class _DocParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.chunks: list[str] = []
+        self.content: list[str] = []
         self.images: list[dict] = []
         self.title = ""
         self._skip = 0
@@ -132,10 +132,10 @@ class _DocParser(HTMLParser):
         a = dict(attrs)
         if tag in SKIP_TAGS:
             self._skip += 1
-        if tag == "title":
-            self._in_title = True
         if self._skip:
             return
+        if tag == "title":
+            self._in_title = True
         markers = set((a.get("class") or "").split()) | {a.get("id")}
         if self._scope == tag:
             self._depth += 1
@@ -149,6 +149,8 @@ class _DocParser(HTMLParser):
                 self.images.append({"url": src, "caption": (a.get("alt") or a.get("title") or "")[:160]})
         if tag in TEXT_TAGS or tag == "br":
             self.chunks.append("\n")
+            if self._scope:
+                self.content.append("\n")
 
     def handle_endtag(self, tag):
         if self._skip:
@@ -161,6 +163,8 @@ class _DocParser(HTMLParser):
                 self._scope = ""
         if tag in TEXT_TAGS:
             self.chunks.append("\n")
+            if self._scope:
+                self.content.append("\n")
         if tag == "title":
             self._in_title = False
 
@@ -173,9 +177,12 @@ class _DocParser(HTMLParser):
         t = data.strip()
         if t:
             self.chunks.append(t)
+            if self._scope:
+                self.content.append(t)
 
-    def text(self) -> str:
-        joined = " ".join(self.chunks)
+    def text(self, prefer_content: bool = False) -> str:
+        content = " ".join(self.content).strip()
+        joined = content if prefer_content and len(content) >= 180 else " ".join(self.chunks)
         joined = re.sub(r"[ \t]+", " ", joined)
         joined = re.sub(r"\n\s*\n+", "\n", joined)
         return joined.strip()
@@ -192,7 +199,7 @@ def parse_doc(html: str, base_url: str):
         full = urllib.parse.urljoin(base_url, image["url"])
         if full.startswith(("https://", "http://")):
             imgs.append({**image, "url": full})
-    return p.title, p.text(), imgs
+    return p.title, p.text(prefer_content=True), imgs
 
 
 def clean_sample(text: str) -> str:
@@ -231,6 +238,17 @@ def _allow_image(source: dict) -> bool:
     return isinstance(use_for, list) and "image" in use_for
 
 
+def source_matches(source: dict, url: str) -> bool:
+    base = source.get("baseUrl") or ""
+    host = _host(base).removeprefix("www.")
+    target = _host(url)
+    if not host or not (target == host or target.endswith("." + host)):
+        return False
+    path = urllib.parse.urlsplit(base).path.rstrip("/")
+    target_path = urllib.parse.urlsplit(url).path
+    return not path or target_path == path or target_path.startswith(path + "/")
+
+
 def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: bool = False) -> dict | None:
     try:
         raw, ctype, charset = fetch(url, timeout=10)
@@ -238,13 +256,18 @@ def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: boo
         return None
     if ctype and not any(kind in ctype.lower() for kind in ("html", "text/plain")):
         return None
-    title, text, imgs = parse_doc(_decode(raw, charset), url)
+    return _make_doc(_decode(raw, charset), url, source, authority, allow_image)
+
+
+def _make_doc(html: str, url: str, source: dict, authority: bool, allow_image: bool,
+              article_title: str = "") -> dict | None:
+    title, text, imgs = parse_doc(html, url)
     if len(text) < 180:
         return None
     return {
         "sourceName": source.get("name") or _host(url),
         "sourceUrl": url,
-        "title": title,
+        "title": article_title or title,
         "text": text[:9000],
         "images": imgs,
         "trust": source.get("trust") or 3,
@@ -289,23 +312,60 @@ def _source_pages(source: dict, query: str) -> list[str]:
             return []
     root = host.removeprefix("www.")
     hits = web_search(f"site:{root} {query}", limit=4)
-    return [url for url in hits if _host(url) == root or _host(url).endswith("." + root)][:2]
+    return [url for url in hits if source_matches(source, url)][:2]
+
+
+def focused_phrase(query: str) -> str:
+    feature = re.search(r'"([^"\r\n]{2,80})"', query)
+    key = " ".join(word for word in feature.group(1).split()
+                   if word.lower() not in FEATURE_QUALIFIERS) if feature else ""
+    return re.sub(r"\boff ?hand\b", "off-hand", key, flags=re.I)
+
+
+def _help_center_docs(source: dict, query: str) -> list[dict]:
+    base = source.get("baseUrl") or ""
+    parts = urllib.parse.urlsplit(base)
+    if _host(base) != "feedback.minecraft.net" and not parts.path.startswith("/hc/"):
+        return []
+    origin = parts._replace(path="", query="", fragment="").geturl()
+    key = focused_phrase(query)
+    search = f'"{key}"' if key else query
+    params = urllib.parse.urlencode({"query": search, "per_page": 4})
+    try:
+        raw, _, charset = fetch(f"{origin}/api/v2/help_center/articles/search.json?{params}", timeout=6)
+        hits = json.loads(_decode(raw, charset)).get("results") or []
+    except (OSError, ValueError):
+        return []
+    docs = []
+    for hit in hits[:4]:
+        url, body, title = hit.get("html_url"), hit.get("body"), hit.get("title")
+        if not all(isinstance(value, str) for value in (url, body, title)) or not source_matches(source, url):
+            continue
+        doc = _make_doc(f"<article>{body}</article>", url, source, True, _allow_image(source), title)
+        if doc:
+            docs.append(doc)
+    return docs[:2]
 
 
 def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float | None = None) -> list[dict]:
     deadline = deadline or time.time() + 18
     ordered = sorted([source for source in sources if source.get("enabled", True)],
-                     key=lambda source: -int(source.get("trust") or 3))[:4]
-    results = _parallel(lambda source: (source, _source_pages(source, query)), ordered, 4, min(deadline, time.time() + 9))
-    pages, seen = [], set()
-    for source, links in results:
+                     key=lambda source: -int(source.get("trust") or 3))[:6]
+    def lookup(source):
+        docs = _help_center_docs(source, query)
+        return source, docs, [] if docs else _source_pages(source, query)
+
+    results = _parallel(lookup, ordered, 6, min(deadline, time.time() + 9))
+    pages, docs, seen = [], [], set()
+    for source, articles, links in results:
+        docs.extend(articles)
         for link in links:
             key = canonical_url(link)
             if key not in seen:
                 pages.append((link, source))
                 seen.add(key)
-    docs = _parallel(lambda page: _fetch_doc(page[0], page[1], True, _allow_image(page[1])),
-                     pages[: max_pages * 2], 6, deadline)
+    docs.extend(_parallel(lambda page: _fetch_doc(page[0], page[1], True, _allow_image(page[1])),
+                          pages[: max_pages * 2], 6, deadline))
     return [doc for doc in docs if doc][:max_pages]
 
 
@@ -368,6 +428,7 @@ def gather_web(query: str, max_pages: int = 3, deadline: float | None = None) ->
 def keywords(text: str) -> set[str]:
     lower = text.lower()
     words = set(re.findall(r"[a-z][a-z0-9]{1,}", lower))
+    words.update(left + right for left, right in re.findall(r"\b([a-z]+)-([a-z]+)\b", lower))
     words.update(re.findall(r"(?=([\u4e00-\u9fff]{2}))", lower))
     return words - {"how", "what", "the", "for", "and", "什么", "怎么", "如何", "问题", "知乎", "官方", "可以", "哪个"}
 
@@ -378,13 +439,14 @@ def canonical_url(url: str) -> str:
 
 
 def pick_image_urls(docs: list[dict], want: int, topic: str) -> list[dict]:
-    target = keywords(topic)
+    target = keywords(topic) - {"beta", "preview", "edition", "update", "version", "gameplay", "support", "full", "完整", "功能", "玩法", "版本"}
     ranked = []
     for doc in docs:
         if not (doc.get("authority") and doc.get("allowImage")):
             continue
         page = doc["sourceUrl"]
-        page_matches = target & keywords(doc.get("title", ""))
+        specific = target - keywords(doc.get("sourceName", ""))
+        page_matches = specific & keywords(doc.get("title", ""))
         for image in doc.get("images", [])[:40]:
             if not isinstance(image, dict):
                 continue
@@ -394,7 +456,7 @@ def pick_image_urls(docs: list[dict], want: int, topic: str) -> list[dict]:
             if any(hint in path for hint in BAD_IMG_HINTS) or path.endswith((".svg", ".svgz", ".gif")):
                 continue
             filename = path.rsplit("/", 1)[-1]
-            image_matches = target & keywords(caption + " " + filename)
+            image_matches = specific & keywords(caption + " " + filename)
             if not image_matches and len(page_matches) < 2:
                 continue
             if not image_matches and not caption and not keywords(filename):
