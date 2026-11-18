@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -63,7 +63,10 @@ pub fn router(state: Shared) -> Router {
         .route("/questions/sync", post(sync_now))
         .route("/questions/sync/recent", post(sync_recent_now))
         .route("/questions/{id}", get(get_question))
-        .route("/questions/{id}/research", post(research_question))
+        .route(
+            "/questions/{id}/research",
+            get(research_status).post(research_question),
+        )
         .route("/questions/{id}/status", post(set_status))
         .route("/questions/{id}/answered", post(mark_answered))
         .route("/questions/{id}/dismiss", post(dismiss_question))
@@ -761,35 +764,44 @@ async fn sync_recent_now(State(st): State<Shared>) -> R {
 }
 
 async fn research_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
-    {
-        let db = st.db.lock().await;
-        let running: i64 = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM jobs WHERE kind='research' AND question_id=?1 AND state='running'",
-                params![id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if running > 0 {
-            return Ok(Json(json!({
-                "ok": true,
-                "message": "这个问题的稿子正在生成中，稍等片刻"
-            })));
-        }
-        let _ = db.conn.execute(
-            "UPDATE questions SET status='researching' WHERE id=?1",
+    let job = tasks::start_research(&st, &id).await?;
+    Ok(Json(json!({ "ok": true, "jobId": job })))
+}
+
+async fn research_status(State(st): State<Shared>, Path(id): Path<String>) -> R {
+    let db = st.db.lock().await;
+    let job = db
+        .conn
+        .query_row(
+            "SELECT id, stage, progress, message, state, started_at, finished_at
+         FROM jobs WHERE kind='research' AND question_id=?1 ORDER BY rowid DESC LIMIT 1",
             params![id],
-        );
-    }
-    let st2 = st.clone();
-    let qid = id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = tasks::run_research(&st2, &qid).await {
-            tracing::warn!("出稿失败: {e}");
-        }
-    });
-    Ok(Json(json!({ "ok": true, "message": "智能体已开始工作" })))
+            |row| {
+                Ok(Job {
+                    id: row.get(0)?,
+                    kind: "research".into(),
+                    question_id: Some(id.clone()),
+                    stage: row.get(1)?,
+                    progress: row.get(2)?,
+                    message: row.get(3)?,
+                    state: row.get(4)?,
+                    started_at: row.get(5)?,
+                    finished_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let checkpoint = db
+        .conn
+        .query_row(
+            "SELECT drafted FROM research_checkpoints WHERE question_id=?1",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?;
+    Ok(Json(
+        json!({ "job": job, "resumable": checkpoint.is_some(), "draftSaved": checkpoint == Some(true) }),
+    ))
 }
 
 async fn set_status(
@@ -812,6 +824,7 @@ async fn set_status(
 async fn mark_answered(State(st): State<Shared>, Path(id): Path<String>) -> R {
     let freed = {
         let db = st.db.lock().await;
+        ensure_not_researching(&db, &id)?;
         // 归档正文到领域目录，再清掉本地图片
         let row: Option<(String, String, String)> = db
             .conn
@@ -845,6 +858,7 @@ async fn mark_answered(State(st): State<Shared>, Path(id): Path<String>) -> R {
 async fn dismiss_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
     let freed = {
         let db = st.db.lock().await;
+        ensure_not_researching(&db, &id)?;
         let freed = db.purge_images(&id).unwrap_or(0);
         let _ = db
             .conn
@@ -857,6 +871,23 @@ async fn dismiss_question(State(st): State<Shared>, Path(id): Path<String>) -> R
         freed
     };
     Ok(Json(json!({ "ok": true, "freedBytes": freed })))
+}
+
+fn ensure_not_researching(db: &crate::db::Db, id: &str) -> anyhow::Result<()> {
+    let status: String = db.conn.query_row(
+        "SELECT status FROM questions WHERE id=?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        status != "researching",
+        "任务仍在进行，完成后再归档或弃用。"
+    );
+    db.conn.execute(
+        "DELETE FROM research_checkpoints WHERE question_id=?1",
+        params![id],
+    )?;
+    Ok(())
 }
 
 // ---------------- 草稿与图片 ----------------
@@ -930,15 +961,26 @@ async fn put_draft(
     Path(qid): Path<String>,
     Json(body): Json<Value>,
 ) -> R {
-    let md = body.get("markdown").and_then(|x| x.as_str()).unwrap_or("");
+    let md = body
+        .get("markdown")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("缺少正文"))?;
     let wc = md.chars().filter(|c| !c.is_whitespace()).count() as i64;
     let db = st.db.lock().await;
-    let _ = db.conn.execute(
+    let editable = db.conn.query_row(
+        "SELECT status IN ('inbox','pending_review') OR
+         (status='researching' AND EXISTS(SELECT 1 FROM drafts WHERE question_id=?1)) FROM questions WHERE id=?1",
+        params![qid], |row| row.get::<_, bool>(0),
+    ).optional()?.unwrap_or(false);
+    if !editable {
+        return Err(anyhow::anyhow!("当前问题不能编辑正文，请等待初稿保存或检查归档状态。").into());
+    }
+    db.conn.execute(
         "INSERT INTO drafts (question_id, markdown, doubts, citations, model, word_count, updated_at)
          VALUES (?1,?2,'[]','[]','manual',?3,?4)
          ON CONFLICT(question_id) DO UPDATE SET markdown=?2, word_count=?3, updated_at=?4",
         params![qid, md, wc, now_iso()],
-    );
+    )?;
     Ok(Json(json!({ "ok": true, "wordCount": wc })))
 }
 
@@ -969,7 +1011,7 @@ async fn get_image(
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
-        "svg" => "image/svg+xml",
+        "svg" => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported image").into_response(),
         _ => "application/octet-stream",
     };
     ([(header::CONTENT_TYPE, mime)], bytes).into_response()

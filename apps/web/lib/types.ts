@@ -124,7 +124,7 @@ export interface Citation {
 
 export interface Doubt {
   text: string;
-  status: "open" | "verified" | "corrected" | "rejected";
+  status: "open" | "unverified" | "verified" | "corrected" | "rejected";
   verdict: string;
   source: string;
 }

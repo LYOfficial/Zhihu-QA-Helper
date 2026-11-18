@@ -121,17 +121,17 @@ const GROUPS = [
   {
     label: "工作台",
     items: [
-      { href: "/", label: "案头", icon: IconDesk, badge: "" },
-      { href: "/inbox", label: "奏章", icon: IconInbox, badge: "inbox" },
-      { href: "/desk", label: "批阅台", icon: IconQuill, badge: "pending" },
+      { href: "/", label: "概览", icon: IconDesk, badge: "" },
+      { href: "/inbox", label: "问题收件箱", icon: IconInbox, badge: "inbox" },
+      { href: "/desk", label: "写作台", icon: IconQuill, badge: "pending" },
     ],
   },
   {
     label: "配置",
     items: [
       { href: "/profile", label: "领域画像", icon: IconSpark, badge: "" },
-      { href: "/sources", label: "权威平台", icon: IconGlobe, badge: "" },
-      { href: "/stats", label: "台账", icon: IconChart, badge: "" },
+      { href: "/sources", label: "资料来源", icon: IconGlobe, badge: "" },
+      { href: "/stats", label: "活动统计", icon: IconChart, badge: "" },
       { href: "/settings", label: "设置", icon: IconSliders, badge: "" },
     ],
   },
@@ -319,10 +319,10 @@ export default function Shell({ children }: { children: React.ReactNode }) {
           <button
             className="theme-toggle"
             onClick={() => changeTheme(paperTheme ? "zhihu" : "paper")}
-            title={paperTheme ? "切换到知乎现代蓝" : "切换到宣纸印章黄"}
+            title={paperTheme ? "切换到现代主题" : "切换到纸质主题"}
           >
             <span className="theme-swatch" data-theme={theme} />
-            <span>{paperTheme ? "知乎现代蓝" : "宣纸印章黄"}</span>
+            <span>{paperTheme ? "纸质主题" : "现代主题"}</span>
             <span className="theme-toggle-arrow">切换</span>
           </button>
         </div>

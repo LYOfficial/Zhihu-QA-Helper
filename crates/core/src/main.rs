@@ -57,24 +57,36 @@ fn find_python() -> Option<String> {
     None
 }
 
-fn spawn_agent(port: u16, embed_web: &PathBuf) -> AgentGuard {
-    let script = PathBuf::from("agents/main.py");
-    if !script.exists() {
-        tracing::warn!("找不到 agents/main.py，智能体不会自动启动");
-        return AgentGuard(None);
-    }
-    let Some(py) = find_python() else {
-        tracing::warn!("系统里找不到 python，请自行启动 agents/main.py");
-        return AgentGuard(None);
+fn spawn_agent(
+    port: u16,
+    data_dir: &std::path::Path,
+    runtime: Option<&std::path::Path>,
+) -> AgentGuard {
+    let mut cmd = if let Some(runtime) = runtime {
+        Command::new(runtime.join("agent").join("zhihu-qa-agent.exe"))
+    } else {
+        let Some(python) = find_python() else {
+            tracing::warn!("系统里找不到 Python，无法启动开发版智能体");
+            return AgentGuard(None);
+        };
+        let mut command = Command::new(python);
+        command.arg("agents/main.py");
+        command
     };
-    let mut cmd = Command::new(py);
-    cmd.arg(&script)
-        .arg("--port")
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("logs").join("agent.log"))
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+    cmd.arg("--port")
         .arg(port.to_string())
         .arg("--data-dir")
-        .arg(embed_web.to_string_lossy().to_string())
+        .arg(data_dir)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -136,7 +148,8 @@ async fn main() -> Result<()> {
     let database = db::Db::open(&data_dir)?;
     let state = state::AppState::new(database, data_dir.clone(), agent_port);
 
-    let _agent = spawn_agent(agent_port, &data_dir);
+    let runtime = std::env::var_os("ZHIHU_QA_RUNTIME").map(PathBuf::from);
+    let _agent = spawn_agent(agent_port, &data_dir, runtime.as_deref());
     tasks::recover_stale_jobs(&state).await;
     scheduler::spawn(state.clone());
     let bootstrap_state = state.clone();
@@ -146,7 +159,9 @@ async fn main() -> Result<()> {
     });
 
     // 静态前端：优先 apps/web/.build（next export 的产物），否则给一个提示页
-    let web_out = PathBuf::from("apps/web/.build");
+    let web_out = runtime
+        .map(|path| path.join("web"))
+        .unwrap_or_else(|| PathBuf::from("apps/web/.build"));
     let index = web_out.join("index.html");
     let mut app = api::router(state.clone()).layer(
         CorsLayer::new()

@@ -17,7 +17,15 @@
     "build:web": "npm run build --workspace apps/web",
     "build:core": "cargo build --release -p zhihu-qa-core",
     "build:desktop": "cargo build --release -p zhihu-qa-desktop",
+    "build:nsis": "node scripts/build-nsis.mjs",
     "typecheck": "npm run build:web && npm run typecheck --workspace apps/web",
     "build": "npm run build:web && cargo build --release -p zhihu-qa-core && cargo build --release -p zhihu-qa-desktop"
+  },
+  "overrides": {
+    "postcss": "8.5.33",
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.5"
   }
 }

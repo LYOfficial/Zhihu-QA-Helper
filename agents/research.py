@@ -12,12 +12,15 @@ import io
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
 from html.parser import HTMLParser
+
+from PIL import Image, ImageOps
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -30,7 +33,8 @@ BAD_IMG_HINTS = (
 )
 
 TEXT_TAGS = {"p", "li", "td", "th", "h1", "h2", "h3", "h4", "dd", "dt", "blockquote"}
-SKIP_TAGS = {"script", "style", "noscript", "svg", "nav", "footer", "form", "iframe"}
+SKIP_TAGS = {"script", "style", "noscript", "svg", "nav", "footer", "form", "iframe", "header", "aside"}
+CONTENT_MARKERS = {"mw-content-text", "mw-parser-output", "article-content", "article-body", "post-content", "main-content"}
 
 # 被站点拒绝（403/404/DNS 失败）后，短时间内不再重试同一域名。
 # 否则三个检索词会各撞一次墙，白等好几轮超时。
@@ -117,10 +121,12 @@ class _DocParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.chunks: list[str] = []
-        self.images: list[str] = []
+        self.images: list[dict] = []
         self.title = ""
         self._skip = 0
         self._in_title = False
+        self._scope = ""
+        self._depth = 0
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -128,16 +134,33 @@ class _DocParser(HTMLParser):
             self._skip += 1
         if tag == "title":
             self._in_title = True
-        if tag == "img":
-            src = a.get("src") or a.get("data-src") or ""
-            if src:
-                self.images.append(src)
-        if tag in TEXT_TAGS:
+        if self._skip:
+            return
+        markers = set((a.get("class") or "").split()) | {a.get("id")}
+        if self._scope == tag:
+            self._depth += 1
+        elif not self._scope and (tag in {"article", "main", "figure"} or CONTENT_MARKERS & markers):
+            self._scope, self._depth = tag, 1
+        if tag == "img" and self._scope:
+            src = a.get("data-src") or a.get("data-original") or a.get("src") or ""
+            if src and not any(
+                (a.get(dim) or "").isdigit() and int(a[dim]) < 100 for dim in ("width", "height")
+            ):
+                self.images.append({"url": src, "caption": (a.get("alt") or a.get("title") or "")[:160]})
+        if tag in TEXT_TAGS or tag == "br":
             self.chunks.append("\n")
 
     def handle_endtag(self, tag):
-        if tag in SKIP_TAGS and self._skip > 0:
-            self._skip -= 1
+        if self._skip:
+            if tag in SKIP_TAGS:
+                self._skip -= 1
+            return
+        if tag == self._scope:
+            self._depth -= 1
+            if not self._depth:
+                self._scope = ""
+        if tag in TEXT_TAGS:
+            self.chunks.append("\n")
         if tag == "title":
             self._in_title = False
 
@@ -165,13 +188,19 @@ def parse_doc(html: str, base_url: str):
     except Exception:  # 坏 HTML 不该让整条流水线崩掉
         pass
     imgs = []
-    for src in p.images:
-        if src.startswith("data:"):
-            continue
-        full = urllib.parse.urljoin(base_url, src)
-        if full.startswith("http"):
-            imgs.append(full)
+    for image in p.images:
+        full = urllib.parse.urljoin(base_url, image["url"])
+        if full.startswith(("https://", "http://")):
+            imgs.append({**image, "url": full})
     return p.title, p.text(), imgs
+
+
+def clean_sample(text: str) -> str:
+    if re.search(r"</?[a-z][^>]*>", text, re.I):
+        parser = _DocParser()
+        parser.feed(text[:32000])
+        text = parser.text()
+    return "\n\n".join(part.strip() for part in text.splitlines() if part.strip())
 
 
 def mediawiki_search(base: str, query: str, limit: int = 3) -> list[dict]:
@@ -197,30 +226,9 @@ def mediawiki_search(base: str, query: str, limit: int = 3) -> list[dict]:
     return pages
 
 
-def _guess_search_url(source: dict, query: str) -> str | None:
-    base = (source.get("baseUrl") or "").rstrip("/")
-    kind = source.get("kind") or ""
-    if not base:
-        return None
-    q = urllib.parse.quote(query)
-    if "mcmod.cn" in base:
-        return f"https://search.mcmod.cn/s?key={q}"
-    if kind == "wiki" or "wiki" in base:
-        return None  # 走 mediawiki_search
-    if "modrinth.com" in base:
-        return f"https://api.modrinth.com/v2/search?query={q}&limit=3"
-    if "curseforge.com" in base:
-        return None
-    return None
-
-
 def _allow_image(source: dict) -> bool:
-    """平台是否被允许作为图源。配置里 useFor 不含 image 的，只当文字资料用。
-    老数据没有 useFor 的按允许处理，避免升级后一张图都取不到。"""
     use_for = source.get("useFor")
-    if not isinstance(use_for, list) or not use_for:
-        return True
-    return "image" in use_for
+    return isinstance(use_for, list) and "image" in use_for
 
 
 def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: bool = False) -> dict | None:
@@ -228,8 +236,10 @@ def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: boo
         raw, ctype, charset = fetch(url, timeout=10)
     except Exception:
         return None
+    if ctype and not any(kind in ctype.lower() for kind in ("html", "text/plain")):
+        return None
     title, text, imgs = parse_doc(_decode(raw, charset), url)
-    if len(text) < 200:
+    if len(text) < 180:
         return None
     return {
         "sourceName": source.get("name") or _host(url),
@@ -245,83 +255,58 @@ def _fetch_doc(url: str, source: dict, authority: bool = False, allow_image: boo
     }
 
 
-def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float | None = None) -> list[dict]:
-    """按可信度从高到低检索，凑够 max_pages 篇正文就停。
-    所有抓取并行，且受 deadline 约束——慢站点不会把整次拟稿拖死。"""
-    docs: list[dict] = []
-    ordered = sorted(
-        [s for s in sources if s.get("enabled", True)],
-        key=lambda s: -int(s.get("trust") or 3),
-    )
-    urls: list[tuple[str, dict, bool]] = []
-    json_hits: list[tuple[str, str, dict, bool]] = []
+def _parallel(function, inputs, workers: int, deadline: float):
+    inputs = list(inputs)
+    if not inputs:
+        return []
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(inputs)))
+    try:
+        futures = [pool.submit(function, item) for item in inputs]
+        done, _ = concurrent.futures.wait(futures, timeout=max(0, deadline - time.time()))
+        return [future.result() for future in futures if future in done and future.exception() is None]
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
-    for s in ordered:
-        if len(urls) + len(json_hits) >= max_pages * 2:
-            break
-        if deadline and time.time() > deadline:
-            break
-        base = (s.get("baseUrl") or "").rstrip("/")
-        if not base or _is_bad(base):
-            continue
-        allow_img = _allow_image(s)
 
-        if s.get("kind") == "wiki" or "wiki" in base:
-            for hit in mediawiki_search(base, query, limit=2):
-                urls.append((hit["url"], s, allow_img))
-            continue
-
-        surl = _guess_search_url(s, query)
-        if not surl:
-            continue
+def _source_pages(source: dict, query: str) -> list[str]:
+    base = (source.get("baseUrl") or "").rstrip("/")
+    host = _host(base)
+    if not host or _is_bad(base):
+        return []
+    if source.get("kind") == "wiki" or "wiki" in host:
+        hits = mediawiki_search(base, query, limit=2)
+        if hits:
+            return [hit["url"] for hit in hits]
+    if host in {"modrinth.com", "www.modrinth.com"}:
+        url = f"https://api.modrinth.com/v2/search?query={urllib.parse.quote(query)}&limit=3"
         try:
-            raw, ctype, charset = fetch(surl, timeout=10)
-        except Exception:
-            continue
-        if "json" in (ctype or ""):
-            try:
-                data = json.loads(_decode(raw, charset))
-                for h in (data.get("hits") or [])[:2]:
-                    json_hits.append(
-                        (f"https://modrinth.com/mod/{h.get('slug')}", h.get("slug", ""), s, allow_img)
-                    )
-            except Exception:
-                pass
-            continue
-        title, text, imgs = parse_doc(_decode(raw, charset), surl)
-        if len(text) > 400:
-            docs.append(
-                {
-                    "sourceName": s.get("name") or base,
-                    "sourceUrl": surl,
-                    "title": title,
-                    "text": text[:5000],
-                    "images": imgs,
-                    "trust": (s.get("trust") or 3) - 1,
-                    "authority": True,
-                    "allowImage": allow_img,
-                }
-            )
-        if len(docs) >= max_pages:
-            return docs
+            raw, _, charset = fetch(url, timeout=6)
+            hits = json.loads(_decode(raw, charset)).get("hits") or []
+            return [f"https://modrinth.com/{hit['project_type']}/{hit['slug']}" for hit in hits[:2]
+                    if hit.get("project_type") in {"mod", "plugin", "resourcepack", "shader", "modpack", "datapack"}
+                    and re.fullmatch(r"[a-zA-Z0-9_-]+", str(hit.get("slug", "")))]
+        except (OSError, ValueError):
+            return []
+    root = host.removeprefix("www.")
+    hits = web_search(f"site:{root} {query}", limit=4)
+    return [url for url in hits if _host(url) == root or _host(url).endswith("." + root)][:2]
 
-    urls.extend((u, s, allow) for u, _slug, s, allow in json_hits)
-    if not urls:
-        return docs
 
-    limit = max(1, max_pages - len(docs))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(urls))) as pool:
-        futures = [pool.submit(_fetch_doc, u, s, True, allow) for u, s, allow in urls[: limit * 2]]
-        for fut in concurrent.futures.as_completed(futures, timeout=25 if not deadline else max(5, deadline - time.time())):
-            try:
-                d = fut.result()
-            except Exception:
-                continue
-            if d:
-                docs.append(d)
-            if len(docs) >= max_pages:
-                break
-    return docs
+def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float | None = None) -> list[dict]:
+    deadline = deadline or time.time() + 18
+    ordered = sorted([source for source in sources if source.get("enabled", True)],
+                     key=lambda source: -int(source.get("trust") or 3))[:4]
+    results = _parallel(lambda source: (source, _source_pages(source, query)), ordered, 4, min(deadline, time.time() + 9))
+    pages, seen = [], set()
+    for source, links in results:
+        for link in links:
+            key = canonical_url(link)
+            if key not in seen:
+                pages.append((link, source))
+                seen.add(key)
+    docs = _parallel(lambda page: _fetch_doc(page[0], page[1], True, _allow_image(page[1])),
+                     pages[: max_pages * 2], 6, deadline)
+    return [doc for doc in docs if doc][:max_pages]
 
 
 BING = "https://cn.bing.com/search?q={q}&setlang=zh-CN"
@@ -380,123 +365,131 @@ def gather_web(query: str, max_pages: int = 3, deadline: float | None = None) ->
     return docs
 
 
-_MAGIC = {
-    b"\x89PNG\r\n\x1a\n": ".png",
-    b"\xff\xd8\xff": ".jpg",
-    b"GIF8": ".gif",
-    b"RIFF": ".webp",
-}
+def keywords(text: str) -> set[str]:
+    lower = text.lower()
+    words = set(re.findall(r"[a-z][a-z0-9]{1,}", lower))
+    words.update(re.findall(r"(?=([\u4e00-\u9fff]{2}))", lower))
+    return words - {"how", "what", "the", "for", "and", "什么", "怎么", "如何", "问题", "知乎", "官方", "可以", "哪个"}
 
 
-def _sniff_ext(raw: bytes) -> str | None:
-    for sig, ext in _MAGIC.items():
-        if raw.startswith(sig):
-            if ext == ".webp" and b"WEBP" not in raw[:16]:
-                return None
-            return ext
-    head = raw[:400].lstrip()
-    if head.startswith(b"<svg") or head.startswith(b"<?xml"):
-        return ".svg"
-    return None
+def canonical_url(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, "", ""))
 
 
-def pick_image_urls(docs: list[dict], want: int) -> list[tuple[str, str, str]]:
-    """返回 [(url, sourceName, 所在页面)]，按可信度优先，去重。
-
-    只收用户配置的权威平台页面的图（authority 且 allowImage）：
-    通用网页检索兜底来的页面，哪怕图再多也不收，否则图库里会冒出
-    用户根本没有授权过的站点（比如 mc.163.com）。"""
-    out: list[tuple[str, str, str]] = []
-    seen: set[str] = set()
-    for d in docs:
-        if not (d.get("authority") and d.get("allowImage")):
+def pick_image_urls(docs: list[dict], want: int, topic: str) -> list[dict]:
+    target = keywords(topic)
+    ranked = []
+    for doc in docs:
+        if not (doc.get("authority") and doc.get("allowImage")):
             continue
-        for u in d.get("images", []):
-            low = u.lower()
-            if any(b in low for b in BAD_IMG_HINTS):
+        page = doc["sourceUrl"]
+        page_matches = target & keywords(doc.get("title", ""))
+        for image in doc.get("images", [])[:40]:
+            if not isinstance(image, dict):
                 continue
-            if any(low.split("?")[0].endswith(e) for e in (".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif")):
-                pass
-            elif "/images/" not in low:
+            url = image["url"]
+            path = urllib.parse.unquote(urllib.parse.urlsplit(url).path).lower()
+            caption = image.get("caption", "")
+            if any(hint in path for hint in BAD_IMG_HINTS) or path.endswith((".svg", ".svgz", ".gif")):
                 continue
-            key = hashlib.md5(u.encode()).hexdigest()
-            if key in seen:
+            filename = path.rsplit("/", 1)[-1]
+            image_matches = target & keywords(caption + " " + filename)
+            if not image_matches and len(page_matches) < 2:
                 continue
-            seen.add(key)
-            out.append((u, d.get("sourceName", ""), d.get("sourceUrl", "")))
-            if len(out) >= want * 3:
-                return out
+            if not image_matches and not caption and not keywords(filename):
+                continue
+            ranked.append((
+                4 * len(image_matches) + len(page_matches), int(doc.get("trust") or 3),
+                {"url": url, "caption": caption or doc.get("title", ""), "page": page,
+                 "sourceName": doc.get("sourceName", "")},
+            ))
+    ranked.sort(key=lambda item: item[:2], reverse=True)
+    out, seen, per_document = [], set(), {}
+    for _, _, item in ranked:
+        key = canonical_url(item["url"])
+        page = item["page"]
+        if key in seen or per_document.get(page, 0) >= max(4, want):
+            continue
+        seen.add(key)
+        per_document[page] = per_document.get(page, 0) + 1
+        out.append(item)
+        if len(out) >= min(30, want * 4):
+            break
     return out
 
 
-def download_images(candidates: list[tuple[str, str, str]], out_dir: str,
-                    want: int = 6, min_bytes: int = 6000,
+def _normal_image(raw: bytes) -> tuple[bytes, int, int, float]:
+    with Image.open(io.BytesIO(raw), formats=("PNG", "JPEG", "WEBP")) as original:
+        width, height = original.size
+        if (min(width, height) < 160 or width * height > 24_000_000
+                or max(width, height) / min(width, height) > 5 or getattr(original, "is_animated", False)):
+            raise ValueError("不是合适的正文配图")
+        image = ImageOps.exif_transpose(original).convert("RGBA")
+    image.thumbnail((1800, 1800))
+    white = Image.new("RGBA", image.size, "white")
+    pixels = Image.alpha_composite(white, image).convert("RGB")
+    gray = pixels.convert("L").resize((9, 9), Image.Resampling.LANCZOS)
+    values = gray.get_flattened_data()
+    if max(values) - min(values) < 28:
+        raise ValueError("空白或占位图")
+    fingerprint = 0
+    for index, value in enumerate(values):
+        if index % 9 < 8:
+            fingerprint = (fingerprint << 1) | (value > values[index + 1])
+        if index < 72:
+            fingerprint = (fingerprint << 1) | (value > values[index + 9])
+    target = io.BytesIO()
+    pixels.save(target, format="PNG", optimize=False)
+    return target.getvalue(), fingerprint, sum(values) // len(values), pixels.width / pixels.height
+
+
+def download_images(candidates: list[dict], out_dir: str, want: int = 6,
                     deadline: float | None = None) -> list[dict]:
-    os.makedirs(out_dir, exist_ok=True)
-    if not candidates:
+    if not candidates or want <= 0:
         return []
+    os.makedirs(out_dir, exist_ok=True)
 
-    def one(idx_url: tuple[int, tuple[str, str, str]]) -> tuple[int, bytes, str, str, str] | None:
-        idx, (url, source_name, page) = idx_url
-        if deadline and time.time() > deadline:
-            return None
-        try:
-            raw, ctype, _ = fetch(url, referer=page, timeout=12, max_bytes=8_000_000)
-        except Exception:
-            return None
-        if len(raw) < min_bytes:
-            return None
-        ext = _sniff_ext(raw)
-        if not ext:
-            return None
-        return idx, raw, ext, url, source_name
+    def download(item: dict):
+        raw, _, _ = fetch(item["url"], referer=item["page"], timeout=7, max_bytes=6_000_000)
+        return _normal_image(raw)
 
-    ordered = list(enumerate(candidates[: max(want * 3, 6)]))
-    got: list[tuple[int, dict]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futures = [pool.submit(one, item) for item in ordered]
-        for fut in concurrent.futures.as_completed(
-            futures, timeout=None if not deadline else max(5, deadline - time.time())
-        ):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    futures = [pool.submit(download, item) for item in candidates]
+    saved, seen, fingerprints = [], set(), []
+    try:
+        for item, future in zip(candidates, futures):
             try:
-                res = fut.result()
-            except Exception:
-                continue
-            if not res:
-                continue
-            idx, raw, ext, url, source_name = res
-            got.append(
-                (
-                    idx,
-                    {
-                        "filename": "",
-                        "ext": ext,
-                        "sourceUrl": url,
-                        "sourceName": source_name,
-                        "caption": "",
-                        "bytes": len(raw),
-                        "_raw": raw,
-                    },
+                content, fingerprint, brightness, ratio = future.result(
+                    timeout=None if deadline is None else max(0, deadline - time.time())
                 )
-            )
-
-    saved: list[dict] = []
-    for idx, meta in sorted(got, key=lambda x: x[0]):
-        if len(saved) >= want:
-            break
-        name = f"img_{len(saved) + 1}{meta['ext']}"
-        try:
-            with open(os.path.join(out_dir, name), "wb") as f:
-                f.write(meta["_raw"])
-        except OSError:
-            continue
-        saved.append(
-            {
-                "filename": name,
-                "sourceUrl": meta["sourceUrl"],
-                "sourceName": meta["sourceName"],
-                "caption": "",
-                "bytes": meta["bytes"],
-            }
-        )
+            except (ValueError, OSError, Image.DecompressionBombError, concurrent.futures.TimeoutError):
+                continue
+            digest = hashlib.sha256(content).hexdigest()
+            if digest in seen or any(
+                abs(ratio / previous_ratio - 1) < 0.12 and abs(brightness - previous_brightness) < 22
+                and (fingerprint ^ previous).bit_count() <= 10
+                for previous, previous_brightness, previous_ratio in fingerprints
+            ):
+                continue
+            filename = digest[:32] + ".png"
+            path = os.path.join(out_dir, filename)
+            if not os.path.exists(path):
+                with tempfile.NamedTemporaryFile(dir=out_dir, delete=False) as temporary:
+                    temporary.write(content)
+                try:
+                    os.replace(temporary.name, path)
+                finally:
+                    if os.path.exists(temporary.name):
+                        os.unlink(temporary.name)
+            seen.add(digest)
+            fingerprints.append((fingerprint, brightness, ratio))
+            saved.append({
+                "filename": filename, "sourceUrl": item["page"], "imageUrl": item["url"],
+                "sourceName": item["sourceName"], "caption": item["caption"], "bytes": len(content),
+            })
+            if len(saved) >= want:
+                break
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return saved

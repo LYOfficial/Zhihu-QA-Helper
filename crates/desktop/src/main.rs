@@ -17,7 +17,12 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
-const PORT: u16 = 8787;
+fn core_port() -> u16 {
+    std::env::var("ZHIHU_QA_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8787)
+}
 
 struct CoreProcess(Mutex<Option<Child>>);
 
@@ -26,7 +31,13 @@ fn acquire_single_instance() -> Option<isize> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
-    let name: Vec<u16> = "Local\\ZhihuQAHelperDesktop\0".encode_utf16().collect();
+    let name: Vec<u16> = if core_port() == 8787 {
+        "Local\\ZhihuQAHelperDesktop\0".to_string()
+    } else {
+        format!("Local\\ZhihuQAHelperDesktop-{}\0", core_port())
+    }
+    .encode_utf16()
+    .collect();
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if handle.is_null() {
         return None;
@@ -64,15 +75,25 @@ fn find_core_binary() -> Option<PathBuf> {
 fn spawn_core() -> Option<Child> {
     // 已经有一个在跑就不重复起
     if TcpStream::connect_timeout(
-        &"127.0.0.1:8787".parse::<SocketAddr>().ok()?,
+        &SocketAddr::from(([127, 0, 0, 1], core_port())),
         Duration::from_millis(250),
     )
     .is_ok()
     {
         return None;
     }
-    let path = find_core_binary()?;
+    let runtime = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("runtime")))
+        .filter(|path| path.join("zhihu-qa-core.exe").is_file());
+    let path = match &runtime {
+        Some(path) => path.join("zhihu-qa-core.exe"),
+        None => find_core_binary()?,
+    };
     let mut cmd = Command::new(path);
+    if let Some(runtime) = runtime {
+        cmd.current_dir(&runtime).env("ZHIHU_QA_RUNTIME", &runtime);
+    }
     if cfg!(debug_assertions) {
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
@@ -88,7 +109,7 @@ fn spawn_core() -> Option<Child> {
 }
 
 fn wait_core(timeout: Duration) -> bool {
-    let addr: SocketAddr = format!("127.0.0.1:{PORT}").parse().unwrap();
+    let addr = SocketAddr::from(([127, 0, 0, 1], core_port()));
     let started = Instant::now();
     while started.elapsed() < timeout {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
@@ -99,11 +120,10 @@ fn wait_core(timeout: Duration) -> bool {
     false
 }
 
-
 // ---------------- 与内核通信（只走本机回环，不引额外依赖） ----------------
 
 fn core_post(path: &str, body: &str) -> Option<String> {
-    let addr: SocketAddr = format!("127.0.0.1:{PORT}").parse().ok()?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], core_port()));
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok()?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
     let req = format!(
@@ -118,7 +138,7 @@ fn core_post(path: &str, body: &str) -> Option<String> {
 }
 
 fn core_get(path: &str) -> Option<String> {
-    let addr: SocketAddr = format!("127.0.0.1:{PORT}").parse().ok()?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], core_port()));
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok()?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
@@ -129,8 +149,7 @@ fn core_get(path: &str) -> Option<String> {
 }
 
 /// 知乎 Cookie 都在 zhihu.com 域下；拿到 z_c0 就说明登录成功
-fn harvest_cookie(app: &tauri::AppHandle) -> Option<String> {
-    let win = app.get_webview_window("login")?;
+fn harvest_cookie(win: &tauri::WebviewWindow) -> Option<String> {
     let url = tauri::Url::parse("https://www.zhihu.com").ok()?;
     let cookies = win.cookies_for_url(url).ok()?;
     let mut parts: Vec<String> = Vec::new();
@@ -150,46 +169,49 @@ fn harvest_cookie(app: &tauri::AppHandle) -> Option<String> {
 
 /// 打开知乎登录窗口，登录成功后把 Cookie 交给内核并关窗
 fn open_login_window(app: tauri::AppHandle) {
-    // 窗口必须在主线程创建，否则 Tauri 会 panic
     let app_main = app.clone();
     let _ = app.run_on_main_thread(move || {
-        if app_main.get_webview_window("login").is_none() {
-            if let Ok(url) = tauri::Url::parse("https://www.zhihu.com/signin") {
-                let _ = WebviewWindowBuilder::new(
-                    &app_main,
-                    "login",
-                    WebviewUrl::External(url),
-                )
-                .title("登录知乎 · 完成后本窗口会自动关闭")
-                .inner_size(560.0, 780.0)
-                .center()
-                .build();
-            }
+        if let Some(window) = app_main.get_webview_window("login") {
+            let _ = window.set_focus();
+            return;
         }
-    });
-
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(900);
-        loop {
-            std::thread::sleep(Duration::from_millis(900));
-            if Instant::now() > deadline || app.get_webview_window("login").is_none() {
-                break;
-            }
-            if let Some(cookie) = harvest_cookie(&app) {
-                let body = serde_json::json!({ "cookie": cookie }).to_string();
-                eprintln!("[desktop] 已从登录窗口取到知乎 Cookie，提交内核");
-                let _ = core_post("/api/session/cookie", &body);
-                let _ = core_post("/api/login/browser/done", "{}");
-                if let Some(w) = app.get_webview_window("login") {
-                    let _ = w.close();
+        let Ok(url) = tauri::Url::parse("https://www.zhihu.com/signin") else {
+            return;
+        };
+        let Ok(login) = WebviewWindowBuilder::new(&app_main, "login", WebviewUrl::External(url))
+            .title("登录知乎 · 完成后本窗口会自动关闭")
+            .inner_size(560.0, 780.0)
+            .center()
+            .build()
+        else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(900);
+            while Instant::now() < deadline && login.is_visible().unwrap_or(false) {
+                std::thread::sleep(Duration::from_millis(900));
+                if !login.is_visible().unwrap_or(false) {
+                    return;
                 }
-                if let Some(main) = app.get_webview_window("main") {
-                    let _ = main.eval("window.location.reload()");
+                let Some(cookie) = harvest_cookie(&login) else {
+                    continue;
+                };
+                let body = serde_json::json!({ "cookie": cookie }).to_string();
+                let accepted = core_post("/api/session/cookie", &body)
+                    .is_some_and(|response| response.split_whitespace().nth(1) == Some("200"));
+                if !accepted {
+                    let _ = login.set_title("登录知乎 · 验证未完成，请重试或关闭窗口后重新打开");
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+                let _ = login.close();
+                if let Some(main) = app_main.get_webview_window("main") {
                     let _ = main.set_focus();
                 }
-                break;
+                return;
             }
-        }
+            let _ = login.close();
+        });
     });
 }
 
@@ -210,7 +232,7 @@ fn watch_browser_login(app: tauri::AppHandle) {
 /// 托盘菜单直接触发一次同步（内核没在跑时静默失败，不弹窗打扰）
 fn trigger_sync() {
     if let Ok(mut s) = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{PORT}").parse().unwrap(),
+        &SocketAddr::from(([127, 0, 0, 1], core_port())),
         Duration::from_millis(600),
     ) {
         let _ = s.set_write_timeout(Some(Duration::from_secs(3)));
@@ -239,13 +261,13 @@ fn main() {
                 .filter(|v| !v.trim().is_empty());
             let target = dev_url
                 .clone()
-                .unwrap_or_else(|| format!("http://127.0.0.1:{PORT}/"));
+                .unwrap_or_else(|| format!("http://127.0.0.1:{}/", core_port()));
             let url = tauri::Url::parse(&target)?;
 
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("知乎答主助手")
                 .inner_size(1280.0, 840.0)
-                .min_inner_size(1060.0, 700.0)
+                .min_inner_size(820.0, 580.0)
                 .decorations(false)
                 .transparent(true)
                 .shadow(false)
@@ -320,6 +342,9 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 // 关窗 = 收进托盘，值守不中断
                 api.prevent_close();

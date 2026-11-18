@@ -42,6 +42,26 @@ function citationHost(url: string) {
   }
 }
 
+type ResearchStatus = { job: Job | null; resumable: boolean; draftSaved: boolean };
+
+function recoveryKey(id: string) {
+  return `zhihu-qa:draft-recovery:${id}`;
+}
+
+const writes = new Map<string, Promise<unknown>>();
+
+function persistDraft(id: string, markdown: string) {
+  const previous = writes.get(id);
+  const write = (previous ?? Promise.resolve()).catch(() => {}).then(async () => {
+    await api.put(`/api/drafts/${id}`, { markdown });
+    try {
+      if (localStorage.getItem(recoveryKey(id)) === markdown) localStorage.removeItem(recoveryKey(id));
+    } catch {}
+  });
+  writes.set(id, write);
+  return write.finally(() => { if (writes.get(id) === write) writes.delete(id); });
+}
+
 function RenderMarkdown({
   md,
   qid,
@@ -231,12 +251,12 @@ function DeskInner() {
   const [doubts, setDoubts] = React.useState<Draft["doubts"]>([]);
   const [citations, setCitations] = React.useState<Draft["citations"]>([]);
   const [warnings, setWarnings] = React.useState<string[]>([]);
-  const [liveJob, setLiveJob] = React.useState<{
-    stage: string;
-    message: string;
-    state: string;
-    elapsed: number;
-  } | null>(null);
+  const [researchStatus, setResearchStatus] = React.useState<ResearchStatus | null>(null);
+  const liveJob = researchStatus?.job;
+  const [loadedId, setLoadedId] = React.useState("");
+  const [draftError, setDraftError] = React.useState("");
+  const [starting, setStarting] = React.useState(false);
+  const [refreshKey, refresh] = React.useReducer((value) => value + 1, 0);
   const [mode, setMode] = React.useState<"edit" | "preview">("preview");
   const [savedAt, setSavedAt] = React.useState<string>("");
   const [loading, setLoading] = React.useState(false);
@@ -244,6 +264,7 @@ function DeskInner() {
   const [tab, setTab] = React.useState<"doubt" | "source">("doubt");
   const taRef = React.useRef<HTMLTextAreaElement>(null);
   const dirty = React.useRef(false);
+  const serverMarkdown = React.useRef("");
   // 记住最后一次落下的插入点：编辑态是选区，预览态是点中的段落结尾。
   // 之前预览态直接 append 到 md 末尾，插图永远跑到文末，这就是那个 bug。
   const caretRef = React.useRef<number | null>(null);
@@ -256,94 +277,87 @@ function DeskInner() {
   React.useEffect(() => {
     if (!draftId) return;
     let alive = true;
-    setLoading(true);
-    api
-      .get<Draft>(`/api/drafts/${draftId}`)
-      .then((d) => {
-        if (!alive) return;
-        setMd(d.markdown || "");
-        setImages(d.images || []);
-        setDoubts(d.doubts || []);
-        setCitations(d.citations || []);
-        setWarnings(d.warnings || []);
-        setSavedAt(d.updatedAt ? "已加载" : "");
-        dirty.current = false;
-        setMode(d.markdown?.trim() ? "preview" : "edit");
-      })
-      .catch((e) => toast(e instanceof Error ? e.message : "读取失败", "err"))
-      .finally(() => alive && setLoading(false));
-    return () => {
-      alive = false;
-    };
-  }, [draftId]);
-
-  // 自动保存
-  React.useEffect(() => {
-    if (!draftId || !dirty.current) return;
-    const t = setTimeout(async () => {
-      try {
-        await api.put(`/api/drafts/${draftId}`, { markdown: md });
-        setSavedAt(
-          `已保存 ${new Date().toLocaleTimeString("zh-CN", {
-            hour: "2-digit",
-            minute: "2-digit",
-          })}`
-        );
-      } catch {
-        setSavedAt("保存失败");
-      }
-    }, 900);
-    return () => clearTimeout(t);
-  }, [md, draftId]);
-
-  // 拟稿进行中：跟住后台任务，把阶段和已用时间显示出来。
-  // 之前这里只有一个永不停的转圈，任务中断了也看不出来。
-  React.useEffect(() => {
-    if (!draftId || current?.status !== "researching") {
-      setLiveJob(null);
-      return;
-    }
-    let alive = true;
-    let tries = 0;
     let timer: ReturnType<typeof setTimeout>;
-    const tick = async () => {
-      tries += 1;
+    let first = true;
+    let marker = "";
+    dirty.current = false;
+    caretRef.current = null;
+    pendingCaret.current = null;
+    setResearchStatus(null);
+    setDraftError("");
+    setLoading(true);
+    setLoadedId("");
+    const update = async () => {
+      let nextDelay = 0;
       try {
-        const { jobs } = await api.get<{ jobs: Job[] }>("/api/jobs");
+        const status = await api.get<ResearchStatus>(`/api/questions/${draftId}/research`);
         if (!alive) return;
-        const job = jobs.find((j) => j.questionId === draftId && j.kind === "research");
-        if (!job) {
-          setLiveJob({ stage: "准备", message: "等待智能体接手…", state: "running", elapsed: 0 });
-        } else {
-          const started = Date.parse(job.startedAt);
-          const elapsed = Number.isFinite(started)
-            ? Math.max(0, Math.round((Date.now() - started) / 1000))
-            : 0;
-          setLiveJob({ stage: job.stage, message: job.message, state: job.state, elapsed });
-          if (job.state === "failed") {
-            toast(`拟稿失败：${job.message}`, "err");
-            await qs.reload(true);
-            return;
+        setResearchStatus(status);
+        nextDelay = status.job?.state === "running" ? 1600 : 6000;
+        const currentMarker = `${status.job?.id}:${status.job?.state}:${status.draftSaved}`;
+        if (first || currentMarker !== marker) {
+          await writes.get(draftId)?.catch(() => {});
+          const data = await api.get<Draft>(`/api/drafts/${draftId}`);
+          if (!alive) return;
+          let recovered: string | null = null;
+          try { recovered = localStorage.getItem(recoveryKey(draftId)); } catch {}
+          serverMarkdown.current = data.markdown || "";
+          if (first || !dirty.current) {
+            setMd(recovered ?? serverMarkdown.current);
+            if (first) setMode("edit");
+            if (recovered !== null) dirty.current = true;
+            setSavedAt(recovered !== null ? "已恢复本机未提交的改动"
+              : serverMarkdown.current ? "已保存" : "");
           }
-          if (job.state === "done") {
-            toast("初稿已就绪，可以去批阅了", "ok");
-            await qs.reload(true);
-            return;
-          }
+          setImages(data.images || []);
+          setDoubts(data.doubts || []);
+          setCitations(data.citations || []);
+          setWarnings(data.warnings || []);
+          setLoadedId(draftId);
+          if (!first && status.job?.state !== "running") void qs.reload(true);
+          first = false;
+          marker = currentMarker;
         }
-      } catch {
-        /* 单次轮询失败忽略 */
+        setDraftError("");
+      } catch (error) {
+        if (!alive) return;
+        setDraftError(error instanceof Error ? error.message : "暂时无法读取工作台");
+        nextDelay = 4000;
+      } finally {
+        if (alive) {
+          setLoading(false);
+          if (nextDelay) timer = setTimeout(update, nextDelay);
+        }
       }
-      if (!alive || tries > 300) return; // 最多跟 10 分钟
-      timer = setTimeout(tick, 2000);
     };
-    timer = setTimeout(tick, 800);
-    return () => {
-      alive = false;
-      clearTimeout(timer);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draftId, current?.status]);
+    void update();
+    return () => { alive = false; clearTimeout(timer); };
+  }, [draftId, refreshKey, qs.reload]);
+
+  React.useEffect(() => {
+    if (!draftId || loadedId !== draftId || !dirty.current) return;
+    let alive = true;
+    const timer = setTimeout(() => {
+      void persistDraft(draftId, md).then(() => {
+        if (alive) setSavedAt("已保存");
+      }).catch(() => {
+        if (alive) setSavedAt("保存失败 · 点击重试");
+      });
+    }, 550);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [md, draftId, loadedId, refreshKey]);
+
+  function editMarkdown(markdown: string) {
+    if (!draftId || loadedId !== draftId) return;
+    dirty.current = true;
+    try {
+      localStorage.setItem(recoveryKey(draftId), markdown);
+      setSavedAt("待同步 · 本机已有备份");
+    } catch {
+      setSavedAt("待保存");
+    }
+    setMd(markdown);
+  }
 
   const words = md.replace(/\s/g, "").length;
   const min = se.data?.draftMin ?? 500;
@@ -380,8 +394,7 @@ function DeskInner() {
     caretRef.current = caret;
     pendingCaret.current = caret;
     pendingScroll.current = ta?.scrollTop ?? null;
-    dirty.current = true;
-    setMd(next);
+    editMarkdown(next);
   }
 
   // 受控 textarea 更新 value 后浏览器会把光标甩到末尾，这里立刻按回插入点，
@@ -400,6 +413,10 @@ function DeskInner() {
   }, [md, mode]);
 
   function insertImage(file: string, caption?: string) {
+    if (md.includes(`[IMG:${file}]`)) {
+      toast("这张图已经在正文中", "info");
+      return;
+    }
     insertAtCursor(`\n\n[IMG:${file}]\n\n`);
     toast(`已插入插图：${caption || file}`, "ok");
   }
@@ -415,6 +432,7 @@ function DeskInner() {
   async function markAnswered() {
     if (!current) return;
     try {
+      if (dirty.current) await persistDraft(current.id, md);
       const r = await api.post<{ freedBytes?: number }>(`/api/questions/${current.id}/answered`);
       toast(`已标记回答，释放 ${Math.round((r.freedBytes ?? 0) / 1024)} KB`, "ok");
       setConfirm(null);
@@ -428,7 +446,9 @@ function DeskInner() {
   async function dismiss() {
     if (!current) return;
     try {
+      await writes.get(current.id)?.catch(() => {});
       await api.post(`/api/questions/${current.id}/dismiss`);
+      try { localStorage.removeItem(recoveryKey(current.id)); } catch {}
       toast("已弃用，本地素材已清理", "ok");
       setConfirm(null);
       await qs.reload(true);
@@ -439,13 +459,16 @@ function DeskInner() {
   }
 
   async function runAgent() {
-    if (!current) return;
+    if (!current || starting) return;
+    setStarting(true);
     try {
       await api.post(`/api/questions/${current.id}/research`);
-      toast("智能体已接手", "ok");
-      await qs.reload(true);
+      refresh();
+      void qs.reload(true);
     } catch (e) {
       toast(e instanceof Error ? e.message : "启动失败", "err");
+    } finally {
+      setStarting(false);
     }
   }
 
@@ -455,14 +478,17 @@ function DeskInner() {
         <div className="desk-side" />
         <div className="desk-main">
           <Empty glyph="案">
-            案头是空的。去「奏章」里挑一个问题，点播放键让智能体先拟一稿。
+            还没有要处理的问题。到「问题收件箱」选择一条，或先同步知乎邀请。
           </Empty>
         </div>
       </div>
     );
   }
 
-  const isPending = current.status === "pending_review";
+  const processing = liveJob?.state === "running" || starting || (!researchStatus && current.status === "researching");
+  const canEdit = loadedId === draftId && (!processing || !!serverMarkdown.current);
+  const progress = Math.round((liveJob?.progress ?? 0) * 100);
+  const canStart = !processing && loadedId === draftId && (!!researchStatus?.resumable || (!current.hasDraft && !md.trim()));
 
   return (
     <div className="desk">
@@ -479,13 +505,14 @@ function DeskInner() {
             }}
           >
             <span className="eyebrow" style={{ whiteSpace: "nowrap", flexShrink: 0 }}>
-              素材案
+              资料与配图
             </span>
             <select
               className="select"
               style={{ flex: 1, minWidth: 0, fontSize: 11, padding: "3px 6px" }}
               value={current.id}
-              onChange={(e) => router.push(`/desk?id=${e.target.value}`)}
+              aria-label="切换问题"
+              onChange={(e) => router.push(`/desk?id=${encodeURIComponent(e.target.value)}`)}
             >
               {pending.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -509,59 +536,6 @@ function DeskInner() {
             </div>
           )}
 
-          {!isPending && current.status !== "researching" && (
-            <div
-              style={{
-                border: "1px solid var(--rule-2)",
-                padding: 14,
-                marginBottom: 16,
-                background: "var(--cinnabar-wash)",
-              }}
-            >
-              <p style={{ fontSize: 12.5, lineHeight: 1.8, color: "var(--ink-2)" }}>
-                这件还没拟稿。可以让智能体先检索资料、校对、取图，再把草稿摆到你面前。
-              </p>
-              <button className="btn btn-red mt-8" onClick={runAgent}>
-                让智能体开始拟稿 ▷
-              </button>
-            </div>
-          )}
-
-          {current.status === "researching" && (
-            <div
-              style={{
-                border: "1px solid var(--rule-2)",
-                padding: 14,
-                marginBottom: 16,
-                background: "var(--blue-wash)",
-                fontSize: 12.5,
-                color: "var(--ink-2)",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <Spinner />
-                <span>
-                  智能体正在检索权威资料、核对疑问点、抓取配图…
-                  {liveJob?.elapsed ? `（已用 ${liveJob.elapsed} 秒）` : ""}
-                </span>
-              </div>
-              {liveJob?.message && (
-                <p style={{ margin: "8px 0 0", fontSize: 11.5, color: "var(--ink-3)", lineHeight: 1.7 }}>
-                  {liveJob.stage ? `${liveJob.stage} · ` : ""}
-                  {liveJob.message}
-                </p>
-              )}
-              <button
-                className="btn btn-sm"
-                style={{ marginTop: 10 }}
-                onClick={() => {
-                  void qs.reload(true);
-                }}
-              >
-                <IconRefresh size={12} /> 刷新状态
-              </button>
-            </div>
-          )}
 
           {warnings.length > 0 && (
             <div
@@ -576,7 +550,7 @@ function DeskInner() {
                 color: "var(--ink-2)",
               }}
             >
-              <b style={{ display: "block", marginBottom: 4 }}>这一稿的已知问题</b>
+              <b style={{ display: "block", marginBottom: 4 }}>本次拟稿提示</b>
               {warnings.map((w, i) => (
                 <div key={i}>· {w}</div>
               ))}
@@ -660,9 +634,10 @@ function DeskInner() {
                           ? "已更正 · "
                           : d.status === "rejected"
                             ? "已否定 · "
-                            : "已核 · "}
+                            : d.status === "verified" && d.source ? "资料支持 · " : "未核实 · "}
                       </b>
                       {d.verdict}
+                      {d.source && <button className="btn btn-sm" onClick={() => void openExternal(d.source)}>查看核查来源</button>}
                     </div>
                   )}
                 </div>
@@ -754,17 +729,32 @@ function DeskInner() {
           </div>
         </div>
 
+        {(processing || canStart || liveJob?.state === "failed" || draftError) && (
+          <section className="research-card" aria-live="polite">
+            <div className="research-card-title">
+              {processing && <Spinner />}
+              <strong>{processing ? liveJob?.stage || "正在排队" : researchStatus?.resumable ? "有可继续的任务" : draftError ? "暂时无法连接" : "准备拟稿"}</strong>
+              {processing && <span className="mono">{progress}%</span>}
+            </div>
+            {processing && <progress max={100} value={progress} aria-label="拟稿进度" />}
+            <p>{draftError || liveJob?.message || "先保存资料和正文，再补充核查与配图。"}</p>
+            {canStart && <button className="btn btn-primary btn-sm" onClick={runAgent}>
+              {researchStatus?.resumable ? "继续上次任务" : "生成初稿"}
+            </button>}
+          </section>
+        )}
         {/* 编辑器常驻不卸载：切到预览时光标位置也不会丢，
             插图时才能准确插在原来那句话后面 */}
         <div className="desk-edit" style={mode === "edit" ? undefined : { display: "none" }}>
           <textarea
             ref={taRef}
             className="editor"
-            value={md}
+            value={loadedId === draftId ? md : ""}
+            disabled={!canEdit}
+            aria-label="回答正文"
             placeholder="在这里落下你的判断。左侧配图点一下就能插到光标处，也可以直接拖进来。"
             onChange={(e) => {
-              dirty.current = true;
-              setMd(e.target.value);
+              editMarkdown(e.target.value);
             }}
             onSelect={noteCaret}
             onClick={noteCaret}
@@ -777,10 +767,8 @@ function DeskInner() {
             onDrop={(e) => {
               e.preventDefault();
               const text = e.dataTransfer.getData("text/plain");
-              if (text.startsWith("[IMG:")) {
-                insertAtCursor(`\n\n${text}\n\n`);
-                dirty.current = true;
-              }
+              const asset = images.find((image) => text === `[IMG:${image.filename}]`);
+              if (asset) insertImage(asset.filename, asset.caption);
             }}
             spellCheck={false}
           />
@@ -789,7 +777,7 @@ function DeskInner() {
         {mode === "preview" && (
           <div className="desk-edit">
             <RenderMarkdown
-              md={md}
+              md={loadedId === draftId ? md : ""}
               qid={current.id}
               images={images}
               onPick={(off) => {
@@ -807,11 +795,16 @@ function DeskInner() {
             / 建议 {min}–{max} 字
           </span>
           <span className="dim" style={{ fontSize: 11, marginLeft: 8 }}>
-            {savedAt}
+            {savedAt.startsWith("保存失败") ? (
+              <button className="btn btn-sm" onClick={() => void persistDraft(draftId, md).then(
+                () => setSavedAt("已保存"), () => toast("仍无法保存，正文保留在本机恢复区", "err"),
+              )}>{savedAt}</button>
+            ) : savedAt}
           </span>
           <div className="grow" />
           <button
             className="btn btn-sm"
+            disabled={loadedId !== draftId || !md.trim()}
             onClick={() => {
               copy(exportText());
               toast("已复制全文，粘贴到知乎后按插图提示补齐图片即可", "ok");
@@ -825,10 +818,10 @@ function DeskInner() {
           >
             <IconExternal size={13} /> 去知乎作答
           </button>
-          <button className="btn btn-sm" onClick={() => setConfirm("dismiss")}>
+          <button className="btn btn-sm" disabled={processing || loadedId !== draftId} onClick={() => setConfirm("dismiss")}>
             <IconX size={13} /> 弃用
           </button>
-          <button className="btn btn-sm btn-primary" onClick={() => setConfirm("answered")}>
+          <button className="btn btn-sm btn-primary" disabled={processing || !canEdit || !md.trim()} onClick={() => setConfirm("answered")}>
             <IconCheck size={13} /> 标记已回答
           </button>
         </div>
@@ -836,12 +829,10 @@ function DeskInner() {
         <div className="desk-foot">
           <IconQuill size={12} />
           <span>
-            {current.hasDraft
-              ? `初稿基于 ${citations.length} 条权威来源生成，${doubts.length} 处存疑已逐条核对`
-              : "尚无初稿"}
+            {md.trim() ? `${citations.length} 条引用 · ${doubts.filter((d) => !d.source || d.status === "unverified" || d.status === "open").length} 处待核实` : "尚无正文"}
           </span>
           <span className="dim">·</span>
-          <span>落笔与定稿由你负责，这是本站的底线</span>
+          <span>仅保存本地草稿，不会代你发布</span>
         </div>
       </section>
 
@@ -868,7 +859,7 @@ function DeskInner() {
       )}
 
       {confirm === "dismiss" && (
-        <Modal title="弃用这件奏章？" sub={current.title} onClose={() => setConfirm(null)}>
+        <Modal title="弃用这个问题？" sub={current.title} onClose={() => setConfirm(null)}>
           <p style={{ fontSize: 12.5, lineHeight: 1.8, color: "var(--ink-2)" }}>
             会删除本地已生成的正文与配图。如果只是暂时不想答，可以先留着。
           </p>

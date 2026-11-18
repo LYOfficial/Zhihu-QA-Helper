@@ -163,6 +163,17 @@ CREATE TABLE IF NOT EXISTS research_cache (
   payload    TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS research_checkpoints (
+  question_id TEXT PRIMARY KEY REFERENCES questions(id) ON DELETE CASCADE,
+  material TEXT NOT NULL,
+  drafted INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS writing_samples (
+  account_id TEXT PRIMARY KEY,
+  samples TEXT NOT NULL
+);
 "#;
 
 pub struct Db {

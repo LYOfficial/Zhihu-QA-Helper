@@ -276,6 +276,11 @@ def chat_json(cfg: dict, messages: list[dict], temperature: float = 0.3,
             raise LLMError("正文过短")
         return data
     except LLMError as first:
+        if not retry_tokens:
+            saved = _salvage(raw)
+            if len(saved.get("markdown", "")) >= max(1, min_chars):
+                return {**saved, "_salvaged": True}
+            raise
         retry = list(messages)
         retry.append({"role": "assistant", "content": raw[:1200]})
         retry.append(

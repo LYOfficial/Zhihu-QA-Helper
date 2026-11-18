@@ -40,17 +40,20 @@ export default function LoginScreen({
     return () => clearInterval(t);
   }, [phase, onSuccess]);
 
+  React.useEffect(() => {
+    if (phase !== "inapp") return;
+    const timer = setTimeout(() => {
+      setBrowserHint("没看到登录窗口？可点击上方按钮重新打开，或使用默认浏览器登录。");
+    }, 10_000);
+    return () => clearTimeout(timer);
+  }, [phase]);
+
   async function loginInApp() {
     setErr("");
     setBrowserHint("");
     setPhase("inapp");
     try {
       await api.post("/api/login/browser");
-      setTimeout(() => {
-        setBrowserHint(
-          "十秒内没看到登录窗口？说明当前是浏览器预览而不是桌面应用，请改用「用默认浏览器登录」。"
-        );
-      }, 10_000);
     } catch (e) {
       setPhase("none");
       setErr(e instanceof Error ? e.message : "无法唤起登录窗口");
@@ -135,7 +138,7 @@ export default function LoginScreen({
           className="login-theme-toggle"
           onClick={() => onThemeChange(theme === "paper" ? "zhihu" : "paper")}
         >
-          切换到{theme === "paper" ? "知乎现代蓝" : "宣纸印章黄"}
+          切换到{theme === "paper" ? "现代主题" : "纸质主题"}
         </button>
         <div className="login-card">
           <h2>登录知乎</h2>
@@ -147,10 +150,9 @@ export default function LoginScreen({
             className="btn btn-primary btn-block"
             style={{ marginTop: 18 }}
             onClick={loginInApp}
-            disabled={phase === "inapp"}
           >
             {phase === "inapp" ? <Spinner /> : <IconExternal size={14} />}
-            {phase === "inapp" ? "等你登录…" : "在应用内登录知乎"}
+            {phase === "inapp" ? "重新打开登录窗口" : "在应用内登录知乎"}
           </button>
           <p className="hint" style={{ textAlign: "center" }}>
             弹出应用内的知乎登录页，可以在里面扫码或密码登录；登录完自动关闭。
@@ -159,7 +161,7 @@ export default function LoginScreen({
           {phase === "inapp" && (
             <div className="login-waiting">
               <Spinner />
-              <span>登录窗口已打开，完成登录后会自动回到这里</span>
+              <span>请在知乎窗口完成登录，成功后会自动回到这里</span>
             </div>
           )}
           {browserHint && <div className="login-warn">{browserHint}</div>}

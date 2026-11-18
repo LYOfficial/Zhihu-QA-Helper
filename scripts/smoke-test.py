@@ -1,0 +1,218 @@
+import argparse
+import json
+import os
+import socket
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+QUESTION = "如何配置铁路信号？"
+FIRST_DRAFT = "先看入口是否有信号，再检查区段边界。"
+MANUAL_DRAFT = "手工补充：先在测试线路上验证区段边界。"
+
+
+def free_port():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def wait_for(check, timeout=12):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            result = check()
+            if result:
+                return result
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(0.08)
+    raise AssertionError("等待集成检查超时")
+
+
+class Agent(BaseHTTPRequestHandler):
+    calls = Counter()
+    review_release = threading.Event()
+
+    def send(self, payload):
+        data = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        try:
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send({"ok": True})
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        stage = self.path.rsplit("/", 1)[-1]
+        self.calls[stage] += 1
+        if stage == "collect":
+            self.send({"docs": [], "warnings": ["回归测试：未连接外部资料站"]})
+        elif stage == "draft":
+            if self.calls[stage] == 1:
+                self.send({"ok": False, "error": "回归测试：模拟模型暂时不可用"})
+            else:
+                self.send({"draft": {"markdown": FIRST_DRAFT, "doubts": [
+                    {"text": "是否必须设置出口信号", "status": "unverified", "verdict": "尚未核查"},
+                ], "citations": []}, "warnings": payload["material"]["warnings"]})
+        elif stage == "review":
+            self.review_release.wait(10)
+            self.send({"doubts": [{**doubt, "verdict": "现有资料不足"} for doubt in payload["doubts"]]})
+        elif stage == "images":
+            self.send({"images": []})
+        else:
+            self.send({"ok": True})
+
+
+class Smoke:
+    def __init__(self, binary, directory, agent):
+        self.binary = binary
+        self.directory = directory
+        self.port = free_port()
+        self.agent = agent
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def request(self, path, method="GET", data=None):
+        body = None if data is None else json.dumps(data).encode()
+        req = urllib.request.Request(self.base + "/api" + path, method=method, data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=4) as response:
+            return json.load(response)
+
+    @contextmanager
+    def core(self):
+        env = {**os.environ, "ZHIHU_QA_DATA": str(self.directory), "ZHIHU_QA_PORT": str(self.port),
+               "ZHIHU_QA_AGENT_PORT": str(self.agent.server_port)}
+        process = subprocess.Popen([str(self.binary)], cwd=ROOT, env=env, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        try:
+            wait_for(lambda: self.request("/health")["agent"])
+            yield process
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+
+    def seed(self):
+        with sqlite3.connect(self.directory / "zhihu-qa.db") as database:
+            database.execute("UPDATE settings SET auto_sync=0")
+            database.execute("INSERT INTO account (id, name, cookie) VALUES (1, '本机测试答主', 'fixture')")
+            for qid, title in (("rail", QUESTION), ("other", "另一条测试问题")):
+                database.execute("INSERT INTO questions (id,title,domain,tags) VALUES (?,?,?,?)",
+                                 (qid, title, "测试资料", '["铁路"]'))
+
+    def stage(self):
+        return self.request("/questions/rail/research")
+
+    def start(self):
+        return self.request("/questions/rail/research", "POST", {})["jobId"]
+
+    def draft(self):
+        return self.request("/drafts/rail")
+
+    def test_workflow(self):
+        with self.core():
+            self.seed()
+            self.start()
+            wait_for(lambda: self.stage()["job"]["state"] == "failed")
+            assert self.stage()["resumable"] and not self.stage()["draftSaved"]
+            job = self.start()
+            assert job == self.start(), "重复点击不能创建第二份稿子"
+            wait_for(lambda: self.stage()["draftSaved"])
+            assert self.draft()["markdown"] == FIRST_DRAFT
+            self.request("/drafts/rail", "PUT", {"markdown": MANUAL_DRAFT})
+        with self.core():
+            interrupted = self.stage()
+            assert interrupted["draftSaved"] and interrupted["job"]["state"] == "failed"
+            assert self.draft()["markdown"] == MANUAL_DRAFT
+            Agent.review_release.set()
+            self.start()
+            wait_for(lambda: self.stage()["job"]["state"] == "done")
+            assert self.draft()["markdown"] == MANUAL_DRAFT
+            assert not self.stage()["resumable"]
+            assert Agent.calls["collect"] == 1 and Agent.calls["draft"] == 2
+            print("PASS API：失败后续跑、重复启动合并、重启恢复、保留手工正文")
+
+    def test_browser(self, output):
+        from playwright.sync_api import sync_playwright
+
+        output.mkdir(parents=True, exist_ok=True)
+        with self.core(), sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="msedge", headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 820})
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.route("**/api/session", lambda route: route.fulfill(json={"loggedIn": False}))
+            page.goto(self.base)
+            page.get_by_role("button", name="在应用内登录知乎").click()
+            retry = page.get_by_role("button", name="重新打开登录窗口")
+            with page.expect_response(lambda response: response.url.endswith("/api/login/browser")) as reopened:
+                retry.click()
+            assert reopened.value.ok
+            page.unroute("**/api/session")
+            page.goto(self.base + "/desk/?id=rail")
+            editor = page.get_by_role("textbox", name="回答正文")
+            editor.wait_for()
+            logo = page.locator(".app-titlebar-brand img")
+            assert logo.evaluate("img => img.complete && img.naturalWidth > 0")
+            assert 16 <= logo.bounding_box()["x"] <= 18
+            assert editor.input_value() == MANUAL_DRAFT
+            updated = MANUAL_DRAFT + "\n\n离开页面前输入的文字。"
+            editor.fill(updated)
+            page.reload()
+            editor.wait_for()
+            wait_for(lambda: editor.input_value() == updated)
+            wait_for(lambda: self.draft()["markdown"] == updated)
+            page.get_by_role("button", name="预览", exact=True).click()
+            page.get_by_text("离开页面前输入的文字。", exact=True).wait_for()
+            page.screenshot(path=output / "workbench.png")
+            page.set_viewport_size({"width": 820, "height": 600})
+            page.screenshot(path=output / "workbench-narrow.png")
+            assert 16 <= logo.bounding_box()["x"] <= 18
+            assert page.locator(".page-scroll").evaluate("el => el.scrollWidth <= el.clientWidth + 1")
+            page.get_by_role("combobox", name="切换问题").select_option("other")
+            page.get_by_role("heading", name="另一条测试问题").wait_for()
+            assert editor.input_value() == ""
+            assert not errors, errors
+            browser.close()
+            print("PASS 界面：登录可重试、Logo 对齐、刷新恢复、预览、窄窗口、切换问题")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--core", type=Path, default=ROOT / "target/nsis-build/release/zhihu-qa-core.exe")
+    parser.add_argument("--screenshots", type=Path)
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix="zhihu-qa-smoke-") as name, ThreadingHTTPServer(("127.0.0.1", 0), Agent) as agent:
+        threading.Thread(target=agent.serve_forever, daemon=True).start()
+        try:
+            smoke = Smoke(args.core.resolve(), Path(name), agent)
+            smoke.test_workflow()
+            if args.screenshots:
+                smoke.test_browser(args.screenshots)
+        finally:
+            Agent.review_release.set()
+            agent.shutdown()
+
+
+if __name__ == "__main__":
+    main()

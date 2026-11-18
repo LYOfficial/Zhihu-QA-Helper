@@ -2,7 +2,7 @@
 //! 所有任务都会写一行 job 记录，前端据此显示进度。
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -181,13 +181,14 @@ pub async fn recover_stale_jobs(state: &AppState) {
         .execute(
             "UPDATE jobs SET state='failed', progress=1.0, message=?1, finished_at=?2
              WHERE state='running'",
-            params!["内核重启，任务已中断，请重新发起", now_iso()],
+            params!["应用已重启。重新开始时会从已保存的阶段继续。", now_iso()],
         )
         .unwrap_or(0);
     let questions = db
         .conn
         .execute(
-            "UPDATE questions SET status='inbox' WHERE status='researching'",
+            "UPDATE questions SET status=CASE WHEN EXISTS(SELECT 1 FROM drafts WHERE question_id=questions.id)
+             THEN 'pending_review' ELSE 'inbox' END WHERE status='researching'",
             [],
         )
         .unwrap_or(0);
@@ -403,7 +404,7 @@ async fn sync_inner(
     for id in selected_ids {
         let st = state.clone();
         tokio::spawn(async move {
-            let _ = run_research(&st, &id).await;
+            let _ = start_research(&st, &id).await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     }
@@ -437,7 +438,7 @@ pub async fn run_profile_job(state: &AppState, job: String) -> Result<()> {
 }
 
 async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
-    let (url_token, cookie_empty) = {
+    let (url_token, account_id, cookie_empty) = {
         let db = state.db.lock().await;
         let tok: String = db
             .conn
@@ -449,7 +450,14 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
             .conn
             .query_row("SELECT cookie FROM account WHERE id = 1", [], |r| r.get(0))
             .unwrap_or_default();
-        (tok, ck.trim().is_empty())
+        let account_id = db
+            .conn
+            .query_row("SELECT zhihu_id FROM account WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .unwrap_or_default();
+        (tok, account_id, ck.trim().is_empty())
     };
     if cookie_empty {
         anyhow::bail!("请先登录知乎账号");
@@ -487,7 +495,7 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
             json!({
                 "kind": "answer",
                 "title": a.pointer("/question/title").and_then(|x| x.as_str()).unwrap_or(""),
-                "text": a.get("excerpt").and_then(|x| x.as_str()).unwrap_or(""),
+                "text": sample_text(a),
                 "voteups": a.get("voteup_count").and_then(|x| x.as_i64()).unwrap_or(0),
             })
         })
@@ -495,7 +503,7 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
             json!({
                 "kind": "article",
                 "title": a.get("title").and_then(|x| x.as_str()).unwrap_or(""),
-                "text": a.get("excerpt").and_then(|x| x.as_str()).unwrap_or(""),
+                "text": sample_text(a),
                 "voteups": a.get("voteup_count").and_then(|x| x.as_i64()).unwrap_or(0),
             })
         }))
@@ -548,6 +556,15 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
 
     {
         let db = state.db.lock().await;
+        let current_account: String =
+            db.conn
+                .query_row("SELECT zhihu_id FROM account WHERE id=1", [], |row| {
+                    row.get(0)
+                })?;
+        anyhow::ensure!(
+            current_account == account_id && !account_id.is_empty(),
+            "分析期间账号已切换，未保存文风样本"
+        );
         // 用户手动锁定的词条保留
         let locked: Vec<String> = {
             let mut stmt = db
@@ -604,6 +621,16 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
                 now_iso()
             ],
         );
+        db.conn.execute(
+            "INSERT OR REPLACE INTO writing_samples (account_id, samples) VALUES (?1, ?2)",
+            params![
+                account_id,
+                resp.get("samples")
+                    .cloned()
+                    .unwrap_or(json!([]))
+                    .to_string()
+            ],
+        )?;
         db.log_event(
             "profile",
             None,
@@ -616,6 +643,18 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
     job_step(state, job, "关联来源", 0.9, "正在关联对应的权威平台").await;
     let _ = run_discover_sources(state).await;
     Ok(())
+}
+
+fn sample_text(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| value.get("excerpt").and_then(Value::as_str))
+        .unwrap_or_default()
+        .chars()
+        .take(32000)
+        .collect()
 }
 
 // ---------------- 权威平台 ----------------
@@ -716,83 +755,103 @@ async fn discover_inner(state: &AppState, job: &str) -> Result<()> {
 
 /// 同时最多跑两份稿子。三份以上一起打同一个模型 Key，既容易限流，
 /// 也会让每一份都慢到让人以为卡死。
-pub async fn run_research(state: &AppState, question_id: &str) -> Result<()> {
-    // 同一问题已在跑就直接返回，别叠出第二个幽灵任务
-    {
-        let db = state.db.lock().await;
-        let running: i64 = db
-            .conn
+pub async fn start_research(state: &crate::state::Shared, question_id: &str) -> Result<String> {
+    let job = {
+        let mut db = state.db.lock().await;
+        let tx = db.conn.transaction()?;
+        if let Some(existing) = tx
             .query_row(
-                "SELECT COUNT(*) FROM jobs WHERE kind='research' AND question_id=?1 AND state='running'",
+                "SELECT id FROM jobs WHERE kind='research' AND question_id=?1 AND state='running'",
                 params![question_id],
-                |r| r.get(0),
+                |row| row.get(0),
             )
-            .unwrap_or(0);
-        if running > 0 {
-            tracing::info!(target: "jobs", qid = %question_id, "该问题已有拟稿任务在跑，跳过重复启动");
-            return Ok(());
+            .optional()?
+        {
+            return Ok(existing);
         }
-    }
-
-    let job = job_start(state, "research", Some(question_id), "排队中").await;
-    let _slot = match state.research_slots.acquire().await {
-        Ok(s) => s,
-        Err(_) => return Ok(()),
-    };
-    job_step(state, &job, "准备", 0.05, "已获得拟稿名额，准备检索").await;
-    let r = research_inner(state, question_id, &job).await;
-    match &r {
-        Ok(_) => job_end(state, &job, true, "初稿已就绪，等待人工批阅").await,
-        Err(e) => {
-            job_end(state, &job, false, &format!("{e}")).await;
-            let db = state.db.lock().await;
-            let _ = db.conn.execute(
-                "UPDATE questions SET status='inbox' WHERE id=?1 AND status='researching'",
+        let status: String = tx
+            .query_row(
+                "SELECT status FROM questions WHERE id=?1",
                 params![question_id],
-            );
-        }
-    }
-    r
-}
-
-/// 调智能体期间持续更新进度。用户至少能看到「已经跑了多少秒」，
-/// 而不是一个永远不动的转圈。
-async fn agent_research_with_progress(
-    state: &AppState,
-    job: &str,
-    payload: &Value,
-    hard_deadline: std::time::Duration,
-) -> Result<Value> {
-    let started = std::time::Instant::now();
-    let fut = state.agent.post("/v1/research", payload);
-    tokio::pin!(fut);
-    let mut last_note = 0u64;
-    loop {
-        tokio::select! {
-            r = &mut fut => return r,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
-                let elapsed = started.elapsed().as_secs();
-                if started.elapsed() > hard_deadline {
-                    anyhow::bail!(
-                        "智能体 {} 秒仍没有返回，已中止。请检查模型网络是否正常，或换一个更快的模型",
-                        hard_deadline.as_secs()
-                    );
-                }
-                let note = elapsed / 15;
-                if note != last_note {
-                    last_note = note;
-                    job_step(
-                        state,
-                        job,
-                        "起草",
-                        0.5,
-                        &format!("智能体正在检索资料、起草并核对（已用 {elapsed} 秒）"),
-                    )
-                    .await;
-                }
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("问题不存在"))?;
+        let resume = tx
+            .query_row(
+                "SELECT 1 FROM research_checkpoints WHERE question_id=?1",
+                params![question_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let has_draft = tx
+            .query_row(
+                "SELECT 1 FROM drafts WHERE question_id=?1 AND trim(markdown)<>''",
+                params![question_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        anyhow::ensure!(
+            matches!(status.as_str(), "inbox" | "pending_review"),
+            "该问题已归档，不能拟稿"
+        );
+        anyhow::ensure!(
+            !has_draft || resume,
+            "已有正文。为避免覆盖手工改动，不会重新生成。"
+        );
+        let job = format!("j_{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO jobs (id, kind, question_id, stage, message, started_at) VALUES (?1,'research',?2,'排队','等待拟稿名额',?3)",
+            params![job, question_id, now_iso()],
+        )?;
+        tx.execute(
+            "UPDATE questions SET status='researching' WHERE id=?1",
+            params![question_id],
+        )?;
+        tx.commit()?;
+        job
+    };
+    let job_id = job.clone();
+    let qid = question_id.to_owned();
+    let state = state.clone();
+    tokio::spawn(async move {
+        let Ok(_slot) = state.research_slots.acquire().await else {
+            return;
+        };
+        let result = research_inner(&state, &qid, &job_id).await;
+        let db = state.db.lock().await;
+        let _ = db.conn.execute(
+            "UPDATE questions SET status=CASE WHEN EXISTS(SELECT 1 FROM drafts WHERE question_id=?1)
+             THEN 'pending_review' ELSE 'inbox' END WHERE id=?1 AND status='researching'",
+            params![qid],
+        );
+        drop(db);
+        match result {
+            Ok(()) => job_end(&state, &job_id, true, "初稿和素材已保存，等待人工批阅").await,
+            Err(error) => {
+                job_end(
+                    &state,
+                    &job_id,
+                    false,
+                    &format!("{error} 已保存的阶段不会丢失。"),
+                )
+                .await
             }
         }
-    }
+    });
+    Ok(job)
+}
+
+async fn agent_stage(state: &AppState, path: &str, payload: &Value, seconds: u64) -> Result<Value> {
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(seconds),
+        state.agent.post(path, payload),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("当前阶段超时，请重试或检查网络与模型配置。"))??;
+    agent_ok(&response)?;
+    Ok(response)
 }
 
 async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
@@ -898,122 +957,149 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
         (q, terms, summary, style, src, load_model(&db), s)
     };
 
-    {
-        let db = state.db.lock().await;
-        let _ = db.conn.execute(
-            "UPDATE questions SET status='researching' WHERE id=?1",
-            params![qid],
-        );
-    }
-
     let img_dir = state.data_dir.join("images").join(crate::db::sanitize(qid));
-    std::fs::create_dir_all(&img_dir)?;
-
-    job_step(state, job, "联网检索", 0.2, "抓取权威平台页面").await;
-
-    let payload = json!({
-        "question": question.clone(),
-        "profile": { "summary": meta_summary, "terms": terms, "style": meta_style },
+    let (checkpoint, samples) = {
+        let db = state.db.lock().await;
+        let checkpoint = db
+            .conn
+            .query_row(
+                "SELECT material, drafted FROM research_checkpoints WHERE question_id=?1",
+                params![qid],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?;
+        let samples = db
+            .conn
+            .query_row(
+                "SELECT samples FROM writing_samples WHERE account_id=(SELECT zhihu_id FROM account WHERE id=1 AND cookie<>'')",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        (
+            checkpoint,
+            serde_json::from_str::<Value>(&samples).unwrap_or(json!([])),
+        )
+    };
+    let mut payload = json!({
+        "question": question,
+        "profile": { "summary": meta_summary, "terms": terms, "style": meta_style, "samples": samples },
         "sources": sources,
         "model": model,
         "settings": settings,
         "imagesDir": img_dir.to_string_lossy(),
-        "imagesUrlBase": format!("/api/images/{}", qid),
-        "deadlineSeconds": 300,
     });
-
-    job_step(state, job, "起草", 0.45, "检索权威资料、起草并核对疑问点").await;
-    let resp =
-        agent_research_with_progress(state, job, &payload, std::time::Duration::from_secs(420))
-            .await?;
-    agent_ok(&resp)?;
-
-    let markdown = resp
-        .pointer("/draft/markdown")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    if markdown.trim().is_empty() {
-        anyhow::bail!("智能体没有返回正文");
-    }
-    let doubts = resp.pointer("/draft/doubts").cloned().unwrap_or(json!([]));
-    let citations = resp
-        .pointer("/draft/citations")
-        .cloned()
-        .unwrap_or(json!([]));
-    let images = resp
-        .get("images")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let warnings: Vec<String> = resp
-        .get("warnings")
-        .and_then(|x| x.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let used_model = resp
-        .get("model")
-        .and_then(|x| x.as_str())
-        .unwrap_or(&model.model)
-        .to_string();
-
-    let step_note = if warnings.is_empty() {
-        format!("{} 张配图", images.len())
-    } else {
-        format!("{} 张配图；{}", images.len(), warnings.join("；"))
+    let (material, drafted) = match checkpoint {
+        Some((material, drafted)) => (serde_json::from_str(&material)?, drafted),
+        None => {
+            job_step(state, job, "取材", 0.18, "搜索资料并筛选可引用正文").await;
+            let material = agent_stage(state, "/v1/research/collect", &payload, 50).await?;
+            let db = state.db.lock().await;
+            db.conn.execute(
+                "INSERT INTO research_checkpoints (question_id, material) VALUES (?1,?2)",
+                params![qid, material.to_string()],
+            )?;
+            (material, false)
+        }
     };
-    job_step(state, job, "校对与取图", 0.8, &step_note).await;
-
-    let word_count = markdown.chars().filter(|c| !c.is_whitespace()).count() as i64;
-    let warnings_json = serde_json::to_string(&warnings).unwrap_or_else(|_| "[]".into());
-
-    {
-        let db = state.db.lock().await;
-        let _ = db.conn.execute(
+    payload["material"] = material;
+    if !drafted {
+        job_step(state, job, "拟稿", 0.43, "资料已保存，正在生成正文").await;
+        let response = agent_stage(state, "/v1/research/draft", &payload, 145).await?;
+        let markdown = response
+            .pointer("/draft/markdown")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        anyhow::ensure!(!markdown.is_empty(), "模型没有返回有效正文");
+        let count = markdown
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .count() as i64;
+        let mut db = state.db.lock().await;
+        let tx = db.conn.transaction()?;
+        let written = tx.execute(
             "INSERT INTO drafts (question_id, markdown, doubts, citations, model, word_count, updated_at, warnings)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(question_id) DO UPDATE SET markdown=?2, doubts=?3, citations=?4, model=?5, word_count=?6, updated_at=?7, warnings=?8",
-            params![qid, markdown, doubts.to_string(), citations.to_string(), used_model, word_count, now_iso(), warnings_json],
-        );
-        let _ = db
-            .conn
-            .execute("DELETE FROM images WHERE question_id=?1", params![qid]);
-        for img in &images {
-            let filename = img.get("filename").and_then(|x| x.as_str()).unwrap_or("");
-            if filename.is_empty() {
-                continue;
-            }
-            let bytes = std::fs::metadata(img_dir.join(filename))
-                .map(|m| m.len() as i64)
-                .unwrap_or(0);
-            let _ = db.conn.execute(
-                "INSERT INTO images (id, question_id, filename, source_url, source_name, caption, bytes, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    format!("i_{}", Uuid::new_v4().simple()),
-                    qid,
-                    filename,
-                    img.get("sourceUrl").and_then(|x| x.as_str()).unwrap_or(""),
-                    img.get("sourceName").and_then(|x| x.as_str()).unwrap_or(""),
-                    img.get("caption").and_then(|x| x.as_str()).unwrap_or(""),
-                    bytes,
-                    now_iso()
-                ],
-            );
-        }
-        let _ = db.conn.execute(
-            "UPDATE questions SET status='pending_review', bucket='selected' WHERE id=?1",
+             ON CONFLICT(question_id) DO UPDATE SET markdown=?2, doubts=?3, citations=?4, model=?5,
+             word_count=?6, updated_at=?7, warnings=?8 WHERE trim(drafts.markdown)=''",
+            params![qid, markdown, response["draft"]["doubts"].to_string(), response["draft"]["citations"].to_string(),
+                model.model, count, now_iso(), response["warnings"].to_string()],
+        )?;
+        anyhow::ensure!(written == 1, "已有手工正文，未覆盖任何改动");
+        tx.execute(
+            "UPDATE research_checkpoints SET drafted=1 WHERE question_id=?1",
             params![qid],
-        );
-        let title = question.title.clone();
-        db.log_event("research", Some(qid), "初稿生成完毕", &title);
+        )?;
+        tx.execute(
+            "UPDATE questions SET bucket='selected' WHERE id=?1",
+            params![qid],
+        )?;
+        tx.commit()?;
     }
 
+    let raw_doubts: String = state.db.lock().await.conn.query_row(
+        "SELECT doubts FROM drafts WHERE question_id=?1",
+        params![qid],
+        |row| row.get(0),
+    )?;
+    payload["doubts"] = serde_json::from_str(&raw_doubts)?;
+    job_step(
+        state,
+        job,
+        "补充核查与配图",
+        0.76,
+        "正文已保存并可编辑；正在补充核查与配图",
+    )
+    .await;
+    let (review, images) = tokio::join!(
+        agent_stage(state, "/v1/research/review", &payload, 42),
+        agent_stage(state, "/v1/research/images", &payload, 26),
+    );
+    let mut db = state.db.lock().await;
+    let tx = db.conn.transaction()?;
+    if let Ok(review) = &review {
+        tx.execute(
+            "UPDATE drafts SET doubts=?2 WHERE question_id=?1",
+            params![qid, review["doubts"].to_string()],
+        )?;
+    }
+    if let Ok(result) = &images {
+        for image in result["images"].as_array().into_iter().flatten() {
+            let filename = image["filename"].as_str().unwrap_or_default();
+            if filename.len() != 36
+                || !filename.ends_with(".png")
+                || !filename[..32].bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            let Ok(metadata) = std::fs::metadata(img_dir.join(filename)) else {
+                continue;
+            };
+            tx.execute(
+                "INSERT INTO images (id, question_id, filename, source_url, source_name, caption, bytes, created_at)
+                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS
+                 (SELECT 1 FROM images WHERE question_id=?2 AND filename=?3)",
+                params![format!("i_{}", Uuid::new_v4().simple()), qid, filename,
+                    image["sourceUrl"].as_str().unwrap_or_default(), image["sourceName"].as_str().unwrap_or_default(),
+                    image["caption"].as_str().unwrap_or_default(), metadata.len() as i64, now_iso()],
+            )?;
+        }
+    }
+    if review.is_ok() && images.is_ok() {
+        tx.execute(
+            "DELETE FROM research_checkpoints WHERE question_id=?1",
+            params![qid],
+        )?;
+    }
+    tx.commit()?;
+    if let Err(error) = review {
+        anyhow::bail!("正文已保存，核查未完成：{error}");
+    }
+    if let Err(error) = images {
+        anyhow::bail!("正文已保存，配图未完成：{error}");
+    }
     Ok(())
 }
 

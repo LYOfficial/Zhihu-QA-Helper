@@ -38,8 +38,10 @@
 - **通知同步**：使用知乎账号登录，按设定时间同步邀请回答和推荐回答；首次登录或本地问题为空时，自动补齐最近 3 天的内容。
 - **领域画像**：从历史回答与文章中归纳主领域、子领域和附属领域，同时归纳**文风档案**（语气、结构套路、句式节奏、口头禅、排版习惯、忌用写法与一段可执行的写作指令），拟稿时逐条照着写；画像页可直接修改写作指令。
 - **智能筛选**：根据个人领域画像计算问题契合度，将内容划分为重点队列和待阅队列。
-- **资料核查**：只从你配置的权威平台检索资料、核对存疑点，并生成可编辑初稿；配图也从这些平台挑选（平台在「权威平台」里勾选了「取图」才会用），通用搜索兜底来的页面不参与取图。
-- **批阅台**：集中查看素材、来源与存疑点，支持 Markdown 编辑、预览、自动保存和跳转知乎。初稿正文**不含任何图片**，配图由你在左侧素材里挑选后插到光标处，插完光标与滚动位置都留在原地。
+- **分阶段拟稿**：先保存取材结果和纯文字初稿，再并行补充配图与核查。任务中断后，在写作台点击「继续上次任务」即可从已保存的阶段接着做。补充核查不会覆盖你的正文。
+- **资料与配图**：配图只从显式允许取图的来源正文中挑选，过滤无关图片、缩略图和近似重复。通用网页只作为资料线索，不参与配图；缺乏证据的疑点标为未核实。
+- **写作台**：支持 Markdown 编辑、预览、自动保存和跳转知乎。切换问题或关闭窗口前尚未写入数据库的正文，在同一应用中可从本机恢复。初稿不含图片，请核对来源与使用权限后再手动插图、发布。
+- **文风参考**：更新领域画像后，本机会保留少量真实回答片段。拟稿时最多将两则关联片段与问题、资料一同发给你配置的模型，以参考段落、句式和节奏。只有旧画像而没有原文样本时，请重新分析画像。
 - **模型库**：自动同步 `models.dev` 开源目录，覆盖 OpenAI、Claude、DeepSeek、智谱 GLM、Kimi、通义千问和 MiniMax；网络不可用时使用内置清单。目录里每个模型的 `limit.context` / `limit.output` 会一并存入配置，拟稿时按真实上下文容量决定一次性能喂多少资料、输出上限开多大，不会再把长文截断成半截 JSON。
 - **本地化体验**：提供知乎现代蓝与宣纸印章黄两套主题；数据保存在本机，Tauri 托盘常驻，关闭窗口后仍可定时值守。
 - **归档清理**：已回答或弃用的问题会归档正文，并清理对应的本地图片缓存。
@@ -78,7 +80,7 @@
 | 桌面壳 | Tauri v2 | Windows 窗口、系统托盘与本地集成 |
 | 前端 | Next.js、React、TypeScript | 界面、主题、批阅台与进度展示 |
 | 本地内核 | Rust、Axum、SQLite | 本地 API、数据存储、知乎同步与任务调度 |
-| 智能体 | Python 标准库 | 模型适配、资料整理、领域画像与初稿生成 |
+| 智能体 | Python + Pillow | 模型适配、资料整理、图片筛选、领域画像与初稿生成 |
 
 所有服务默认只监听本机回环地址。知乎 Cookie、草稿、图片和数据库均保存在本机数据目录中。
 
@@ -92,10 +94,13 @@
 - Python 3.10 或更高版本
 - WebView2 Runtime
 
+Windows 安装版已内置智能体和 Python 运行时，无需另外安装 Node.js、Rust 或 Python。
+
 ### 启动项目
 
 ```powershell
 npm install
+python -m pip install -r agents/requirements.txt
 
 # 桌面开发模式：Next 热更新 + Rust 内核 + Tauri 窗口
 npm run dev
@@ -148,20 +153,16 @@ Compress-Archive -Path dist\portable\* -DestinationPath dist\zhihu-qa-helper-por
 <details>
 <summary><strong>生成 NSIS 安装包</strong></summary>
 
-先安装 Tauri CLI：
-
 ```powershell
-cargo install tauri-cli --version "^2"
+npm ci
+python -m pip install -r agents/requirements-build.txt
+npm run build:nsis
 ```
 
-然后构建安装包：
+使用 Windows x64、对应架构的 Node.js/Python 和 MSVC 工具链构建。输出位于 `target\nsis-build\release\bundle\nsis\`，安装包内含前端、本地内核及图像处理依赖。可用 `ZHIHU_QA_BUILD_PYTHON` 指定构建环境中的 Python 路径。
 
-```powershell
-npm run build:web
-cargo tauri build --bundles nsis
-```
-
-安装包位于 `target\release\bundle\nsis\`。
+回归检查：`python -m unittest discover -s agents -v`、`cargo test --locked -p zhihu-qa-core`。
+构建后可运行 `python scripts/smoke-test.py`；它使用临时数据库和模拟模型测试断点续跑，不会访问你的知乎账号。选装 Playwright 后，加上 `--screenshots shots/smoke` 可验证界面并输出截图。
 
 </details>
 
