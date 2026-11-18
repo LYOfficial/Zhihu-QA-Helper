@@ -34,4 +34,4 @@ for (const resource of Object.keys(resources)) {
   if (!existsSync(resolve(desktop, resource))) throw new Error(`缺少安装资源：${resource}`);
 }
 run(process.execPath, [resolve(root, "node_modules/@tauri-apps/cli/tauri.js"),
-  "build", "--ci", "--bundles", "nsis", "--config", JSON.stringify({ bundle: { resources } })], desktop);
+  "build", "--ci", "--features", "installed-runtime", "--bundles", "nsis", "--config", JSON.stringify({ bundle: { resources } })], desktop);

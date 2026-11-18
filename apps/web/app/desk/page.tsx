@@ -2,6 +2,7 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import React, { Suspense } from "react";
+import { createPortal } from "react-dom";
 import {
   Empty,
   IconCheck,
@@ -18,6 +19,83 @@ import {
 import { api, imageSrc, openExternal, toast } from "@/lib/api";
 import { useCopy, useLoad } from "@/lib/hooks";
 import type { Draft, Job, Question, Settings } from "@/lib/types";
+
+function IllustrationTools({ question, disabled, onImages }: {
+  question: Question;
+  disabled: boolean;
+  onImages: (id: string, assets: Draft["images"]) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [query, setQuery] = React.useState("");
+  const [sourceUrl, setSourceUrl] = React.useState("");
+  const [file, setFile] = React.useState<File | null>(null);
+  const [busy, setBusy] = React.useState<"search" | "import" | null>(null);
+  const [notice, setNotice] = React.useState("");
+  const base = `/api/images/${encodeURIComponent(question.id)}`;
+  const keywords = query.trim() || question.title;
+
+  async function run(action: "search" | "import") {
+    if (busy || disabled) return;
+    if (action === "import" && (!file || file.size > 6_000_000)) {
+      setNotice("请选择不超过 6 MB 的 PNG、JPEG 或 WebP 图片。");
+      return;
+    }
+    setBusy(action);
+    setNotice(action === "search" ? "正在搜索公开图源并筛除重复图片，最多约 25 秒。" : "正在检查图片并去重…");
+    try {
+      let result: { added: number };
+      if (action === "search") {
+        result = await api.post(base, { query: query.trim() });
+      } else if (file) {
+        const imageData = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(new Error("无法读取图片文件"));
+          reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+          reader.readAsDataURL(file);
+        });
+        result = await api.post(`${base}/import`, { imageData, sourceUrl, caption: file.name.replace(/\.[^.]+$/, "") });
+      } else {
+        return;
+      }
+      onImages(question.id, await api.get<Draft["images"]>(base));
+      setNotice(result.added ? `已加入 ${result.added} 张备选图，正文未改动。` : action === "import"
+        ? "已有相同或相似的图片，未重复添加。"
+        : "没有新增合适的配图。试试更短的关键词、英文名称，或在浏览器找到后导入。");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "配图操作未完成，请重试。");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return <>
+    <button className="btn btn-sm" onClick={() => setOpen(true)} disabled={disabled}>找配图</button>
+    {open && createPortal(<Modal title="找配图" sub="图片只加入备选，不改正文。使用前请核对可见水印、出处和转载许可。"
+      onClose={() => { if (!busy) setOpen(false); }} width={490}>
+      <div className="illustration-tools">
+        <label>搜图关键词或公开帖子链接 <input className="input" value={query} onChange={(event) => setQuery(event.target.value)}
+          placeholder={question.title} maxLength={2048} disabled={!!busy} /></label>
+        <div className="illustration-actions">
+          <button className="btn btn-sm" disabled={disabled || !!busy} onClick={() => void run("search")}>
+            {busy === "search" ? "正在搜图…" : "自动搜图"}
+          </button>
+          <button className="btn btn-sm" onClick={() => void openExternal(keywords.startsWith("https://") ? keywords : `https://www.bing.com/images/search?q=${encodeURIComponent(keywords)}`)}>
+            <IconExternal size={13} /> 浏览器搜图
+          </button>
+        </div>
+        <p className="dim">支持全网搜图、Wikimedia Commons，也可粘贴百度贴吧、知乎或小黑盒的公开帖子链接。打不开或明确带水印的候选会跳过。</p>
+        <label>导入本地图片 <input className="input" type="file" accept="image/png,image/jpeg,image/webp"
+          onChange={(event) => setFile(event.target.files?.[0] ?? null)} disabled={!!busy} /></label>
+        <label>来源网页（可选） <input className="input" type="url" value={sourceUrl} maxLength={2048}
+          onChange={(event) => setSourceUrl(event.target.value)} placeholder="https://…" disabled={!!busy} /></label>
+        <div><button className="btn btn-sm" disabled={!file || disabled || !!busy} onClick={() => void run("import")}>
+          {busy === "import" ? "正在导入…" : "加入备选"}
+        </button></div>
+        {notice && <p className="dim" role="status">{notice}</p>}
+      </div>
+    </Modal>, document.body)}
+  </>;
+}
 
 /* ------------------------------------------------------------ markdown 渲染 */
 
@@ -273,6 +351,8 @@ function DeskInner() {
   const { copy } = useCopy();
 
   const draftId = current?.id ?? "";
+  const viewedDraft = React.useRef(draftId);
+  viewedDraft.current = draftId;
 
   React.useEffect(() => {
     if (!draftId) return;
@@ -557,7 +637,9 @@ function DeskInner() {
             </div>
           )}
 
-          <SectionTitle count={images.length} right={<span className="dim">拖动或点击插入</span>}>
+          <SectionTitle count={images.length} right={<IllustrationTools key={draftId} question={current}
+            disabled={processing || loadedId !== draftId}
+            onImages={(id, assets) => { if (viewedDraft.current === id) setImages(assets); }} />}>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
               <IconImage size={13} /> 配图
             </span>
@@ -565,7 +647,7 @@ function DeskInner() {
 
           {images.length === 0 ? (
             <p className="dim" style={{ fontSize: 11.5, marginBottom: 18, lineHeight: 1.7 }}>
-              暂无配图。拟稿时会从你配置的权威平台挑几张备选，点一下插到光标处；正文本身不会自动带图。
+              暂无配图。可以点击「找配图」自动搜索，也可以在浏览器找图后导入。备选图不会自动插入正文。
             </p>
           ) : (
             <div className="img-grid" style={{ marginBottom: 20 }}>
@@ -588,6 +670,10 @@ function DeskInner() {
                     draggable={false}
                   />
                   <div className="img-cap">{img.caption || img.filename}</div>
+                  {img.sourceUrl && <button className="illustration-source" title={img.sourceName}
+                    onClick={(event) => { event.stopPropagation(); void openExternal(img.sourceUrl); }}>
+                    <IconExternal size={11} /> {img.sourceName || "查看出处"}
+                  </button>}
                 </div>
               ))}
             </div>

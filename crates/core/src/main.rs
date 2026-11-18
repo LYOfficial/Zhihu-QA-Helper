@@ -13,7 +13,7 @@ mod zhihu;
 
 use anyhow::Result;
 use axum::http::{header, HeaderValue, Method};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -85,6 +85,8 @@ fn spawn_agent(
         .arg(data_dir)
         .arg("--parent-pid")
         .arg(std::process::id().to_string())
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
     #[cfg(windows)]
@@ -140,6 +142,35 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8787);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+        tracing::error!(%addr, %error, "内核端口无法监听");
+        error
+    })?;
+    let runtime = std::env::var_os("ZHIHU_QA_RUNTIME").map(PathBuf::from);
+    let desktop_child = std::env::var_os("ZHIHU_QA_DESKTOP_CHILD").is_some();
+    let _data_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(data_dir.join("core.lock"))?;
+    if let Err(error) = _data_lock.try_lock() {
+        tracing::error!(%error, "数据目录已被另一内核占用，请从托盘退出另一实例");
+        anyhow::bail!("数据目录已被另一内核占用");
+    }
+    if runtime.is_some() && port != 8787 && legacy_uses_data(&data_dir).await {
+        tracing::error!("旧版内核仍在使用此数据目录，请从托盘退出旧版");
+        anyhow::bail!("旧版内核仍在使用此数据目录");
+    }
+    let web_out = runtime
+        .as_ref()
+        .map(|path| path.join("web"))
+        .unwrap_or_else(|| PathBuf::from("apps/web/.build"));
+    let index = web_out.join("index.html");
+    if runtime.is_some() && !index.is_file() {
+        tracing::error!(path = %index.display(), "缺少安装版前端，请重新安装");
+        anyhow::bail!("缺少安装版前端");
+    }
     let agent_port: u16 = std::env::var("ZHIHU_QA_AGENT_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -148,7 +179,6 @@ async fn main() -> Result<()> {
     let database = db::Db::open(&data_dir)?;
     let state = state::AppState::new(database, data_dir.clone(), agent_port);
 
-    let runtime = std::env::var_os("ZHIHU_QA_RUNTIME").map(PathBuf::from);
     let _agent = spawn_agent(agent_port, &data_dir, runtime.as_deref());
     tasks::recover_stale_jobs(&state).await;
     scheduler::spawn(state.clone());
@@ -159,10 +189,6 @@ async fn main() -> Result<()> {
     });
 
     // 静态前端：优先 apps/web/.build（next export 的产物），否则给一个提示页
-    let web_out = runtime
-        .map(|path| path.join("web"))
-        .unwrap_or_else(|| PathBuf::from("apps/web/.build"));
-    let index = web_out.join("index.html");
     let mut app = api::router(state.clone()).layer(
         CorsLayer::new()
             .allow_origin([
@@ -181,6 +207,12 @@ async fn main() -> Result<()> {
     );
 
     if index.exists() {
+        if desktop_child {
+            app = app.route(
+                "/__desktop_ready",
+                axum::routing::get(|| async { std::process::id().to_string() }),
+            );
+        }
         app = app.fallback_service(ServeDir::new(&web_out).fallback(ServeFile::new(&index)));
         tracing::info!("静态前端：{}", web_out.display());
     } else {
@@ -199,13 +231,52 @@ async fn main() -> Result<()> {
         });
     }
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("知乎答主助手 已就绪 → http://{addr}");
     tracing::info!("数据目录：{}", data_dir.display());
 
-    axum::serve(listener, app).await?;
+    if desktop_child {
+        let (close, closed) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = std::io::stdin().read(&mut [0]);
+            let _ = close.send(());
+        });
+        tokio::select! {
+            result = axum::serve(listener, app) => result?,
+            _ = closed => {},
+        }
+    } else {
+        axum::serve(listener, app).await?;
+    }
     Ok(())
+}
+
+async fn legacy_uses_data(data_dir: &std::path::Path) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+    let Ok(response) = client.get("http://127.0.0.1:8787/api/health").send().await else {
+        return false;
+    };
+    let Ok(health) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    let Some(old_dir) = health["dataDir"].as_str() else {
+        return false;
+    };
+    match (
+        data_dir.canonicalize(),
+        std::path::Path::new(old_dir).canonicalize(),
+    ) {
+        (Ok(current), Ok(previous)) if cfg!(windows) => current
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&previous.to_string_lossy()),
+        (Ok(current), Ok(previous)) => current == previous,
+        _ => false,
+    }
 }
 
 fn dotenv_lite() -> Option<()> {

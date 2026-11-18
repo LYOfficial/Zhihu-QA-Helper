@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import os
 import socket
@@ -79,6 +80,16 @@ class Agent(BaseHTTPRequestHandler):
             self.send({"doubts": [{**doubt, "verdict": "现有资料不足"} for doubt in payload["doubts"]]})
         elif stage == "images":
             self.send({"images": []})
+        elif stage == "import":
+            filename = "a" * 32 + ".png"
+            if filename in payload["existingImages"]:
+                self.send({"images": []})
+                return
+            folder = Path(payload["imagesDir"])
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / filename).write_bytes(base64.b64decode(payload["imageData"]))
+            self.send({"images": [{"filename": filename, "caption": payload["caption"],
+                                   "sourceName": "手动导入", "sourceUrl": payload["sourceUrl"]}]})
         else:
             self.send({"ok": True})
 
@@ -184,6 +195,21 @@ class Smoke:
             wait_for(lambda: self.draft()["markdown"] == updated)
             page.get_by_role("button", name="预览", exact=True).click()
             page.get_by_text("离开页面前输入的文字。", exact=True).wait_for()
+            page.get_by_role("button", name="找配图", exact=True).click()
+            search = page.get_by_role("button", name="自动搜图")
+            search.click()
+            page.get_by_role("status").filter(has_text="没有新增合适的配图").wait_for()
+            page.get_by_label("导入本地图片").set_input_files(ROOT / "crates/desktop/icons/128x128.png")
+            page.get_by_label("来源网页（可选）").fill("https://example.org/source")
+            page.get_by_role("button", name="加入备选").click()
+            page.get_by_role("status").filter(has_text="已加入 1 张备选图").wait_for()
+            page.get_by_role("button", name="加入备选").click()
+            page.get_by_role("status").filter(has_text="未重复添加").wait_for()
+            page.screenshot(path=output / "illustration-tools.png")
+            page.locator(".modal").get_by_role("button", name="关闭", exact=True).click()
+            assert self.draft()["markdown"] == updated
+            assets = self.request("/images/rail")
+            assert len(assets) == 1 and assets[0]["sourceUrl"] == "https://example.org/source"
             page.screenshot(path=output / "workbench.png")
             page.set_viewport_size({"width": 820, "height": 600})
             page.screenshot(path=output / "workbench-narrow.png")
@@ -194,7 +220,7 @@ class Smoke:
             assert editor.input_value() == ""
             assert not errors, errors
             browser.close()
-            print("PASS 界面：登录可重试、Logo 对齐、刷新恢复、预览、窄窗口、切换问题")
+            print("PASS 界面：登录可重试、Logo 对齐、刷新恢复、搜图、导入去重、窄窗口、切换问题")
 
 
 def main():

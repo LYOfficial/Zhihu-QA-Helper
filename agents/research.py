@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import base64
+from html import unescape
 import gzip
 import hashlib
 import io
@@ -76,20 +78,37 @@ def _decode(raw: bytes, charset: str | None) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def fetch(url: str, referer: str = "", timeout: int = 12, max_bytes: int = 3_000_000):
+class _RestrictedRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allowed):
+        self.allowed = allowed
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not self.allowed(newurl):
+            raise urllib.error.URLError("不允许访问跳转后的地址")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch(url: str, referer: str = "", timeout: int = 12, max_bytes: int = 3_000_000, allowed=None):
     if _is_bad(url):
         raise urllib.error.URLError("该站点刚才已失败，本次跳过")
+    if allowed is not None and not allowed(url):
+        raise ValueError("不允许访问此地址")
     req = urllib.request.Request(url, method="GET")
     req.add_header("User-Agent", UA)
     req.add_header("Accept", "text/html,application/xhtml+xml,image/*,*/*;q=0.8")
     req.add_header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-    req.add_header("Accept-Encoding", "gzip, deflate")
+    req.add_header("Accept-Encoding", "identity" if allowed else "gzip, deflate")
     if referer:
         req.add_header("Referer", referer)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(max_bytes)
+        opener = urllib.request.build_opener(_RestrictedRedirect(allowed)).open if allowed else urllib.request.urlopen
+        with opener(req, timeout=timeout) as resp:
+            raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ValueError("响应体过大")
             enc = resp.headers.get("Content-Encoding", "")
+            if allowed and enc not in {"", "identity"}:
+                raise ValueError("受限图源返回了意外的压缩格式")
             if "gzip" in enc:
                 try:
                     raw = gzip.decompress(raw)
@@ -117,8 +136,9 @@ def fetch(url: str, referer: str = "", timeout: int = 12, max_bytes: int = 3_000
 
 
 class _DocParser(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, image_markers=None) -> None:
         super().__init__(convert_charrefs=True)
+        self.image_markers = image_markers
         self.chunks: list[str] = []
         self.content: list[str] = []
         self.images: list[dict] = []
@@ -139,10 +159,13 @@ class _DocParser(HTMLParser):
         markers = set((a.get("class") or "").split()) | {a.get("id")}
         if self._scope == tag:
             self._depth += 1
-        elif not self._scope and (tag in {"article", "main", "figure"} or CONTENT_MARKERS & markers):
+        elif not self._scope and (
+            bool(self.image_markers & markers) if self.image_markers is not None else
+            (tag in {"article", "main", "figure"} or CONTENT_MARKERS & markers)
+        ):
             self._scope, self._depth = tag, 1
         if tag == "img" and self._scope:
-            src = a.get("data-src") or a.get("data-original") or a.get("src") or ""
+            src = a.get("data-original") or a.get("data-src") or a.get("src") or ""
             if src and not any(
                 (a.get(dim) or "").isdigit() and int(a[dim]) < 100 for dim in ("width", "height")
             ):
@@ -188,15 +211,18 @@ class _DocParser(HTMLParser):
         return joined.strip()
 
 
-def parse_doc(html: str, base_url: str):
-    p = _DocParser()
+def parse_doc(html: str, base_url: str, image_markers=None):
+    p = _DocParser(image_markers)
     try:
         p.feed(html)
     except Exception:  # 坏 HTML 不该让整条流水线崩掉
         pass
     imgs = []
     for image in p.images:
-        full = urllib.parse.urljoin(base_url, image["url"])
+        try:
+            full = urllib.parse.urljoin(base_url, image["url"])
+        except ValueError:
+            continue
         if full.startswith(("https://", "http://")):
             imgs.append({**image, "url": full})
     return p.title, p.text(prefer_content=True), imgs
@@ -372,11 +398,11 @@ def gather(query: str, sources: list[dict], max_pages: int = 4, deadline: float 
 BING = "https://cn.bing.com/search?q={q}&setlang=zh-CN"
 
 
-def web_search(query: str, limit: int = 4) -> list[str]:
+def web_search(query: str, limit: int = 4, timeout: int = 10, allowed=None) -> list[str]:
     """通用网页检索兜底：配置的权威平台都抓不到内容时（比如站点被墙或 403），
     至少让拟稿有真实页面可参考，而不是完全凭空写。"""
     try:
-        raw, ctype, charset = fetch(BING.format(q=urllib.parse.quote(query)), timeout=10)
+        raw, _, charset = fetch(BING.format(q=urllib.parse.quote(query)), timeout=timeout)
     except Exception:
         return []
     html = _decode(raw, charset)
@@ -393,10 +419,19 @@ def web_search(query: str, limit: int = 4) -> list[str]:
     )
     out: list[str] = []
     for u in links:
+        u = unescape(u)
+        if _host(u) in {"cn.bing.com", "www.bing.com"}:
+            redirect = urllib.parse.parse_qs(urllib.parse.urlsplit(u).query).get("u", [""])[0]
+            if redirect.startswith("a1"):
+                try:
+                    encoded = redirect[2:]
+                    u = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
+                except (ValueError, UnicodeError):
+                    continue
         host = _host(u)
         if not host or any(bad in host for bad in skip_hosts):
             continue
-        if u in out:
+        if u in out or (allowed is not None and not allowed(u)):
             continue
         out.append(u)
         if len(out) >= limit:
@@ -491,6 +526,13 @@ def _normal_image(raw: bytes) -> tuple[bytes, int, int, float]:
     image.thumbnail((1800, 1800))
     white = Image.new("RGBA", image.size, "white")
     pixels = Image.alpha_composite(white, image).convert("RGB")
+    fingerprint, brightness, ratio = _image_signature(pixels)
+    target = io.BytesIO()
+    pixels.save(target, format="PNG", optimize=False)
+    return target.getvalue(), fingerprint, brightness, ratio
+
+
+def _image_signature(pixels):
     gray = pixels.convert("L").resize((9, 9), Image.Resampling.LANCZOS)
     values = gray.get_flattened_data()
     if max(values) - min(values) < 28:
@@ -501,55 +543,77 @@ def _normal_image(raw: bytes) -> tuple[bytes, int, int, float]:
             fingerprint = (fingerprint << 1) | (value > values[index + 1])
         if index < 72:
             fingerprint = (fingerprint << 1) | (value > values[index + 9])
-    target = io.BytesIO()
-    pixels.save(target, format="PNG", optimize=False)
-    return target.getvalue(), fingerprint, sum(values) // len(values), pixels.width / pixels.height
+    return fingerprint, sum(values) // len(values), pixels.width / pixels.height
+
+
+def _save_image(item, image, out_dir, seen, fingerprints):
+    content, fingerprint, brightness, ratio = image
+    digest = hashlib.sha256(content).hexdigest()
+    filename = digest[:32] + ".png"
+    if filename in seen or any(
+        abs(ratio / previous_ratio - 1) < 0.12 and abs(brightness - previous_brightness) < 22
+        and (fingerprint ^ previous).bit_count() <= 10
+        for previous, previous_brightness, previous_ratio in fingerprints
+    ):
+        return None
+    path = os.path.join(out_dir, filename)
+    if not os.path.exists(path):
+        with tempfile.NamedTemporaryFile(dir=out_dir, delete=False) as temporary:
+            temporary.write(content)
+        try:
+            os.replace(temporary.name, path)
+        finally:
+            if os.path.exists(temporary.name):
+                os.unlink(temporary.name)
+    seen.add(filename)
+    fingerprints.append((fingerprint, brightness, ratio))
+    return {
+        "filename": filename, "sourceUrl": item["page"], "imageUrl": item.get("url", ""),
+        "sourceName": item["sourceName"], "caption": item["caption"], "bytes": len(content),
+    }
+
+
+def existing_signatures(out_dir, existing):
+    signatures = []
+    for filename in existing[:80]:
+        if not re.fullmatch(r"[a-f0-9]{32}\.png", filename):
+            continue
+        try:
+            with Image.open(os.path.join(out_dir, filename), formats=("PNG",)) as image:
+                if image.width * image.height <= 4_000_000:
+                    signatures.append(_image_signature(image))
+        except (OSError, ValueError, Image.DecompressionBombError):
+            pass
+    return signatures
 
 
 def download_images(candidates: list[dict], out_dir: str, want: int = 6,
-                    deadline: float | None = None) -> list[dict]:
+                    deadline: float | None = None, existing=None) -> list[dict]:
     if not candidates or want <= 0:
         return []
     os.makedirs(out_dir, exist_ok=True)
 
     def download(item: dict):
-        raw, _, _ = fetch(item["url"], referer=item["page"], timeout=7, max_bytes=6_000_000)
+        raw, _, _ = fetch(item["url"], referer=item["page"], timeout=5, max_bytes=6_000_000,
+                          allowed=item.get("allowed"))
         return _normal_image(raw)
 
+    existing = existing or []
+    saved, seen, fingerprints = [], set(existing), existing_signatures(out_dir, existing)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     futures = [pool.submit(download, item) for item in candidates]
-    saved, seen, fingerprints = [], set(), []
     try:
         for item, future in zip(candidates, futures):
             try:
-                content, fingerprint, brightness, ratio = future.result(
+                image = future.result(
                     timeout=None if deadline is None else max(0, deadline - time.time())
                 )
             except (ValueError, OSError, Image.DecompressionBombError, concurrent.futures.TimeoutError):
                 continue
-            digest = hashlib.sha256(content).hexdigest()
-            if digest in seen or any(
-                abs(ratio / previous_ratio - 1) < 0.12 and abs(brightness - previous_brightness) < 22
-                and (fingerprint ^ previous).bit_count() <= 10
-                for previous, previous_brightness, previous_ratio in fingerprints
-            ):
+            asset = _save_image(item, image, out_dir, seen, fingerprints)
+            if asset is None:
                 continue
-            filename = digest[:32] + ".png"
-            path = os.path.join(out_dir, filename)
-            if not os.path.exists(path):
-                with tempfile.NamedTemporaryFile(dir=out_dir, delete=False) as temporary:
-                    temporary.write(content)
-                try:
-                    os.replace(temporary.name, path)
-                finally:
-                    if os.path.exists(temporary.name):
-                        os.unlink(temporary.name)
-            seen.add(digest)
-            fingerprints.append((fingerprint, brightness, ratio))
-            saved.append({
-                "filename": filename, "sourceUrl": item["page"], "imageUrl": item["url"],
-                "sourceName": item["sourceName"], "caption": item["caption"], "bytes": len(content),
-            })
+            saved.append(asset)
             if len(saved) >= want:
                 break
     finally:

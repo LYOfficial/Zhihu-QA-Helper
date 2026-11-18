@@ -28,8 +28,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import llm  # noqa: E402
 import prompts  # noqa: E402
 import research  # noqa: E402
+import illustrations
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 DATA_DIR = os.path.join(os.getcwd(), "data")
 
 
@@ -463,8 +464,21 @@ def collect_images(payload: dict) -> dict:
     terms = payload.get("material", {}).get("searchTerms") or []
     topic = " ".join([str(question.get("title") or ""), *(question.get("tags") or []), *terms])
     maximum = max(0, min(20, int(payload.get("settings", {}).get("imageMax", 8))))
-    candidates = research.pick_image_urls(docs, maximum, topic)
-    return {"images": research.download_images(candidates, payload["imagesDir"], maximum, time.time() + 20)}
+    deadline = time.time() + 22
+    limit = maximum if payload.get("supplement") else max(0, maximum - len(payload.get("existingImages") or []))
+    if not limit:
+        return {"images": []}
+    page = payload.get("publicPage")
+    candidates = [] if page else research.pick_image_urls(docs, limit, topic)
+    public = illustrations.page_candidates(page) if page else illustrations.find_candidates(question, terms, topic, time.time() + 10)
+    ranked, seen = [], set()
+    for item in candidates[:6] + public + candidates[6:]:
+        key = research.canonical_url(item["url"])
+        if key not in seen:
+            ranked.append(item)
+            seen.add(key)
+    return {"images": research.download_images(ranked[:32], payload["imagesDir"], limit,
+                                                deadline, payload.get("existingImages"))}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -532,6 +546,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, review_material(payload))
             elif route == "/v1/research/images":
                 self._send(200, collect_images(payload))
+            elif route == "/v1/research/images/import":
+                self._send(200, illustrations.import_image(payload))
             else:
                 self._send(404, {"ok": False, "error": "not found"})
         except llm.LLMError as e:

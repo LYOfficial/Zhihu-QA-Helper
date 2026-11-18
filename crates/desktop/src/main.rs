@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -17,7 +17,18 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
+const INSTALLED_PORT: u16 = 18787;
+
+fn runtime_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let runtime = exe.parent()?.join("runtime");
+    (cfg!(feature = "installed-runtime") || runtime.exists()).then_some(runtime)
+}
+
 fn core_port() -> u16 {
+    if runtime_dir().is_some() {
+        return INSTALLED_PORT;
+    }
     std::env::var("ZHIHU_QA_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -72,27 +83,19 @@ fn find_core_binary() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-fn spawn_core() -> Option<Child> {
-    // 已经有一个在跑就不重复起
-    if TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], core_port())),
-        Duration::from_millis(250),
-    )
-    .is_ok()
-    {
-        return None;
-    }
-    let runtime = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("runtime")))
-        .filter(|path| path.join("zhihu-qa-core.exe").is_file());
-    let path = match &runtime {
+fn spawn_core(runtime: Option<&Path>) -> std::io::Result<Child> {
+    let path = match runtime {
         Some(path) => path.join("zhihu-qa-core.exe"),
-        None => find_core_binary()?,
+        None => find_core_binary().ok_or(std::io::ErrorKind::NotFound)?,
     };
     let mut cmd = Command::new(path);
     if let Some(runtime) = runtime {
-        cmd.current_dir(&runtime).env("ZHIHU_QA_RUNTIME", &runtime);
+        cmd.current_dir(runtime)
+            .env("ZHIHU_QA_RUNTIME", runtime)
+            .env("ZHIHU_QA_PORT", INSTALLED_PORT.to_string())
+            .env_remove("ZHIHU_QA_AGENT_PORT")
+            .env("ZHIHU_QA_DESKTOP_CHILD", "1")
+            .stdin(Stdio::piped());
     }
     if cfg!(debug_assertions) {
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -105,19 +108,50 @@ fn spawn_core() -> Option<Child> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.spawn().ok()
+    cmd.spawn()
 }
 
-fn wait_core(timeout: Duration) -> bool {
+fn wait_core(timeout: Duration, mut child: Option<&mut Child>) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], core_port()));
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+        if let Some(child) = child.as_mut() {
+            if !matches!(child.try_wait(), Ok(None)) {
+                return false;
+            }
+            let pid = child.id().to_string();
+            if core_get("/__desktop_ready").is_some_and(|response| {
+                response.split_whitespace().nth(1) == Some("200")
+                    && response
+                        .split_once("\r\n\r\n")
+                        .is_some_and(|(_, body)| body == pid)
+            }) {
+                return true;
+            }
+        } else if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(180));
     }
     false
+}
+
+fn startup_error(message: &str) {
+    eprintln!("[desktop] {message}");
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR};
+        let text: Vec<u16> = message.encode_utf16().chain([0]).collect();
+        let title: Vec<u16> = "知乎答主助手无法启动".encode_utf16().chain([0]).collect();
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_ICONERROR,
+            )
+        };
+    }
 }
 
 // ---------------- 与内核通信（只走本机回环，不引额外依赖） ----------------
@@ -248,16 +282,66 @@ fn main() {
         eprintln!("[desktop] 已有知乎答主助手实例在运行，忽略本次重复启动");
         return;
     };
-    let child = spawn_core();
-    let ok = wait_core(Duration::from_secs(25));
+    let runtime = runtime_dir();
+    let mut child = if let Some(runtime) = &runtime {
+        if [
+            "web/index.html",
+            "agent/zhihu-qa-agent.exe",
+            "zhihu-qa-core.exe",
+        ]
+        .iter()
+        .any(|file| !runtime.join(file).is_file())
+        {
+            startup_error("安装文件不完整。请重新运行安装包；不要删除现有数据目录。");
+            return;
+        }
+        if TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], INSTALLED_PORT)),
+            Duration::from_millis(250),
+        )
+        .is_ok()
+        {
+            startup_error("本机端口 18787 已被占用。请退出旧的知乎答主助手或释放该端口后重试。");
+            return;
+        }
+        match spawn_core(Some(runtime)) {
+            Ok(child) => Some(child),
+            Err(error) => {
+                startup_error(&format!("无法启动安装版内核。请重新安装后重试。\n{error}"));
+                return;
+            }
+        }
+    } else if wait_core(Duration::from_millis(120), None) {
+        None
+    } else {
+        spawn_core(None).ok()
+    };
+    let ok = wait_core(
+        Duration::from_secs(25),
+        if runtime.is_some() {
+            child.as_mut()
+        } else {
+            None
+        },
+    );
+    if !ok && runtime.is_some() {
+        if let Some(mut child) = child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        startup_error("安装版内核未能就绪。请先在托盘退出旧版再试；仍失败时，查看数据目录下的 logs\\core.log（默认 %APPDATA%\\ZhihuQAHelper）。");
+        return;
+    }
 
     tauri::Builder::default()
         .manage(CoreProcess(Mutex::new(child)))
         .setup(move |app| {
             // 窗口在运行时创建：开发时指向 Next dev server（可热更新），
             // 生产时指向内核托管的静态页。两者同源策略不同，不能用同一个 URL。
-            let dev_url = std::env::var("ZHIHU_QA_DEV_WEB")
-                .ok()
+            let dev_url = runtime
+                .is_none()
+                .then(|| std::env::var("ZHIHU_QA_DEV_WEB"))
+                .and_then(Result::ok)
                 .filter(|v| !v.trim().is_empty());
             let target = dev_url
                 .clone()
@@ -292,7 +376,9 @@ fn main() {
                     "quit" => {
                         if let Some(state) = app.try_state::<CoreProcess>() {
                             if let Some(mut c) = state.0.lock().unwrap().take() {
-                                let _ = c.kill();
+                                if c.stdin.take().is_none() {
+                                    let _ = c.kill();
+                                }
                             }
                         }
                         app.exit(0);

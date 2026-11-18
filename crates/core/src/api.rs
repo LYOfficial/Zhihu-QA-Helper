@@ -1,7 +1,7 @@
 //! 本地 HTTP API。前端（Next.js）与桌面壳都通过 127.0.0.1:8787/api 访问。
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -71,6 +71,11 @@ pub fn router(state: Shared) -> Router {
         .route("/questions/{id}/answered", post(mark_answered))
         .route("/questions/{id}/dismiss", post(dismiss_question))
         .route("/drafts/{qid}", get(get_draft).put(put_draft))
+        .route("/images/{qid}", get(list_images).post(search_images))
+        .route(
+            "/images/{qid}/import",
+            post(import_image).layer(DefaultBodyLimit::max(8_010_000)),
+        )
         .route("/images/{qid}/{name}", get(get_image).delete(delete_image))
         .route("/model", get(get_model).put(put_model))
         .route("/model/catalog", get(model_catalog))
@@ -915,27 +920,7 @@ async fn get_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
         )
         .ok();
 
-    let mut stmt = db
-        .conn
-        .prepare("SELECT id, question_id, filename, source_url, source_name, caption, bytes, created_at FROM images WHERE question_id=?1 ORDER BY created_at")?;
-    let images: Vec<ImageAsset> = stmt
-        .query_map(params![qid], |r| {
-            let filename: String = r.get(2)?;
-            let qid: String = r.get(1)?;
-            Ok(ImageAsset {
-                id: r.get(0)?,
-                question_id: qid.clone(),
-                url: format!("/api/images/{}/{}", qid, filename),
-                filename,
-                source_url: r.get(3)?,
-                source_name: r.get(4)?,
-                caption: r.get(5)?,
-                bytes: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        })?
-        .filter_map(|x| x.ok())
-        .collect();
+    let images = load_images(&db.conn, &qid)?;
 
     match row {
         Some((md, doubts, cites, model, wc, upd, warns)) => Ok(Json(json!(Draft {
@@ -954,6 +939,100 @@ async fn get_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
             "images": images, "warnings": [], "wordCount": 0, "updatedAt": "", "model": ""
         }))),
     }
+}
+
+fn load_images(conn: &rusqlite::Connection, qid: &str) -> rusqlite::Result<Vec<ImageAsset>> {
+    let mut stmt = conn
+        .prepare("SELECT id, question_id, filename, source_url, source_name, caption, bytes, created_at FROM images WHERE question_id=?1 ORDER BY created_at")?;
+    let rows = stmt.query_map(params![qid], |r| {
+        let filename: String = r.get(2)?;
+        let qid: String = r.get(1)?;
+        Ok(ImageAsset {
+            id: r.get(0)?,
+            question_id: qid.clone(),
+            url: format!("/api/images/{}/{}", qid, filename),
+            filename,
+            source_url: r.get(3)?,
+            source_name: r.get(4)?,
+            caption: r.get(5)?,
+            bytes: r.get(6)?,
+            created_at: r.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
+async fn list_images(State(st): State<Shared>, Path(qid): Path<String>) -> R {
+    let db = st.db.lock().await;
+    Ok(Json(json!(load_images(&db.conn, &qid)?)))
+}
+
+async fn illustration_question(st: &Shared, qid: &str) -> Result<(String, i64), ApiError> {
+    let db = st.db.lock().await;
+    let title = db
+        .conn
+        .query_row(
+            "SELECT title FROM questions WHERE id=?1 AND status IN ('inbox','pending_review')",
+            params![qid],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("当前问题不能补图，请等待拟稿完成或检查归档状态。"))?;
+    Ok((title, tasks::load_settings(&db).image_max))
+}
+
+async fn search_images(
+    State(st): State<Shared>,
+    Path(qid): Path<String>,
+    Json(body): Json<Value>,
+) -> R {
+    let (title, maximum) = illustration_question(&st, &qid).await?;
+    let raw_query = body["query"].as_str().unwrap_or_default().trim();
+    let query: String = raw_query.chars().take(110).collect();
+    let public_page = if raw_query.starts_with("https://") && raw_query.len() <= 2048 {
+        raw_query
+    } else {
+        ""
+    };
+    let payload = json!({"question": {"title": title}, "supplement": true, "publicPage": public_page,
+        "settings": {"imageMax": if maximum > 0 { maximum.min(8) } else { 4 }},
+        "material": {"searchTerms": if query.is_empty() { vec![] } else { vec![query] }}});
+    let added = tasks::collect_question_images(&st, &qid, payload, false, true).await?;
+    Ok(Json(json!({"added": added})))
+}
+
+async fn import_image(
+    State(st): State<Shared>,
+    Path(qid): Path<String>,
+    Json(body): Json<Value>,
+) -> R {
+    illustration_question(&st, &qid).await?;
+    let image = body["imageData"]
+        .as_str()
+        .filter(|image| !image.is_empty() && image.len() <= 8_000_000)
+        .ok_or_else(|| anyhow::anyhow!("请选择不超过 6 MB 的图片文件。"))?;
+    let url = body["sourceUrl"].as_str().unwrap_or_default().trim();
+    if !url.is_empty()
+        && (url.len() > 2048
+            || !reqwest::Url::parse(url).is_ok_and(|link| {
+                matches!(link.scheme(), "http" | "https")
+                    && link.host().is_some()
+                    && link.username().is_empty()
+                    && link.password().is_none()
+            }))
+    {
+        return Err(anyhow::anyhow!("请填写有效的 http 或 https 来源链接，或留空。").into());
+    }
+    let caption: String = body["caption"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(160)
+        .collect();
+    let payload = json!({"imageData": image, "sourceUrl": url, "caption": caption});
+    let added = tasks::collect_question_images(&st, &qid, payload, true, true).await?;
+    Ok(Json(json!({"added": added})))
 }
 
 async fn put_draft(

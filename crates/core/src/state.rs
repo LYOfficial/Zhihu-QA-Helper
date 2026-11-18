@@ -17,6 +17,7 @@ pub struct AppState {
     pub browser_login_pending: Mutex<bool>,
     /// 拟稿并发名额：同时最多两份，避免多份稿子抢同一个模型 Key
     pub research_slots: tokio::sync::Semaphore,
+    pub image_slots: tokio::sync::Semaphore,
 }
 
 pub type Shared = Arc<AppState>;
@@ -32,6 +33,7 @@ impl AppState {
             qr_cookie: Mutex::new(String::new()),
             browser_login_pending: Mutex::new(false),
             research_slots: tokio::sync::Semaphore::new(2),
+            image_slots: tokio::sync::Semaphore::new(1),
         })
     }
 }

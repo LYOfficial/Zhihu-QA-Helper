@@ -854,6 +854,77 @@ async fn agent_stage(state: &AppState, path: &str, payload: &Value, seconds: u64
     Ok(response)
 }
 
+pub async fn collect_question_images(
+    state: &AppState,
+    qid: &str,
+    mut payload: Value,
+    import: bool,
+    interactive: bool,
+) -> Result<usize> {
+    let _slot = if interactive {
+        state
+            .image_slots
+            .try_acquire()
+            .map_err(|_| anyhow::anyhow!("正在处理另一批配图，请稍后再试。"))?
+    } else {
+        state.image_slots.acquire().await?
+    };
+    let img_dir = state.data_dir.join("images").join(crate::db::sanitize(qid));
+    let existing = {
+        let db = state.db.lock().await;
+        let mut stmt = db
+            .conn
+            .prepare("SELECT filename FROM images WHERE question_id=?1 ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(params![qid], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if existing.len() >= 80 {
+        anyhow::bail!("备选图已达上限，请先整理已有图片。");
+    }
+    if payload["supplement"] == true {
+        let maximum = payload["settings"]["imageMax"].as_u64().unwrap_or_default();
+        payload["settings"]["imageMax"] = json!(maximum.min((80 - existing.len()) as u64));
+    }
+    payload["imagesDir"] = json!(img_dir);
+    payload["existingImages"] = json!(existing);
+    let result = agent_stage(
+        state,
+        if import {
+            "/v1/research/images/import"
+        } else {
+            "/v1/research/images"
+        },
+        &payload,
+        27,
+    )
+    .await?;
+    let mut db = state.db.lock().await;
+    let tx = db.conn.transaction()?;
+    let mut added = 0;
+    for image in result["images"].as_array().into_iter().flatten() {
+        let filename = image["filename"].as_str().unwrap_or_default();
+        if filename.len() != 36
+            || !filename.as_bytes().ends_with(b".png")
+            || !filename.as_bytes()[..32].iter().all(u8::is_ascii_hexdigit)
+        {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(img_dir.join(filename)) else {
+            continue;
+        };
+        added += tx.execute(
+            "INSERT INTO images (id, question_id, filename, source_url, source_name, caption, bytes, created_at)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS
+             (SELECT 1 FROM images WHERE question_id=?2 AND filename=?3)",
+            params![format!("i_{}", Uuid::new_v4().simple()), qid, filename,
+                image["sourceUrl"].as_str().unwrap_or_default(), image["sourceName"].as_str().unwrap_or_default(),
+                image["caption"].as_str().unwrap_or_default(), metadata.len() as i64, now_iso()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(added)
+}
+
 async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
     let (question, terms, meta_summary, meta_style, sources, model, settings) = {
         let db = state.db.lock().await;
@@ -1055,7 +1126,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
     .await;
     let (review, images) = tokio::join!(
         agent_stage(state, "/v1/research/review", &payload, 42),
-        agent_stage(state, "/v1/research/images", &payload, 26),
+        collect_question_images(state, qid, payload.clone(), false, false),
     );
     let mut db = state.db.lock().await;
     let tx = db.conn.transaction()?;
@@ -1064,28 +1135,6 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             "UPDATE drafts SET doubts=?2 WHERE question_id=?1",
             params![qid, review["doubts"].to_string()],
         )?;
-    }
-    if let Ok(result) = &images {
-        for image in result["images"].as_array().into_iter().flatten() {
-            let filename = image["filename"].as_str().unwrap_or_default();
-            if filename.len() != 36
-                || !filename.ends_with(".png")
-                || !filename[..32].bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                continue;
-            }
-            let Ok(metadata) = std::fs::metadata(img_dir.join(filename)) else {
-                continue;
-            };
-            tx.execute(
-                "INSERT INTO images (id, question_id, filename, source_url, source_name, caption, bytes, created_at)
-                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS
-                 (SELECT 1 FROM images WHERE question_id=?2 AND filename=?3)",
-                params![format!("i_{}", Uuid::new_v4().simple()), qid, filename,
-                    image["sourceUrl"].as_str().unwrap_or_default(), image["sourceName"].as_str().unwrap_or_default(),
-                    image["caption"].as_str().unwrap_or_default(), metadata.len() as i64, now_iso()],
-            )?;
-        }
     }
     if review.is_ok() && images.is_ok() {
         tx.execute(

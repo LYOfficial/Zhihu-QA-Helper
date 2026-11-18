@@ -1239,6 +1239,40 @@ html[data-theme="paper"] body {
   background: rgba(251, 249, 244, 0.92);
 }
 
+.illustration-tools {
+  display: grid;
+  gap: 10px;
+}
+.illustration-tools label {
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+}
+.illustration-tools p {
+  margin: 0;
+  font-size: 12px;
+}
+.illustration-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.illustration-source {
+  width: 100%;
+  border: 0;
+  padding: 3px 6px 6px;
+  color: var(--ink-3);
+  background: transparent;
+  font-size: 10px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.illustration-source:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
 .img-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

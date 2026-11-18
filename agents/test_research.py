@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import tempfile
@@ -9,6 +10,7 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 
 import llm
+import illustrations
 import main
 import research
 
@@ -28,6 +30,43 @@ def illustration(variant="PNG", size=400, alternate=False):
 
 
 class ResearchTests(unittest.TestCase):
+    def test_community_images_use_public_body_originals_only(self):
+        page = "https://www.zhihu.com/question/123/answer/456"
+        html = '''<title>铁路信号</title><main><img src="https://pic1.zhimg.com/site.jpg">
+        <div class="RichText"><img alt="区段示意图" data-original="https://pic1.zhimg.com/signal_r.jpg"
+        src="https://pic1.zhimg.com/signal_b.jpg"><img src="https://pic1.zhimg.com/rail.jpg?watermark=1">
+        <img src="https://zhimg.com.invalid/signal.png"><img src="http://127.0.0.1/image.png"></div></main>'''
+        with patch.object(research, "fetch", return_value=(html.encode(), "text/html", "utf-8")):
+            assets = illustrations.page_candidates(page)
+        self.assertEqual([asset["url"] for asset in assets], ["https://pic1.zhimg.com/signal_r.jpg"])
+        self.assertEqual(assets[0]["page"], page)
+        self.assertFalse(assets[0]["allowed"]("https://127.0.0.1/signal.jpg"))
+        with self.assertRaises(ValueError):
+            illustrations.page_candidates("https://zhihu.com.invalid/question/123")
+
+    def test_bing_images_keep_original_title_source_and_relevance(self):
+        from html import escape
+        source = "https://pixabay.com/photos/steam-locomotive-123/"
+        results = [
+            {"purl": source, "murl": "https://cdn.pixabay.com/steam.jpg", "t": "Steam locomotive at dusk"},
+            {"purl": source, "murl": "https://cdn.pixabay.com/engine.jpg", "t": "Steam account registration"},
+            {"purl": source, "murl": "https://th.bing.com/thumbnail.jpg", "t": "Steam locomotive"},
+        ]
+        markup = "".join(f'<a class="iusc" m="{escape(json.dumps(result))}"></a>' for result in results)
+        with patch.object(research, "fetch", return_value=(markup.encode(), "text/html", "utf-8")):
+            assets, _ = illustrations.bing_image_candidates("steam locomotive")
+        self.assertEqual([(asset["sourceName"], asset["page"]) for asset in assets], [("Pixabay", source)])
+
+    def test_import_dedup_survives_separate_requests(self):
+        with tempfile.TemporaryDirectory() as folder:
+            payload = {"imagesDir": folder, "imageData": base64.b64encode(illustration()).decode(),
+                       "sourceUrl": "https://example.com/article", "caption": "铁路信号"}
+            asset, = illustrations.import_image(payload)["images"]
+            payload["existingImages"] = [asset["filename"]]
+            payload["imageData"] = base64.b64encode(illustration("JPEG", size=370)).decode()
+            self.assertEqual(illustrations.import_image(payload)["images"], [])
+            self.assertEqual(len(list(Path(folder).glob("*.png"))), 1)
+
     def test_svg_title_does_not_swallow_article(self):
         body = "The off-hand can hold a torch in this preview. " * 7
         title, text, images = research.parse_doc(
