@@ -237,7 +237,7 @@ def verify(claims, docs, model, *, follow_up):
         status = item.get("status")
         expected = {"verified": "supports", "corrected": "refutes", "rejected": "refutes"}.get(status if isinstance(status, str) else "")
         direct = [entry for entry in evidence if entry["stance"] == expected]
-        conflict = any(entry["stance"] not in (expected, "context") for entry in evidence)
+        conflict = {"supports", "refutes"} <= {entry["stance"] for entry in evidence}
         primary = any(entry["kind"] in {"official", "docs", "dataset"} for entry in direct)
         credible = any(entry["kind"] in {"wiki", "media"} for entry in direct)
         verdict = str(item.get("verdict") or "").strip()[:450]
@@ -246,7 +246,10 @@ def verify(claims, docs, model, *, follow_up):
             strongest = next((entry for entry in direct if entry["kind"] in {"official", "docs", "dataset"}), direct[0])
             result.update(status=status, verdict=verdict, confidence=90 if primary else 70, source=strongest["url"])
         elif evidence:
-            result.update(verdict=verdict if status == "unverified" and verdict else result["verdict"], confidence=35 if conflict else 25)
+            reason = "来源存在冲突，见下方支持与反证" if conflict else result["verdict"]
+            if status == "unverified" and verdict:
+                reason = verdict
+            result.update(verdict=reason, confidence=35 if conflict else 25)
     return default
 
 

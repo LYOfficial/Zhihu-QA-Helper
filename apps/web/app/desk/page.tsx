@@ -732,7 +732,8 @@ function DeskInner() {
                       {d.evidence?.map((entry) => (
                         <details key={entry.url} style={{ marginTop: 6 }}>
                           <summary>{entry.stance === "supports" ? "支持" : entry.stance === "refutes" ? "反证" : "背景"} · {entry.sourceName}</summary>
-                          <button className="btn btn-sm" onClick={() => void openExternal(entry.url)}>{entry.label || "阅读原文"}</button>
+                          <button className="btn btn-sm" style={{ maxWidth: "100%", height: "auto", whiteSpace: "normal", overflowWrap: "anywhere", textAlign: "left" }}
+                            onClick={() => void openExternal(entry.url)}>{entry.label || "阅读原文"}</button>
                           <div className="dim">{({ official: "官方/发布方", docs: "原始文档", wiki: "维基", media: "媒体", community: "社区个案" } as Record<string, string>)[entry.kind] || "网页"}{entry.publishedAt ? ` · ${entry.publishedAt.slice(0, 10)}` : ""}</div>
                           <blockquote style={{ margin: "5px 0", overflowWrap: "anywhere" }}>{entry.quote}</blockquote>
                         </details>

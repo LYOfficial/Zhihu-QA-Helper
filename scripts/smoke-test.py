@@ -80,7 +80,7 @@ class Agent(BaseHTTPRequestHandler):
         elif stage == "review":
             self.review_release.wait(10)
             self.send({"doubts": [{**doubt, "verdict": "现有资料不足", "confidence": 25, "evidence": [{
-                "url": "https://example.org/manual", "label": "信号手册", "sourceName": "发布方", "kind": "official",
+                "url": "https://example.org/manual", "label": "Railroad signalling reference: operating conditions and section boundaries in the test configuration", "sourceName": "发布方", "kind": "official",
                 "publishedAt": "2025-06-01", "quote": "仅适用于演示线路，不覆盖其他设置。", "stance": "context",
             }]} for doubt in payload["doubts"]]})
         elif stage == "images":
@@ -210,6 +210,10 @@ class Smoke:
             wait_for(lambda: self.draft()["markdown"] == updated)
             page.get_by_role("button", name="预览", exact=True).click()
             page.get_by_text("离开页面前输入的文字。", exact=True).wait_for()
+            evidence = page.get_by_text("背景 · 发布方", exact=True)
+            evidence.click()
+            page.get_by_text("仅适用于演示线路，不覆盖其他设置。", exact=True).wait_for()
+            assert evidence.locator("..").evaluate("element => element.scrollWidth <= element.clientWidth + 1")
             page.get_by_role("button", name="找配图", exact=True).click()
             search = page.get_by_role("button", name="自动搜图")
             search.click()
