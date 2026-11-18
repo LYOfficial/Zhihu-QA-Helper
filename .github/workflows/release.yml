@@ -1,0 +1,142 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+          architecture: x64
+          cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.10'
+          architecture: x64
+      - name: Check tag and package versions
+        id: version
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:TAG -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Expected a release tag like v0.1.0, got $env:TAG"
+          }
+          $version = $env:TAG.Substring(1)
+          $metadata = cargo metadata --format-version 1 --no-deps --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to read Cargo metadata' }
+          $npmLock = Get-Content -Raw package-lock.json | ConvertFrom-Json -AsHashtable
+          $versions = [ordered]@{
+            'package.json' = (Get-Content -Raw package.json | ConvertFrom-Json).version
+            'apps/web/package.json' = (Get-Content -Raw apps/web/package.json | ConvertFrom-Json).version
+            'crates/desktop/tauri.conf.json' = (Get-Content -Raw crates/desktop/tauri.conf.json | ConvertFrom-Json).version
+            'package-lock.json' = $npmLock['version']
+            'package-lock.json (root)' = $npmLock['packages']['']['version']
+            'package-lock.json (web)' = $npmLock['packages']['apps/web']['version']
+          }
+          foreach ($member in $metadata.packages) { $versions[$member.name] = $member.version }
+          foreach ($entry in $versions.GetEnumerator()) {
+            if ($entry.Value -cne $version) {
+              throw "$($entry.Key) version '$($entry.Value)' does not match tag $env:TAG"
+            }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          npm ci
+          python -m pip install -r agents/requirements-build.txt
+      - name: Build x64 NSIS installer
+        run: npm run build:nsis
+      - name: Stage installer, SHA-256 and optional notes
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath target/nsis-build/release/bundle/nsis -File -Filter '*-setup.exe')
+          if ($installers.Count -ne 1 -or $installers[0].Name -cnotlike "*_${env:VERSION}_x64-setup.exe") {
+            throw "Expected exactly one x64 NSIS setup for version $env:VERSION"
+          }
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          $name = "Zhihu-QA-Helper_${env:VERSION}_x64-setup.exe"
+          $path = Join-Path release-assets $name
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $path
+          $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksums = Join-Path (Get-Location) 'release-assets/SHA256SUMS.txt'
+          [IO.File]::WriteAllText($checksums, "$hash *$name`n")
+          $notes = "release-notes/v${env:VERSION}.md"
+          if (Test-Path -LiteralPath $notes -PathType Leaf) {
+            Copy-Item -LiteralPath $notes -Destination release-assets/release-notes.md
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-release-assets
+          path: release-assets/
+          if-no-files-found: error
+
+  draft:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: windows-release-assets
+          path: release-assets
+      - name: Verify and attach assets to draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          installer="Zhihu-QA-Helper_${VERSION}_x64-setup.exe"
+          [[ -s "$installer" && -s SHA256SUMS.txt ]]
+          [[ $(wc -l < SHA256SUMS.txt) -eq 1 ]]
+          sha256sum --binary "$installer" | cmp - SHA256SUMS.txt
+          cd ..
+          assets=("release-assets/$installer" "release-assets/SHA256SUMS.txt")
+
+          matches="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | [.draft, .html_url] | @tsv")"
+          if [[ "$matches" == *$'\n'* ]]; then
+            echo "::error::More than one release matched $TAG. Review them on GitHub."
+            exit 1
+          elif [[ "$matches" == false$'\t'* ]]; then
+            echo "::error::Release $TAG is already published. No changes made."
+            exit 1
+          elif [[ "$matches" == true$'\t'* ]]; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            url="${matches#*$'\t'}"
+          else
+            notes=(--generate-notes)
+            if [[ -s release-assets/release-notes.md ]]; then
+              notes=(--notes-file release-assets/release-notes.md)
+            fi
+            url="$(gh release create "$TAG" "${assets[@]}" --verify-tag --draft \
+              --title "知乎答主助手 $TAG" "${notes[@]}")"
+          fi
+          printf '## Release 草稿\n\n%s\n\n请检查说明与安装包，再手动发布。\n' "$url" >> "$GITHUB_STEP_SUMMARY"
