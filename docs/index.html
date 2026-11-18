@@ -8,6 +8,7 @@
   <title>知乎答主助手｜选题、查证与写作工作台</title>
   <link rel="icon" type="image/svg+xml" href="assets/logo.svg">
   <link rel="stylesheet" href="styles.css">
+  <script src="script.js" defer></script>
 </head>
 <body>
   <a class="skip" href="#main">跳到正文</a>
@@ -35,12 +36,43 @@
           <a class="text-link" href="#showcase">看看界面 <span aria-hidden="true">›</span></a>
         </div>
         <p class="platform"><span>Windows 10 / 11 · x64</span><span>GPL v3 开源项目</span></p>
-        <figure class="hero-screen">
-          <a href="assets/writing-desk.png" aria-label="打开完整写作台截图">
-            <img src="assets/writing-desk.png" width="2238" height="1470" alt="写作台左侧是带图的正文预览，右侧是候选配图库与来源链接" fetchpriority="high">
-          </a>
-          <figcaption>写作台 · 正文预览与候选图库</figcaption>
-        </figure>
+        <section class="hero-gallery" aria-label="软件截图库" data-gallery>
+          <div class="gallery-stage">
+            <div class="gallery-track" id="gallery-track" tabindex="0" aria-label="软件截图，可用方向键切换">
+              <a class="gallery-slide" href="assets/overview.png" data-title="案头概览">
+                <img src="assets/overview.png" width="2238" height="1470" alt="案头概览显示待批稿件、重点队列和同步计划" loading="lazy">
+              </a>
+              <a class="gallery-slide" href="assets/inbox.png" data-title="问题收件箱">
+                <img src="assets/inbox.png" width="2238" height="1470" alt="问题收件箱按状态、领域和契合度列出问题" loading="lazy">
+              </a>
+              <a class="gallery-slide is-current" href="assets/writing-desk.png" data-title="写作台 · 正文预览与候选图库">
+                <img src="assets/writing-desk.png" width="2238" height="1470" alt="写作台左侧是带图的正文预览，右侧是候选配图库与来源链接" fetchpriority="high">
+              </a>
+              <a class="gallery-slide" href="assets/evidence.png" data-title="写作台 · 核查与批阅">
+                <img src="assets/evidence.png" width="2238" height="1470" alt="写作台在正文旁显示核查事项、来源和原文" loading="lazy">
+              </a>
+              <a class="gallery-slide" href="assets/profile.png" data-title="领域画像 · 写作风格">
+                <img src="assets/profile.png" width="2238" height="1470" alt="领域画像列出作品依据及文风观察" loading="lazy">
+              </a>
+              <a class="gallery-slide" href="assets/domain-weights.png" data-title="领域画像 · 关键词与权重">
+                <img src="assets/domain-weights.png" width="2210" height="1470" alt="领域画像中的主领域、子领域、关键词和权重" loading="lazy">
+              </a>
+              <a class="gallery-slide" href="assets/sources.png" data-title="资料来源库">
+                <img src="assets/sources.png" width="2210" height="1470" alt="资料来源页列出来源类型、用途、可信度建议和启用开关" loading="lazy">
+              </a>
+              <a class="gallery-slide" href="assets/activity.png" data-title="活动统计">
+                <img src="assets/activity.png" width="2212" height="1470" alt="活动统计显示近期问题收录、回答记录和本地存储用量" loading="lazy">
+              </a>
+            </div>
+            <button class="gallery-arrow gallery-prev" type="button" aria-label="上一张截图" aria-controls="gallery-track" data-gallery-step="-1" hidden><span aria-hidden="true">‹</span></button>
+            <button class="gallery-arrow gallery-next" type="button" aria-label="下一张截图" aria-controls="gallery-track" data-gallery-step="1" hidden><span aria-hidden="true">›</span></button>
+          </div>
+          <div class="gallery-meta">
+            <p class="gallery-caption" aria-live="polite">写作台 · 正文预览与候选图库</p>
+            <span class="gallery-count" hidden></span>
+          </div>
+          <div class="gallery-thumbs" role="group" aria-label="选择截图" hidden></div>
+        </section>
       </div>
     </section>
 
@@ -130,10 +162,19 @@
         <img class="download-icon" src="assets/logo.svg" width="64" height="64" alt="" loading="lazy">
         <p class="eyebrow">下载</p>
         <h2 id="download-title">获取知乎答主助手</h2>
-        <p class="lede">简体中文安装包内置本地内核和 Python 智能体。请在已公开的版本里选择 <code>_x64-setup.exe</code>。</p>
+        <p class="lede">简体中文安装包内置本地内核和 Python 智能体。</p>
+        <p class="release-meta" id="release-status" role="status" hidden></p>
         <div class="actions">
-          <a class="button" href="https://github.com/LYOfficial/Zhihu-QA-Helper/releases">查看 GitHub Releases <span aria-hidden="true">↗</span></a>
+          <a class="button" id="release-download" href="https://github.com/LYOfficial/Zhihu-QA-Helper/releases/latest" referrerpolicy="no-referrer">查看最新 Release</a>
           <a class="text-link" href="https://github.com/LYOfficial/Zhihu-QA-Helper#检查与构建">从源码构建 <span aria-hidden="true">›</span></a>
+        </div>
+        <div class="release-options" id="release-options" hidden>
+          <label class="mirror-control"><input type="checkbox" role="switch" id="release-mirror" autocomplete="off"><span>使用 gh-proxy 镜像</span></label>
+          <div class="release-links">
+            <a id="release-notes" href="https://github.com/LYOfficial/Zhihu-QA-Helper/releases/latest">发布说明</a>
+            <a id="release-checksum" hidden>SHA-256 校验文件</a>
+          </div>
+          <p class="mirror-hint" id="mirror-hint" hidden>镜像由第三方转发。若下载失败，可关掉镜像，或从发布说明下载并核对 SHA-256。</p>
         </div>
         <p class="fine-print">Windows 10 / 11 · x64。若系统提示缺少 WebView2，可安装 <a href="https://developer.microsoft.com/microsoft-edge/webview2/">Microsoft Edge WebView2 Runtime</a>。</p>
       </div>
@@ -150,5 +191,20 @@
       </nav>
     </div>
   </footer>
+
+  <dialog class="gallery-dialog" aria-labelledby="gallery-dialog-title">
+    <div class="gallery-dialog-bar">
+      <p id="gallery-dialog-title"></p>
+      <button type="button" class="gallery-close" aria-label="关闭大图" autofocus>×</button>
+    </div>
+    <div class="gallery-dialog-body">
+      <img alt="">
+    </div>
+    <div class="gallery-dialog-actions">
+      <button class="gallery-arrow" type="button" aria-label="上一张大图" data-gallery-step="-1"><span aria-hidden="true">‹</span></button>
+      <a class="text-link" target="_blank" rel="noopener">打开原始尺寸 <span aria-hidden="true">↗</span></a>
+      <button class="gallery-arrow" type="button" aria-label="下一张大图" data-gallery-step="1"><span aria-hidden="true">›</span></button>
+    </div>
+  </dialog>
 </body>
 </html>
