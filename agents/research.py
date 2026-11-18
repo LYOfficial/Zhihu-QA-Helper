@@ -16,6 +16,7 @@ import json
 import os
 import re
 import socket
+import sys
 import tempfile
 import time
 import urllib.error
@@ -26,6 +27,8 @@ from html.parser import HTMLParser
 from xml.etree import ElementTree
 
 from PIL import Image, ImageOps
+
+import zhihu_open_search
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -574,9 +577,28 @@ def gather_web(query: str, max_pages: int = 3, deadline: float | None = None, so
         urls = [url for group in groups for url in group]
     else:
         urls = web_search(query, limit=max_pages * 2, timeout=6, recent=recent)
+    return _read_web_pages(urls, query, sources, max_pages, deadline)
 
+
+def gather_zhihu_open(kind: str, query: str, deadline: float, sources=(), *, recent=False) -> list[dict]:
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        return []
+    try:
+        urls = zhihu_open_search.search_urls(kind, query, timeout=min(5, remaining), recent=recent)
+    except zhihu_open_search.SearchError as error:
+        print(f"知乎开放平台 {kind}：{error}，继续使用原有来源。", file=sys.stderr)
+        return []
+    if kind == "zhihu_search":
+        urls = [url for url in urls if _host_under(_host(url), ("zhihu.com",))]
+    return _read_web_pages(urls, query, sources, 3, deadline)
+
+
+def _read_web_pages(urls, query, sources, max_pages, deadline):
     def read(url):
         host = _host(url)
+        if not host or not url.startswith(("http://", "https://")):
+            return None
         community = next((label for site, label in COMMUNITY_SITES.items() if _host_under(host, (site,))), "")
         media = next((label for site, label in NEWS_SITES.items() if _host_under(host, (site,))), "")
         source = next((source for source in sources if source_matches(source, url)), None)

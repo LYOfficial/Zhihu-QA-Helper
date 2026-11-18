@@ -29,6 +29,7 @@ import prompts  # noqa: E402
 import research  # noqa: E402
 import illustrations
 import investigation
+import zhihu_open_search
 
 VERSION = "0.1.0"
 DATA_DIR = os.path.join(os.getcwd(), "data")
@@ -620,6 +621,7 @@ def main():
         threading.Thread(target=watch_parent, args=(args.parent_pid,), daemon=True).start()
     DATA_DIR = args.data_dir
     os.makedirs(DATA_DIR, exist_ok=True)
+    zhihu_open_search.load_local_secret(DATA_DIR)
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     sys.stderr.write(f"[agent] 智能体已启动 → http://127.0.0.1:{args.port}（data: {DATA_DIR}）\n")

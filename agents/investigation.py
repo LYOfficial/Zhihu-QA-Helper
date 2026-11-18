@@ -6,6 +6,7 @@ import time
 
 import llm
 import research
+import zhihu_open_search
 
 
 MINECRAFT_SOURCES = (
@@ -128,6 +129,8 @@ def gather_queries(queries, sources, deadline, *, hotspot=False, max_docs=12):
         lane, query = request
         if lane == "directory":
             docs = research.gather(query, sources, 5, deadline)
+        elif lane in zhihu_open_search.LIMITS:
+            docs = research.gather_zhihu_open(lane, query, deadline, sources, recent=hotspot)
         elif lane in {"discussion", "news"}:
             docs = research.gather_web(query, 3, deadline, sources, recent=hotspot, lane=lane)
         else:
@@ -139,7 +142,8 @@ def gather_queries(queries, sources, deadline, *, hotspot=False, max_docs=12):
     recent = [("recent", query) for query in queries[:2]] if hotspot else []
     contextual_query = next((query for query in queries if re.search(r"[\u4e00-\u9fff]", query)), queries[0] if queries else "")
     contextual = [(lane, contextual_query) for lane in ("news", "discussion")] if contextual_query else []
-    lanes = first[:2] + contextual + first[2:] + recent
+    zhihu = [("global_search", queries[0]), ("zhihu_search", contextual_query)] if queries and zhihu_open_search.access_secret() else []
+    lanes = first[:2] + zhihu + contextual + first[2:] + recent
     by_lane = dict(research._parallel(lookup, lanes, 16, deadline))
     docs, seen, seen_text, per_host = [], set(), set(), {}
     for depth in range(5):

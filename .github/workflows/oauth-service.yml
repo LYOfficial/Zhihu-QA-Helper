@@ -1,0 +1,35 @@
+name: Check Linux OAuth service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/**'
+      - '.github/workflows/oauth-service.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Start Docker service
+        run: sh deploy/deploy.sh
+      - name: Check health and disabled OAuth callback
+        run: |
+          curl --fail --silent --show-error http://127.0.0.1:33111/healthz |
+            jq -e '.status == "ok" and .oauthEnabled == false'
+          body=$(curl --fail --silent --show-error 'http://127.0.0.1:33111/oauth/zhihu/callback?authorization_code=fixture')
+          [[ "$body" == *'登录尚未启用'* && "$body" != *'fixture'* ]]
+      - name: Show service status
+        if: failure()
+        run: docker compose -f deploy/compose.yaml ps --all
+      - name: Stop Docker service
+        if: always()
+        run: docker compose -f deploy/compose.yaml down
