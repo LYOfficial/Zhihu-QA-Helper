@@ -11,7 +11,7 @@ curl --fail http://127.0.0.1:33111/healthz
 
 ## DNS 和反向代理
 
-1. 在 `ijune.cn` 的 DNS 控制台添加 `A` 记录：主机记录 `zh`，值为 **HTTPS 反代服务器的公网 IPv4**。只有反代已支持公网 IPv6 时才添加 `AAAA`。不要修改现有 `zhihu.ijune.cn` 记录。
+1. 在 `ijune.cn` 的 DNS 控制台将主机记录 `zh` 配置为 `A`，值为 **HTTPS 反代服务器的公网 IPv4**。如果 `zh` 已有指向 `lyofficial.github.io` 的 `CNAME`，先删掉或改掉那条记录，不能让同名 `CNAME` 和 `A` 共存。只有反代已支持公网 IPv6 时才添加 `AAAA`。不要修改现有 `zhihu.ijune.cn` 记录。
 2. 反代绑定 `zh.ijune.cn` 并启用 HTTPS。如果反代运行在 Docker 宿主机上，上游填 `http://127.0.0.1:33111`，原样保留请求路径。若反代自身也在容器里，容器中的 `127.0.0.1` 指向反代容器自己；可将两个容器接到同一专用网络，反代上游改为 `http://oauth:33111`。不需要将 `33111` 开放到公网。
 3. 用浏览器验证 `https://zh.ijune.cn/healthz` 和 `https://zh.ijune.cn/oauth/zhihu/callback`，确认 HTTPS 有效且回调说明显示登录未启用。提交给知乎的地址是 `https://zh.ijune.cn/oauth/zhihu/callback`（不加尾斜杠）。本服务的回调不读取查询参数，也不记录请求 URL；正式接入前还要关闭或脱敏反代对回调查询参数的日志。此时不要用真实授权码测试。
 
