@@ -67,12 +67,16 @@ def test_nsis(extracted, screenshots, live_search):
                 with sync_playwright() as playwright:
                     debug_url = f"http://127.0.0.1:{debug_port}"
                     def webview_ready():
-                        with urllib.request.urlopen(debug_url + "/json/version", timeout=2) as response:
-                            return response.status == 200
+                        with urllib.request.urlopen(debug_url + "/json/list", timeout=2) as response:
+                            return any(target.get("type") == "page" and target.get("url", "").startswith(BASE)
+                                       for target in json.load(response))
                     smoke.wait_for(webview_ready, 18)
                     browser = playwright.chromium.connect_over_cdp(debug_url)
-                    page = smoke.wait_for(lambda: next((page for context in browser.contexts
-                        for page in context.pages if page.url.startswith(BASE)), None), 12)
+                    cdp = browser.new_browser_cdp_session()
+                    def attached_page():
+                        cdp.send("Target.getTargets")
+                        return next((page for context in browser.contexts for page in context.pages if page.url.startswith(BASE)), None)
+                    page = smoke.wait_for(attached_page, 12)
                     page.goto(BASE + "/desk/?id=test")
                     editor = page.get_by_role("textbox", name="回答正文")
                     editor.wait_for()
