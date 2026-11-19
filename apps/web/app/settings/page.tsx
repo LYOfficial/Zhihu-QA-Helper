@@ -3,6 +3,7 @@
 import React from "react";
 import {
   IconCheck,
+  IconExternal,
   IconRefresh,
   IconUser,
   Modal,
@@ -15,6 +16,96 @@ import { api, getMode, openExternal, toast } from "@/lib/api";
 import { useLoad } from "@/lib/hooks";
 import { PROVIDERS } from "@/lib/providers";
 import type { Health, ModelConfig, QrTicket, Session, Settings } from "@/lib/types";
+
+type ZhihuOpenStatus = { configured: boolean; enabled: boolean; profileEnabled: boolean };
+const zhihuOpenChecks = { user_contents: "用户画像", zhihu_search: "知乎搜索", global_search: "全网搜索" };
+type ZhihuOpenChecks = Record<keyof typeof zhihuOpenChecks, { ok: boolean; message: string }>;
+const zhihuOpenPath = "/api/settings/zhihu-open";
+
+function ZhihuOpenSection({ account }: { account: Session["user"] }) {
+  const status = useLoad<ZhihuOpenStatus>(() => api.get(zhihuOpenPath), [account?.id]);
+  const [secret, setSecret] = React.useState("");
+  const [pendingEnabled, setPendingEnabled] = React.useState<boolean | null>(null);
+  const [checks, setChecks] = React.useState<ZhihuOpenChecks | null>(null);
+  const [busy, setBusy] = React.useState<"save" | "test" | "clear" | null>(null);
+  const configured = status.data?.configured ?? false;
+  const enabled = pendingEnabled ?? status.data?.enabled ?? false;
+  const accessSecret = secret.trim() || undefined;
+
+  async function act(action: NonNullable<typeof busy>) {
+    setBusy(action);
+    setChecks(null);
+    try {
+      if (action === "test") {
+        setChecks(await api.post<ZhihuOpenChecks>(`${zhihuOpenPath}/test`, { accessSecret }));
+      } else {
+        if (action === "save") await api.put(zhihuOpenPath, { enabled, accessSecret, profileAccountId: account?.id });
+        else await api.del(zhihuOpenPath);
+        await status.reload(true);
+        setSecret("");
+        setPendingEnabled(null);
+        toast(action === "save" ? "知乎开放平台设置已保存" : "已移除 Access Secret", "ok");
+      }
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "操作失败", "err");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <section className="mt-24" aria-label="知乎开放平台">
+      <SectionTitle right={<span className="dim">{status.data?.enabled ? "已启用" : "可选"}</span>}>
+        知乎开放平台
+      </SectionTitle>
+      <div className="card">
+        <div className="field">
+          <label htmlFor="zhihu-access-secret">Access Secret 值</label>
+          <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+            <input id="zhihu-access-secret" className="input" type="password" autoComplete="off"
+              spellCheck={false} maxLength={4096} style={{ flex: "1 1 220px", minWidth: 0 }}
+              value={secret} disabled={busy !== null}
+              placeholder={configured ? "已保存，留空保留原值" : "粘贴 Access Secret，不加 Bearer"}
+              onChange={(event) => { setSecret(event.target.value); setChecks(null); }} />
+            <button type="button" className="btn btn-sm" onClick={() => void openExternal("https://developer.zhihu.com/profile")}>
+              <IconExternal size={14} /> 前往创建 Access Secret
+            </button>
+          </div>
+        </div>
+        <p className="hint">
+          密钥仅保存在本机。启用后，知乎搜索和全网搜索使用你自己的额度，原有搜索仍保留；关闭后只使用原有方式。
+          {account
+            ? <> 请使用「{account.name}」本人的密钥。保存新密钥时，将其用于这个账号的公开创作画像。</>
+            : " 若要为用户画像启用此来源，请先登录知乎账号，再填写并保存本人的密钥。"}
+          {status.data?.enabled && account && !status.data.profileEnabled && " 当前账号的画像仍使用原有方式；如需启用，请重新粘贴并保存本人的密钥。"}
+        </p>
+        {status.error && <p className="hint" role="alert">{status.error}</p>}
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+            <input type="checkbox" checked={enabled} disabled={busy !== null || !status.data}
+              onChange={(event) => setPendingEnabled(event.target.checked)} /> 启用知乎 API
+          </label>
+          <button type="button" className="btn btn-primary btn-sm"
+            disabled={busy !== null || !status.data || (enabled && !configured && !accessSecret)} onClick={() => void act("save")}>
+            {busy === "save" ? "保存中…" : "保存"}
+          </button>
+          <button type="button" className="btn btn-sm" disabled={busy !== null || (!configured && !accessSecret)}
+            onClick={() => void act("test")}>
+            {busy === "test" ? "测试中…" : "测试连接"}
+          </button>
+          {configured && <button type="button" className="btn btn-sm" disabled={busy !== null}
+            onClick={() => void act("clear")}>移除密钥</button>}
+        </div>
+        <p className="hint">开关保存后生效。测试可在关闭状态下进行，会调用三个接口各一次，可能消耗额度。</p>
+        {checks && <ul className="hint" aria-live="polite">
+          {(Object.keys(zhihuOpenChecks) as (keyof ZhihuOpenChecks)[]).map((key) => (
+            <li key={key}>{zhihuOpenChecks[key]}：{checks[key].ok ? "连接成功" : `失败（${checks[key].message}）`}</li>
+          ))}
+        </ul>}
+      </div>
+    </section>
+  );
+}
 
 /** 把 1000000 写成 1M，界面上不占地方又看得懂 */
 function formatTokens(n: number): string {
@@ -305,6 +396,8 @@ export default function SettingsPage() {
               </span>
             )}
           </div>
+
+          <ZhihuOpenSection account={ss.data?.user ?? null} />
 
           {/* 模型 */}
           <div className="mt-24">

@@ -31,7 +31,7 @@ import illustrations
 import investigation
 import zhihu_open_search
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 DATA_DIR = os.path.join(os.getcwd(), "data")
 
 
@@ -106,10 +106,10 @@ def do_profile(payload: dict) -> dict:
         raise llm.LLMError("没有可分析的历史内容")
 
     lines = []
-    samples_for_style = _retain_examples(samples)
-    analyzed = sorted(samples, key=lambda sample: sample.get("kind") != "answer")[:24]
+    samples_for_style = _retain_examples([sample for sample in samples if not sample.get("summaryOnly")])
+    analyzed = sorted(samples, key=lambda sample: (not sample.get("summaryOnly"), sample.get("kind") != "answer"))[:24]
     popular = [{"kind": sample.get("kind"), "title": sample.get("title", ""),
-                "voteups": sample.get("voteups", 0),
+                "voteups": sample.get("voteups", 0), "summaryOnly": sample.get("summaryOnly"),
                 "text": research.clean_sample(sample.get("text") or "")[:240]} for sample in analyzed]
     longer = [sample for sample in samples_for_style if sample.get("kind") != "answer"][:4]
     longer.extend(sample for sample in samples_for_style if sample not in longer)
@@ -119,6 +119,8 @@ def do_profile(payload: dict) -> dict:
         if len(body) > size:
             body = body[:size * 2 // 3] + " […] " + body[-size // 3:]
         votes = f"赞同 {sample['voteups']}｜" if "voteups" in sample else "文风节选｜"
+        if sample.get("summaryOnly"):
+            head += "摘要"
         lines.append(f"- [{head}] {sample.get('title', '')}｜{votes}{body}")
     block = "\n".join(lines)
 
@@ -303,7 +305,8 @@ def collect_material(payload: dict) -> dict:
     question = payload.get("question") or {}
     sources = investigation.source_catalog(question, payload.get("sources"))
     plan = investigation.plan_question(question, payload.get("model") or {}, sources)
-    docs = investigation.gather_queries(plan["queries"], sources, time.time() + 23, hotspot=plan["hotspot"])
+    docs = investigation.gather_queries(plan["queries"], sources, time.time() + 23, hotspot=plan["hotspot"],
+                                       zhihu_secret=payload.get("zhihuAccessSecret") or "")
     warnings = [] if docs else ["已联网检索，但没有取得可引用的正文。初稿不会把题目前提当事实。"]
     return {"docs": docs, "warnings": warnings, "plan": plan}
 
@@ -318,7 +321,8 @@ def qualify_material(payload: dict) -> dict:
     warnings = list(material.get("warnings") or [])
     try:
         findings, docs = investigation.investigate_claims(claims, docs, sources, payload.get("model") or {},
-                                                          budget=investigation.verification_budget(payload))
+                                                          budget=investigation.verification_budget(payload),
+                                                          zhihu_secret=payload.get("zhihuAccessSecret") or "")
     except llm.LLMError:
         findings = investigation.verify(claims, docs, {})
         warnings.append("模型未完成前置核查；请查看原文并检查初稿中的条件分析。")
@@ -449,7 +453,8 @@ def review_material(payload: dict) -> dict:
         return {"doubts": doubts}
     suggestions = investigation.focused_queries([query for index in pending for query in doubts[index].get("queries", [])], "")
     results, _ = investigation.investigate_claims(claims, docs, sources, model, budget=investigation.verification_budget(payload),
-                                                  after_draft=True, suggested=suggestions)
+                                                  after_draft=True, suggested=suggestions,
+                                                  zhihu_secret=payload.get("zhihuAccessSecret") or "")
     updated = list(doubts)
     for index, result in zip(pending, results):
         prior = doubts[index]
@@ -563,6 +568,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, llm.test_model(payload))
             elif route == "/v1/profile":
                 self._send(200, do_profile(payload))
+            elif route == "/v1/zhihu-open/test":
+                self._send(200, zhihu_open_search.check_credentials(payload["zhihuAccessSecret"]))
+            elif route == "/v1/zhihu-open/profile":
+                self._send(200, zhihu_open_search.profile_samples(payload["zhihuAccessSecret"]))
             elif route == "/v1/sources":
                 self._send(200, do_sources(payload))
             elif route == "/v1/models":
@@ -621,7 +630,6 @@ def main():
         threading.Thread(target=watch_parent, args=(args.parent_pid,), daemon=True).start()
     DATA_DIR = args.data_dir
     os.makedirs(DATA_DIR, exist_ok=True)
-    zhihu_open_search.load_local_secret(DATA_DIR)
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     sys.stderr.write(f"[agent] 智能体已启动 → http://127.0.0.1:{args.port}（data: {DATA_DIR}）\n")

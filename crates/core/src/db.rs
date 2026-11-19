@@ -130,6 +130,13 @@ CREATE TABLE IF NOT EXISTS settings (
   verify_timeout_seconds INTEGER NOT NULL DEFAULT 180
 );
 
+CREATE TABLE IF NOT EXISTS zhihu_open_settings (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  access_secret TEXT NOT NULL,
+  enabled       INTEGER NOT NULL,
+  account_id    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
   id          TEXT PRIMARY KEY,
   kind        TEXT NOT NULL,

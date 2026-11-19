@@ -66,7 +66,12 @@ class Agent(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         stage = self.path.rsplit("/", 1)[-1]
         self.calls[stage] += 1
-        if stage == "collect":
+        if self.path == "/v1/zhihu-open/test":
+            assert payload == {"zhihuAccessSecret": "local-smoke-fixture"}
+            self.send({"user_contents": {"ok": True, "message": "连接成功"},
+                       "zhihu_search": {"ok": True, "message": "连接成功"},
+                       "global_search": {"ok": False, "message": "HTTP 429"}})
+        elif stage == "collect":
             self.send({"docs": [], "plan": {}, "warnings": ["回归测试：未连接外部资料站"]})
         elif stage == "qualify":
             self.send({**payload["material"], "findings": []})
@@ -139,7 +144,7 @@ class Smoke:
     def seed(self):
         with sqlite3.connect(self.directory / "zhihu-qa.db") as database:
             database.execute("UPDATE settings SET auto_sync=0")
-            database.execute("INSERT INTO account (id, name, cookie) VALUES (1, '本机测试答主', 'fixture')")
+            database.execute("INSERT INTO account (id, name, cookie, zhihu_id) VALUES (1, '本机测试答主', 'fixture', 'first-account')")
             for qid, title in (("rail", QUESTION), ("other", "另一条测试问题")):
                 database.execute("INSERT INTO questions (id,title,domain,tags) VALUES (?,?,?,?)",
                                  (qid, title, "测试资料", '["铁路"]'))
@@ -190,6 +195,47 @@ class Smoke:
             assert self.draft()["doubts"][0]["evidence"][0]["url"] == "https://example.org/manual"
             print("PASS API：前置核查、查证出处、自动配图、失败续跑、重启恢复及保留手工正文")
 
+    def check_zhihu_settings(self, page, output):
+        page.goto(self.base + "/settings/")
+        zhihu = page.get_by_role("region", name="知乎开放平台")
+        secret = zhihu.get_by_label("Access Secret 值")
+        enabled = zhihu.get_by_role("checkbox", name="启用知乎 API")
+        save = zhihu.get_by_role("button", name="保存", exact=True)
+        test = zhihu.get_by_role("button", name="测试连接")
+        credentials_path = "/settings/zhihu-open"
+        initial = {"enabled": False, "configured": False, "profileEnabled": False}
+        wait_for(lambda: enabled.is_enabled() and "本机测试答主" in zhihu.inner_text())
+        assert self.request(credentials_path) == initial
+        assert secret.get_attribute("type") == "password"
+        page.route("**/api/open-url", lambda route: route.fulfill(json={"ok": True}))
+        with page.expect_request("**/api/open-url") as external:
+            zhihu.get_by_role("button", name="前往创建 Access Secret").click()
+        assert external.value.post_data_json == {"url": "https://developer.zhihu.com/profile"}
+        page.unroute("**/api/open-url")
+        secret.fill("local-smoke-fixture")
+        test.click()
+        zhihu.get_by_text("全网搜索：失败（HTTP 429）", exact=True).wait_for()
+        assert self.request(credentials_path) == initial
+        enabled.check()
+        save.click()
+        expected = {"enabled": True, "configured": True, "profileEnabled": True}
+        wait_for(lambda: self.request(credentials_path) == expected)
+        page.reload()
+        wait_for(lambda: enabled.is_checked() and "已保存" in (secret.get_attribute("placeholder") or ""))
+        assert secret.input_value() == ""
+        zhihu.screenshot(path=output / "zhihu-open-settings.png")
+        with sqlite3.connect(self.directory / "zhihu-qa.db") as database:
+            database.execute("UPDATE account SET zhihu_id='other-account' WHERE id=1")
+        assert self.request(credentials_path) == {**expected, "profileEnabled": False}
+        enabled.uncheck()
+        save.click()
+        wait_for(lambda: self.request(credentials_path) == {**expected, "enabled": False, "profileEnabled": False})
+        test.click()
+        zhihu.get_by_text("知乎搜索：连接成功", exact=True).wait_for()
+        zhihu.get_by_role("button", name="移除密钥").click()
+        wait_for(lambda: self.request(credentials_path) == initial)
+        print("PASS 知乎开放平台设置：外链、凭证测试、保存、重载不回显、账户隔离、关闭、移除")
+
     def test_browser(self, output):
         from playwright.sync_api import sync_playwright
 
@@ -207,6 +253,7 @@ class Smoke:
                 retry.click()
             assert reopened.value.ok
             page.unroute("**/api/session")
+            self.check_zhihu_settings(page, output)
             page.goto(self.base + "/desk/?id=rail")
             editor = page.get_by_role("textbox", name="回答正文")
             editor.wait_for()

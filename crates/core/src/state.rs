@@ -1,5 +1,6 @@
 use crate::db::Db;
 use crate::zhihu::ZhihuClient;
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +22,27 @@ pub struct AppState {
 }
 
 pub type Shared = Arc<AppState>;
+
+#[derive(Default)]
+pub struct ZhihuOpenSettings {
+    pub secret: String,
+    pub enabled: bool,
+    pub account_id: String,
+}
+
+impl ZhihuOpenSettings {
+    pub fn load(db: &Db) -> rusqlite::Result<Self> {
+        Ok(db.conn.query_row(
+            "SELECT access_secret, enabled, account_id FROM zhihu_open_settings WHERE id=1",
+            [],
+            |row| Ok(Self { secret: row.get(0)?, enabled: row.get(1)?, account_id: row.get(2)? }),
+        ).optional()?.unwrap_or_default())
+    }
+
+    pub fn profile_enabled(&self, account_id: &str) -> bool {
+        self.enabled && !self.secret.is_empty() && !account_id.is_empty() && self.account_id == account_id
+    }
+}
 
 impl AppState {
     pub fn new(db: Db, data_dir: PathBuf, agent_port: u16) -> Shared {

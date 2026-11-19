@@ -66,11 +66,6 @@ jobs:
           rustup target add x86_64-pc-windows-msvc
           npm ci
           python -m pip install -r agents/requirements-build.txt
-      - name: Check Zhihu Open Platform search (optional)
-        continue-on-error: true
-        env:
-          ZHIHU_ACCESS_SECRET: ${{ secrets.ZHIHU_ACCESS_SECRET }}
-        run: python agents/zhihu_open_search.py
       - name: Build x64 NSIS installer
         run: npm run build:nsis
       - name: Stage installer, SHA-256 and optional notes

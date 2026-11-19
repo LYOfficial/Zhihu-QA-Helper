@@ -343,7 +343,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
           <span className="sep" />
           <span>{pending > 0 ? `${pending} 件待批` : "案头已清"}</span>
           <span className="sep" />
-          <span>v{health.data?.version ?? "0.1.0"}</span>
+          <span>v{health.data?.version ?? "0.1.1"}</span>
           <span className="grow" />
           <span className="path" title={health.data?.dataDir}>
             {health.data?.dataDir}

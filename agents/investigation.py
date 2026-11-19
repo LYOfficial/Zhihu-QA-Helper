@@ -123,14 +123,14 @@ def rank(doc, query):
     return 4 * len(target & title) + len(target & body)
 
 
-def gather_queries(queries, sources, deadline, *, hotspot=False, max_docs=12):
+def gather_queries(queries, sources, deadline, *, hotspot=False, max_docs=12, zhihu_secret=""):
     sources = [source for source in sources if not source.get("useFor") or "fact" in source["useFor"]]
     def lookup(request):
         lane, query = request
         if lane == "directory":
             docs = research.gather(query, sources, 5, deadline)
         elif lane in zhihu_open_search.LIMITS:
-            docs = research.gather_zhihu_open(lane, query, deadline, sources, recent=hotspot)
+            docs = research.gather_zhihu_open(lane, query, deadline, sources, secret=zhihu_secret, recent=hotspot)
         elif lane in {"discussion", "news"}:
             docs = research.gather_web(query, 3, deadline, sources, recent=hotspot, lane=lane)
         else:
@@ -142,7 +142,7 @@ def gather_queries(queries, sources, deadline, *, hotspot=False, max_docs=12):
     recent = [("recent", query) for query in queries[:2]] if hotspot else []
     contextual_query = next((query for query in queries if re.search(r"[\u4e00-\u9fff]", query)), queries[0] if queries else "")
     contextual = [(lane, contextual_query) for lane in ("news", "discussion")] if contextual_query else []
-    zhihu = [("global_search", queries[0]), ("zhihu_search", contextual_query)] if queries and zhihu_open_search.access_secret() else []
+    zhihu = [("global_search", queries[0]), ("zhihu_search", contextual_query)] if queries and zhihu_secret else []
     lanes = first[:2] + zhihu + contextual + first[2:] + recent
     by_lane = dict(research._parallel(lookup, lanes, 16, deadline))
     docs, seen, seen_text, per_host = [], set(), set(), {}
@@ -262,7 +262,7 @@ def verify(claims, docs, model, *, timeout=180):
     return default
 
 
-def investigate_claims(claims, docs, sources, model, *, budget=180, after_draft=False, suggested=()):
+def investigate_claims(claims, docs, sources, model, *, budget=180, after_draft=False, suggested=(), zhihu_secret=""):
     if not claims:
         return [], docs
     deadline = time.monotonic() + budget
@@ -271,7 +271,7 @@ def investigate_claims(claims, docs, sources, model, *, budget=180, after_draft=
 
     if after_draft:
         queries = list(dict.fromkeys([*suggested, *(search_phrase(claim) for claim in claims)]))[:6]
-        extra = gather_queries([query for query in queries if query], sources, time.time() + min(16, budget // 4), max_docs=8)
+        extra = gather_queries([query for query in queries if query], sources, time.time() + min(16, budget // 4), max_docs=8, zhihu_secret=zhihu_secret)
         primary = [doc for doc in docs if doc.get("sourceKind") in {"official", "docs", "dataset"}][:4]
         merged = {research.canonical_url(doc["sourceUrl"]): doc for doc in [*primary, *extra, *docs]}
         combined = list(merged.values())[:12]
@@ -281,7 +281,7 @@ def investigate_claims(claims, docs, sources, model, *, budget=180, after_draft=
     queries = focused_queries([query for result in missing for query in (result["queries"] or [search_phrase(result["text"])])], "")
     if not queries or remaining() < 20:
         return results, docs
-    extra = gather_queries(queries, sources, time.time() + 14, max_docs=7)
+    extra = gather_queries(queries, sources, time.time() + 14, max_docs=7, zhihu_secret=zhihu_secret)
     original = {research.canonical_url(doc["sourceUrl"]) for doc in docs}
     fresh = [doc for doc in extra if research.canonical_url(doc["sourceUrl"]) not in original]
     if not fresh:

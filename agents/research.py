@@ -580,12 +580,12 @@ def gather_web(query: str, max_pages: int = 3, deadline: float | None = None, so
     return _read_web_pages(urls, query, sources, max_pages, deadline)
 
 
-def gather_zhihu_open(kind: str, query: str, deadline: float, sources=(), *, recent=False) -> list[dict]:
+def gather_zhihu_open(kind: str, query: str, deadline: float, sources=(), *, secret, recent=False) -> list[dict]:
     remaining = deadline - time.time()
     if remaining <= 0:
         return []
     try:
-        urls = zhihu_open_search.search_urls(kind, query, timeout=min(5, remaining), recent=recent)
+        urls = zhihu_open_search.search_urls(kind, query, secret=secret, timeout=min(5, remaining), recent=recent)
     except zhihu_open_search.SearchError as error:
         print(f"知乎开放平台 {kind}：{error}，继续使用原有来源。", file=sys.stderr)
         return []

@@ -198,12 +198,6 @@ npm run build:nsis
 - **Release 草稿**：准备新版本时，同步修改 npm 工作区、Tauri 配置和 Rust 工作区的版本及锁文件。将这些改动提交后，在对应提交上打 `vX.Y.Z` 标签并推送。工作流会从标签指向的提交构建 x64 NSIS `setup.exe`，把安装包和 `SHA256SUMS.txt` 加到 Release 草稿，待手动发布。
 - **发布说明**：在打标签前，可将该版本文案保存为 `release-notes/vX.Y.Z.md`。没有对应文件时，GitHub 会生成更新日志。[查看 v0.1.0 发布说明](release-notes/v0.1.0.md)。
 
-## 知乎开放平台（可选）
-
-- **桌面搜索**：将 [配置模板](zhihu-search.env.example) 复制到数据目录，命名为 `zhihu-search.env`，填写 `ZHIHU_ACCESS_SECRET` 并重启应用。知乎搜索和全网搜索用于发现可供取材和核查的原始网页；没有凭证、配额耗尽或调用失败时，原有搜索仍可使用。
-- **Release 验证**：在 GitHub `Settings → Environments → release` 添加 **Environment secret** `ZHIHU_ACCESS_SECRET`，填原始凭证（不加 `Bearer`）。构建时两个接口各验证一次；密钥不进入安装包，验证失败不阻断打包。
-- **OAuth 申请**：现有登录及画像获取流程不变。[Linux 部署说明](deploy/README.md)提供反代所需的回调占位服务，后续迁移见 [OAuth 接入方案](ref/zhihu-oauth.md)。
-
 ## 数据目录
 
 开发时默认使用仓库下的 `data` 目录；安装版使用 `%APPDATA%\ZhihuQAHelper`。主要内容如下：
@@ -229,3 +223,8 @@ npm run build:nsis
 ## 开源许可
 
 本项目基于 [GNU General Public License v3.0](LICENSE) 开源。
+
+## 参考
+
+- [zly2006/zhurl](https://github.com/zly2006/zhurl)
+- [知乎开放平台文档](https://developer.zhihu.com/docs)

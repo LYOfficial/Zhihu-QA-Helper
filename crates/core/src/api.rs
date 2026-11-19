@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::models::*;
-use crate::state::{zhihu_client, Shared};
+use crate::state::{zhihu_client, Shared, ZhihuOpenSettings};
 use crate::tasks;
 
 pub struct ApiError(anyhow::Error);
@@ -84,6 +84,11 @@ pub fn router(state: Shared) -> Router {
         .route("/model/test", post(test_model))
         .route("/model/list", post(list_models))
         .route("/settings", get(get_settings).put(put_settings))
+        .route(
+            "/settings/zhihu-open",
+            get(get_zhihu_open).put(put_zhihu_open).delete(delete_zhihu_open),
+        )
+        .route("/settings/zhihu-open/test", post(test_zhihu_open))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/events", get(list_events))
@@ -1359,6 +1364,91 @@ async fn test_model(State(st): State<Shared>, Json(body): Json<Value>) -> R {
 }
 
 // ---------------- 设置 ----------------
+
+fn zhihu_open_status(db: &crate::db::Db, settings: &ZhihuOpenSettings) -> R {
+    let account_id = zhihu_open_account(db)?;
+    Ok(Json(json!({
+        "configured": !settings.secret.is_empty(),
+        "enabled": settings.enabled,
+        "profileEnabled": settings.profile_enabled(&account_id),
+    })))
+}
+
+fn zhihu_open_account(db: &crate::db::Db) -> rusqlite::Result<String> {
+    Ok(db.conn.query_row(
+        "SELECT zhihu_id FROM account WHERE id=1 AND trim(cookie)<>''",
+        [], |row| row.get(0),
+    ).optional()?.unwrap_or_default())
+}
+
+fn validate_zhihu_open_secret(secret: &str) -> anyhow::Result<&str> {
+    let secret = secret.trim();
+    anyhow::ensure!(
+        !secret.is_empty() && secret.len() <= 4096 && secret.bytes().all(|byte| byte.is_ascii_graphic()),
+        "请输入原始 Access Secret，不要加 Bearer 或空格"
+    );
+    Ok(secret)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ZhihuOpenUpdate {
+    enabled: bool,
+    access_secret: Option<String>,
+    profile_account_id: Option<String>,
+}
+
+async fn get_zhihu_open(State(st): State<Shared>) -> R {
+    let db = st.db.lock().await;
+    zhihu_open_status(&db, &ZhihuOpenSettings::load(&db)?)
+}
+
+async fn put_zhihu_open(State(st): State<Shared>, Json(body): Json<ZhihuOpenUpdate>) -> R {
+    let db = st.db.lock().await;
+    let mut settings = ZhihuOpenSettings::load(&db)?;
+    if let Some(secret) = body.access_secret.as_deref() {
+        settings.secret = validate_zhihu_open_secret(secret)?.to_owned();
+        settings.account_id = body.profile_account_id.unwrap_or_default();
+        if !settings.account_id.is_empty() && settings.account_id != zhihu_open_account(&db)? {
+            return Err(anyhow::anyhow!("知乎账号已切换，请确认当前账号后重新保存").into());
+        }
+    }
+    if body.enabled && settings.secret.is_empty() {
+        return Err(anyhow::anyhow!("请先填写 Access Secret").into());
+    }
+    settings.enabled = body.enabled;
+    db.conn.execute(
+        "INSERT OR REPLACE INTO zhihu_open_settings (id, access_secret, enabled, account_id) VALUES (1,?1,?2,?3)",
+        params![settings.secret, settings.enabled, settings.account_id],
+    )?;
+    zhihu_open_status(&db, &settings)
+}
+
+async fn delete_zhihu_open(State(st): State<Shared>) -> R {
+    let db = st.db.lock().await;
+    db.conn.execute("DELETE FROM zhihu_open_settings WHERE id=1", [])?;
+    zhihu_open_status(&db, &ZhihuOpenSettings::default())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ZhihuOpenTest {
+    access_secret: Option<String>,
+}
+
+async fn test_zhihu_open(State(st): State<Shared>, Json(body): Json<ZhihuOpenTest>) -> R {
+    let secret = if let Some(secret) = body.access_secret {
+        secret
+    } else {
+        ZhihuOpenSettings::load(&*st.db.lock().await)?.secret
+    };
+    let secret = validate_zhihu_open_secret(&secret)?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        st.agent.post("/v1/zhihu-open/test", &json!({ "zhihuAccessSecret": secret })),
+    ).await.map_err(|_| anyhow::anyhow!("知乎接口测试超时，请稍后重试"))??;
+    Ok(Json(result))
+}
 
 async fn get_settings(State(st): State<Shared>) -> R {
     let db = st.db.lock().await;

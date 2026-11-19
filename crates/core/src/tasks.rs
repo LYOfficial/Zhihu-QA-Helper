@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::models::*;
-use crate::state::{zhihu_client, AppState};
+use crate::state::{zhihu_client, AppState, ZhihuOpenSettings};
 
 // ---------------- job 基础设施 ----------------
 
@@ -461,7 +461,7 @@ pub async fn run_profile_job(state: &AppState, job: String) -> Result<()> {
 }
 
 async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
-    let (url_token, account_id, cookie_empty) = {
+    let (url_token, account_id, cookie_empty, open_settings) = {
         let db = state.db.lock().await;
         let tok: String = db
             .conn
@@ -480,7 +480,7 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
             })
             .optional()?
             .unwrap_or_default();
-        (tok, account_id, ck.trim().is_empty())
+        (tok, account_id, ck.trim().is_empty(), ZhihuOpenSettings::load(&db)?)
     };
     if cookie_empty {
         anyhow::bail!("请先登录知乎账号");
@@ -507,12 +507,7 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         &format!("已获取 {} 篇文章", articles.len()),
     )
     .await;
-    let sample = answers.len() + articles.len();
-    if sample == 0 {
-        anyhow::bail!("没有抓到历史内容，可能是登录态失效");
-    }
-
-    let samples: Vec<Value> = answers
+    let mut samples: Vec<Value> = answers
         .iter()
         .map(|a| {
             json!({
@@ -531,6 +526,27 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
             })
         }))
         .collect();
+
+    if open_settings.profile_enabled(&account_id) {
+        job_step(state, job, "整理样本", 0.46, "补充知乎开放平台公开创作摘要").await;
+        let payload = json!({ "zhihuAccessSecret": open_settings.secret });
+        if let Ok(official) = agent_stage(state, "/v1/zhihu-open/profile", &payload, 14).await {
+            let mut seen = samples.iter().map(|sample| (
+                sample["kind"].as_str().unwrap_or_default().to_owned(),
+                sample["title"].as_str().unwrap_or_default().trim().to_owned(),
+            )).collect::<std::collections::HashSet<_>>();
+            for (kind, limit) in [("answer", 12), ("article", 8)] {
+                if let Some(items) = official[kind].as_array() {
+                    samples.extend(items.iter().filter(|sample| {
+                        let title = sample["title"].as_str().unwrap_or_default().trim();
+                        seen.insert((kind.to_owned(), title.to_owned()))
+                    }).take(limit).cloned());
+                }
+            }
+        }
+    }
+    let sample = samples.len();
+    anyhow::ensure!(sample > 0, "没有抓到历史内容，可能是登录态失效");
 
     job_step(
         state,
@@ -866,6 +882,19 @@ pub async fn start_research(state: &crate::state::Shared, question_id: &str) -> 
 }
 
 async fn agent_stage(state: &AppState, path: &str, payload: &Value, seconds: u64) -> Result<Value> {
+    let mut research_payload;
+    let payload = if matches!(path, "/v1/research/collect" | "/v1/research/qualify" | "/v1/research/review") {
+        let settings = ZhihuOpenSettings::load(&*state.db.lock().await)?;
+        if settings.enabled && !settings.secret.is_empty() {
+            research_payload = payload.clone();
+            research_payload["zhihuAccessSecret"] = json!(settings.secret);
+            &research_payload
+        } else {
+            payload
+        }
+    } else {
+        payload
+    };
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(seconds),
         state.agent.post(path, payload),
