@@ -38,6 +38,7 @@ impl SignMode {
     }
 }
 
+#[derive(Clone)]
 pub struct ZhihuClient {
     http: Client,
     pub cookie: String,
@@ -156,6 +157,11 @@ impl ZhihuClient {
     }
 
     async fn send(&self, method: reqwest::Method, url: &str, signed: bool) -> Result<Value> {
+        let signed = signed && match self.sign_mode {
+            SignMode::Always => true,
+            SignMode::Auto => !self.d_c0().is_empty(),
+            SignMode::Off => false,
+        };
         match self.send_web(method.clone(), url, signed).await {
             Err(error)
                 if self.sign_mode == SignMode::Auto && signed && error.retry_without_sign =>
@@ -577,6 +583,56 @@ impl ZhihuClient {
         Ok(out)
     }
 
+    pub async fn answer_history_page(&self, url_token: &str, offset: usize) -> Result<(Vec<Value>, bool)> {
+        let mut url = reqwest::Url::parse("https://www.zhihu.com/api/v4/members")?;
+        url.path_segments_mut().map_err(|_| anyhow::anyhow!("无效的知乎地址"))?.push(url_token).push("answers");
+        url.query_pairs_mut().append_pair("include", "data[*].question.id")
+            .append_pair("limit", "20").append_pair("offset", &offset.to_string()).append_pair("sort_by", "created");
+        let data = self.send(reqwest::Method::GET, url.as_str(), true).await?;
+        let entries = data["data"].as_array().ok_or_else(|| anyhow::anyhow!("没有收到回答记录"))?;
+        let done = data.pointer("/paging/is_end").and_then(Value::as_bool).unwrap_or(entries.len() < 20);
+        Ok((entries.clone(), done || entries.is_empty()))
+    }
+
+    pub async fn question_from_answer(&self, id: &str) -> Result<String> {
+        let url = format!("https://www.zhihu.com/api/v4/answers/{id}?include=question.id");
+        let data = self.send(reqwest::Method::GET, &url, true).await?;
+        let question_id = answer_question_id(&data);
+        anyhow::ensure!(!question_id.is_empty(), "无法从该回答定位原问题");
+        Ok(question_id)
+    }
+
+    pub async fn search_recent_questions(&self, topic: &str) -> Result<Vec<String>> {
+        let mut url = reqwest::Url::parse("https://www.zhihu.com/api/v4/search_v3")?;
+        url.query_pairs_mut().extend_pairs([
+            ("q", topic), ("t", "general"), ("gk_version", "gz-gaokao"), ("search_source", "Filter"),
+            ("limit", "12"), ("sort", "created_time"), ("time_interval", "three_months"), ("include", "data[*].object,type"),
+        ]);
+        let data = self.send(reqwest::Method::GET, url.as_str(), true).await?;
+        Ok(search_question_ids(&data))
+    }
+
+    pub async fn question_details(&self, id: &str, source: &str) -> Result<(RawQuestion, i64, i64)> {
+        let url = format!("https://www.zhihu.com/api/v4/questions/{id}?include=detail,excerpt,created,created_time,answer_count,follower_count,visit_count,read_count,topics,author");
+        let data = self.send(reqwest::Method::GET, &url, true).await?;
+        let title = strip_html(data["title"].as_str().unwrap_or_default());
+        anyhow::ensure!(as_str(&data, &["id"]) == id && !title.trim().is_empty(), "知乎没有返回可读取的问题标题");
+        let created = ["created", "created_time"].iter().find_map(|key| as_str(&data, &[*key]).parse().ok()).unwrap_or(0);
+        let views = data["visit_count"].as_i64().unwrap_or(0).max(data["read_count"].as_i64().unwrap_or(0));
+        let tags = data["topics"].as_array().into_iter().flatten()
+            .filter_map(|topic| topic["name"].as_str().map(str::to_owned)).collect();
+        Ok((RawQuestion {
+            zhihu_id: id.to_owned(), question_id: id.to_owned(), source: source.to_owned(), title,
+            url: format!("https://www.zhihu.com/question/{id}"),
+            excerpt: slim(&strip_html(&first_text([as_str(&data, &["detail"]), as_str(&data, &["excerpt"])])), 4000),
+            asker_name: as_str(&data, &["author", "name"]),
+            asker_headline: as_str(&data, &["author", "headline"]),
+            answer_count: data["answer_count"].as_i64().unwrap_or(0),
+            follower_count: data["follower_count"].as_i64().unwrap_or(0),
+            tags,
+        }, created, views))
+    }
+
     pub async fn my_answers_page(&self, url_token: &str, page: usize) -> Result<Vec<Value>> {
         let offset = page * 20;
         let url = format!(
@@ -718,6 +774,51 @@ fn notification_timestamp(item: &Value) -> Option<i64> {
     }
     item.get("content")
         .and_then(|content| notification_timestamp(content))
+}
+
+pub fn answer_question_id(answer: &Value) -> String {
+    let id = as_str(answer, &["question", "id"]);
+    if is_content_id(&id) { id } else { String::new() }
+}
+
+fn search_question_ids(search: &Value) -> Vec<String> {
+    search["data"].as_array().into_iter().flatten()
+        .filter_map(|row| {
+            let object = &row["object"];
+            let id = match object["type"].as_str() {
+                Some("question") => as_str(object, &["id"]),
+                Some("answer") => first_text([answer_question_id(object), as_str(object, &["question_id"])]),
+                _ => return None,
+            };
+            is_content_id(&id).then_some(id)
+        }).collect()
+}
+
+fn is_content_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[derive(Debug, PartialEq)]
+pub enum SharedLink {
+    Question(String),
+    Answer(String),
+}
+
+pub fn parse_shared_link(raw: &str) -> Result<SharedLink> {
+    let url = reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("不是有效的知乎链接"))?;
+    anyhow::ensure!(matches!(url.scheme(), "http" | "https") && url.username().is_empty()
+        && url.password().is_none() && url.port().is_none(), "不是有效的知乎链接");
+    if url.host_str() == Some("zhuanlan.zhihu.com") {
+        anyhow::bail!("专栏文章不是问题，不能导入收件箱");
+    }
+    anyhow::ensure!(matches!(url.host_str(), Some("www.zhihu.com" | "zhihu.com" | "m.zhihu.com")), "只支持知乎问题或回答链接");
+    let segments = url.path().trim_matches('/').split('/').collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["question", id] if is_content_id(id) => Ok(SharedLink::Question((*id).to_owned())),
+        ["question", id, "answer", answer] if is_content_id(id) && is_content_id(answer) => Ok(SharedLink::Question((*id).to_owned())),
+        ["answer", id] if is_content_id(id) => Ok(SharedLink::Answer((*id).to_owned())),
+        _ => anyhow::bail!("只支持知乎问题或回答链接"),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -943,6 +1044,28 @@ fn parse_notification(item: &Value, assume_invite: bool) -> Option<RawQuestion> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_supported_share_links_and_rejects_other_content() {
+        for link in ["https://www.zhihu.com/question/123456789", "https://www.zhihu.com/question/123456789/answer/987654321?share=1#ref"] {
+            assert_eq!(parse_shared_link(link).unwrap(), SharedLink::Question("123456789".into()));
+        }
+        assert_eq!(parse_shared_link("https://www.zhihu.com/answer/987654321").unwrap(), SharedLink::Answer("987654321".into()));
+        assert!(parse_shared_link("https://zhuanlan.zhihu.com/p/123456789").unwrap_err().to_string().contains("专栏"));
+        assert!(parse_shared_link("https://www.zhihu.com.evil.test/question/123456789").is_err());
+        assert!(parse_shared_link("https://www.zhihu.com/question/123/answer/missing").is_err());
+        assert_eq!(answer_question_id(&json!({"question": {"id": 123456789}})), "123456789");
+    }
+
+    #[test]
+    fn search_results_use_original_question_ids_not_answer_or_article_ids() {
+        assert_eq!(search_question_ids(&json!({"data": [
+            {"object": {"type": "question", "id": 41}},
+            {"object": {"type": "answer", "id": 90, "question": {"id": "42"}}},
+            {"object": {"type": "article", "id": 43}},
+            {"object": {"type": "answer", "id": 12}},
+        ]})), vec!["41", "42"]);
+    }
 
     #[test]
     fn parses_web_invite_with_numeric_id_and_create_time() {

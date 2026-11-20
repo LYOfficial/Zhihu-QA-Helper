@@ -21,6 +21,7 @@ export interface ZhihuUser {
 }
 
 export interface Session {
+  onboardingRequired: boolean;
   loggedIn: boolean;
   user: ZhihuUser | null;
   expiresAt: string | null;
@@ -94,7 +95,7 @@ export interface Question {
   id: string;
   zhihuId: string;
   questionId: string;
-  source: "invite" | "recommend";
+  source: "invite" | "recommend" | "imported" | "discovered";
   title: string;
   excerpt: string;
   url: string;
@@ -154,6 +155,7 @@ export interface ImageAsset {
 }
 
 export interface Draft {
+  direction?: string;
   questionId: string;
   markdown: string;
   doubts: Doubt[];
@@ -180,7 +182,10 @@ export interface ModelConfig {
   outputLimit: number;
 }
 
+export type WritingMode = "automatic" | "subjective";
+
 export interface Settings {
+  writingMode: WritingMode;
   cronTimes: string[];
   pickRatio: number;
   draftMin: number;
@@ -197,7 +202,7 @@ export interface Settings {
 
 export interface Job {
   id: string;
-  kind: "sync" | "research" | "profile" | "sources";
+  kind: "sync" | "research" | "profile" | "sources" | "discover_questions";
   questionId: string | null;
   stage: string;
   progress: number;

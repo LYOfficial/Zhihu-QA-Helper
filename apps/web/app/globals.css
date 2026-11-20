@@ -543,6 +543,7 @@ html[data-theme="paper"] body {
 }
 .page-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 7px;
   flex-shrink: 0;
@@ -1663,7 +1664,7 @@ html[data-theme="paper"] .profile-progress {
 
 .overlay {
   position: fixed;
-  inset: 0;
+  inset: 38px 0 0;
   background: rgba(27, 26, 23, 0.34);
   display: grid;
   place-items: center;
@@ -1680,7 +1681,7 @@ html[data-theme="paper"] .profile-progress {
   background: var(--paper);
   border: 1px solid var(--rule-2);
   width: min(520px, 100%);
-  max-height: 88vh;
+  max-height: min(88vh, calc(100vh - 76px));
   overflow-y: auto;
   padding: 26px 28px 24px;
   position: relative;
@@ -1697,6 +1698,49 @@ html[data-theme="paper"] .profile-progress {
   font-size: 20px;
   font-weight: 400;
   margin-bottom: 4px;
+}
+.modal > h3 { padding-right: 30px; }
+.modal:focus { outline: none; }
+.dialog-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
+.import-text { resize: vertical; width: 100%; min-height: 78px; }
+.import-results { margin: 12px 0; padding: 12px; border: 1px solid var(--rule-2); overflow-wrap: anywhere; }
+.settings-layout { display: grid; gap: 16px; max-width: 880px; margin: 0 auto; }
+.settings-group { border: 1px solid var(--rule-2); border-radius: 10px; background: var(--paper-raised); padding: 16px 19px; min-width: 0; }
+.setting-line { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; padding: 11px 0; }
+.setting-line + .setting-line { border-top: 1px solid var(--rule); }
+.setting-line strong, .setting-line small { display: block; }
+.setting-line small, .writing-mode small { color: var(--ink-3); line-height: 1.6; margin-top: 4px; }
+.settings-details > summary { cursor: pointer; font-weight: 600; }
+.writing-mode { padding: 0; border: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap: 10px; }
+.writing-mode legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.writing-mode label { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--rule-2); border-radius: 8px; cursor: pointer; padding: 12px; }
+.writing-mode label.chosen { border-color: var(--blue); }
+.writing-mode input { margin-top: 3px; accent-color: var(--blue); }
+.writing-mode small { display: block; }
+.setup-steps { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin: 16px 0 22px; }
+.modal:has(.setup-step) { display: flex; flex-direction: column; overflow: hidden; }
+.setup-step { min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
+.setup-steps, .setup-footer { flex-shrink: 0; }
+.setup-steps span { height: 4px; border-radius: 6px; background: var(--rule-2); transition: background 180ms; }
+.setup-steps [data-current=true], .setup-steps [data-past=true] { background: var(--blue); }
+.setup-steps [data-past=true] { opacity: .45; }
+.setup-step { animation: setup-in 230ms var(--ease); }
+@keyframes setup-in { from { opacity: 0; transform: translateX(8px); } }
+.setup-heading { display: flex; align-items: center; gap: 12px; }
+.setup-heading h4 { font-size: 18px; margin: 2px 0; }
+.setup-heading small, .setup-description { color: var(--ink-3); }
+.setup-icon { display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--rule-2); border-radius: 11px; color: var(--blue); }
+.setup-description { margin: 10px 0 16px; line-height: 1.7; }
+.setup-job { display: grid; gap: 8px; margin-top: 14px; padding: 12px; border: 1px solid var(--rule-2); border-radius: 8px; }
+.setup-job progress { width: 100%; accent-color: var(--blue); }
+.setup-job button { justify-self: start; }
+.setup-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--rule-2); }
+.author-direction { padding: 8px 16px; border-bottom: 1px solid var(--rule); color: var(--ink-3); }
+.author-direction summary { cursor: pointer; }
+.author-direction p { margin-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow-y: auto; }
+@media (prefers-reduced-motion: reduce) {
+  .setup-step, .overlay, .modal { animation: none; }
+  .setup-steps span { transition: none; }
 }
 .modal .sub {
   font-size: 12px;

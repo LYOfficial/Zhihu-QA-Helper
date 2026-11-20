@@ -151,10 +151,11 @@ function VerificationTimer({ startedMs, limitSeconds }: Verification) {
 
 const writes = new Map<string, Promise<unknown>>();
 
-function persistDraft(id: string, markdown: string) {
+function persistDraft(id: string, markdown: string, direction = false) {
   const previous = writes.get(id);
   const write = (previous ?? Promise.resolve()).catch(() => {}).then(async () => {
-    await api.put(`/api/drafts/${id}`, { markdown });
+    if (direction) await api.put(`/api/drafts/${id}/direction`, { direction: markdown });
+    else await api.put(`/api/drafts/${id}`, { markdown });
     try {
       if (localStorage.getItem(recoveryKey(id)) === markdown) localStorage.removeItem(recoveryKey(id));
     } catch {}
@@ -357,6 +358,8 @@ function DeskInner() {
   const [loadedId, setLoadedId] = React.useState("");
   const [draftError, setDraftError] = React.useState("");
   const [starting, setStarting] = React.useState(false);
+  const [editingDirection, setEditingDirection] = React.useState(false);
+  const [savedDirection, setSavedDirection] = React.useState("");
   const [refreshKey, refresh] = React.useReducer((value) => value + 1, 0);
   const [mode, setMode] = React.useState<"edit" | "preview">("preview");
   const [savedAt, setSavedAt] = React.useState<string>("");
@@ -378,6 +381,8 @@ function DeskInner() {
   const draftId = current?.id ?? "";
   const viewedDraft = React.useRef(draftId);
   viewedDraft.current = draftId;
+  const requiresDirection = editingDirection && se.data?.writingMode === "subjective" && current?.bucket === "selected"
+    && current.source !== "imported" && current.source !== "discovered";
 
   React.useEffect(() => {
     if (!draftId) return;
@@ -408,12 +413,15 @@ function DeskInner() {
           let recovered: string | null = null;
           try { recovered = localStorage.getItem(recoveryKey(draftId)); } catch {}
           serverMarkdown.current = data.markdown || "";
+          const asDirection = !data.markdown && !status.draftSaved;
+          setEditingDirection(asDirection);
+          setSavedDirection(data.direction || "");
           if (first || !dirty.current) {
-            setMd(recovered ?? serverMarkdown.current);
+            setMd(recovered ?? (asDirection ? data.direction || "" : serverMarkdown.current));
             if (first) setMode("edit");
             if (recovered !== null) dirty.current = true;
             setSavedAt(recovered !== null ? "已恢复本机未提交的改动"
-              : serverMarkdown.current ? "已保存" : "");
+              : (asDirection ? data.direction : serverMarkdown.current) ? "已保存" : "");
           }
           setImages(data.images || []);
           setDoubts(data.doubts || []);
@@ -441,18 +449,18 @@ function DeskInner() {
   }, [draftId, refreshKey, qs.reload]);
 
   React.useEffect(() => {
-    if (!draftId || loadedId !== draftId || !dirty.current || resetting) return;
+    if (!draftId || loadedId !== draftId || !dirty.current || resetting || starting || (editingDirection && liveJob?.state === "running")) return;
     let alive = true;
     const timer = setTimeout(() => {
       if (resetInProgress.current) return;
-      void persistDraft(draftId, md).then(() => {
-        if (alive) setSavedAt("已保存");
+      void persistDraft(draftId, md, editingDirection).then(() => {
+        if (alive) { dirty.current = false; setSavedAt("已保存"); }
       }).catch(() => {
         if (alive) setSavedAt("保存失败 · 点击重试");
       });
     }, 550);
     return () => { alive = false; clearTimeout(timer); };
-  }, [md, draftId, loadedId, refreshKey, resetting]);
+  }, [md, draftId, loadedId, refreshKey, resetting, editingDirection, liveJob?.state, starting]);
 
   function editMarkdown(markdown: string) {
     if (!draftId || loadedId !== draftId || resetInProgress.current) return;
@@ -539,7 +547,7 @@ function DeskInner() {
   async function markAnswered() {
     if (!current) return;
     try {
-      if (dirty.current) await persistDraft(current.id, md);
+      if (dirty.current || editingDirection) await persistDraft(current.id, md);
       const r = await api.post<{ freedBytes?: number }>(`/api/questions/${current.id}/answered`);
       toast(`已标记回答，释放 ${Math.round((r.freedBytes ?? 0) / 1024)} KB`, "ok");
       setConfirm(null);
@@ -596,11 +604,17 @@ function DeskInner() {
   }
 
   async function runAgent() {
-    if (!current || starting) return;
+    if (!current || starting || (requiresDirection && !md.trim())) return;
+    const id = current.id;
     setStarting(true);
     try {
-      await api.post(`/api/questions/${current.id}/research`);
-      refresh();
+      await writes.get(id)?.catch(() => {});
+      await api.post(`/api/questions/${id}/research`, editingDirection ? { direction: md } : undefined);
+      if (editingDirection) clearDraftRecovery(id);
+      if (viewedDraft.current === id) {
+        dirty.current = false;
+        refresh();
+      }
       void qs.reload(true);
     } catch (e) {
       toast(e instanceof Error ? e.message : "启动失败", "err");
@@ -625,7 +639,7 @@ function DeskInner() {
   const processing = liveJob?.state === "running" || starting || (!researchStatus && current.status === "researching");
   const canEdit = !resetting && loadedId === draftId && (!processing || !!serverMarkdown.current);
   const progress = Math.round((liveJob?.progress ?? 0) * 100);
-  const canStart = !resetting && !processing && loadedId === draftId && (!!researchStatus?.resumable || (!current.hasDraft && !md.trim()));
+  const canStart = !resetting && !processing && loadedId === draftId && (editingDirection || (!!researchStatus?.resumable && researchStatus.draftSaved));
 
   return (
     <div className="desk">
@@ -900,12 +914,18 @@ function DeskInner() {
             </div>
             {processing && <progress max={100} value={progress} aria-label="拟稿进度" />}
             {processing && researchStatus?.verification && <VerificationTimer {...researchStatus.verification} />}
-            <p>{draftError || (liveJob?.state !== "done" && liveJob?.message) || "先保存资料和正文，再补充核查与配图。"}</p>
-            {canStart && <button className="btn btn-primary btn-sm" onClick={runAgent}>
+            <p>{draftError || (liveJob?.state !== "done" && liveJob?.message) || (editingDirection
+              ? requiresDirection ? "主观模式：先写下你的判断和理由，助手会沿着你的方向查证并拟稿。"
+                : "可先写下你的判断和解答方向；留空则直接拟稿。" : "先保存资料和正文，再补充核查与配图。")}</p>
+            {canStart && <button className="btn btn-primary btn-sm" disabled={requiresDirection && !md.trim()} onClick={runAgent}>
               {researchStatus?.resumable ? "继续上次任务" : "生成初稿"}
             </button>}
           </section>
         )}
+        {loadedId === draftId && !editingDirection && savedDirection && <details className="author-direction">
+          <summary>查看原始答题思路</summary>
+          <p>{savedDirection}</p>
+        </details>}
         {/* 编辑器常驻不卸载：切到预览时光标位置也不会丢，
             插图时才能准确插在原来那句话后面 */}
         <div className="desk-edit" style={mode === "edit" ? undefined : { display: "none" }}>
@@ -914,8 +934,9 @@ function DeskInner() {
             className="editor"
             value={loadedId === draftId ? md : ""}
             disabled={!canEdit}
-            aria-label="回答正文"
-            placeholder="在这里落下你的判断。左侧配图点一下就能插到光标处，也可以直接拖进来。"
+            aria-label={editingDirection ? "答题思路" : "回答正文"}
+            maxLength={editingDirection ? 6000 : undefined}
+            placeholder={editingDirection ? "例如：我的判断是……主要理由有两点……希望核对的是……" : "在这里修改回答正文。左侧配图点一下就能插到光标处。"}
             onChange={(e) => {
               editMarkdown(e.target.value);
             }}
@@ -954,12 +975,10 @@ function DeskInner() {
           <span className="mono" style={{ color: good ? "var(--moss)" : "var(--ink-3)" }}>
             {words}
           </span>
-          <span className="dim" style={{ fontSize: 11 }}>
-            / 建议 {min}–{max} 字
-          </span>
+          <span className="dim" style={{ fontSize: 11 }}>{editingDirection ? "字 · 答题思路" : `/ 建议 ${min}–${max} 字`}</span>
           <span className="dim" style={{ fontSize: 11, marginLeft: 8 }}>
             {savedAt.startsWith("保存失败") ? (
-              <button className="btn btn-sm" disabled={resetting} onClick={() => void persistDraft(draftId, md).then(
+              <button className="btn btn-sm" disabled={resetting} onClick={() => void persistDraft(draftId, md, editingDirection).then(
                 () => setSavedAt("已保存"), () => toast("仍无法保存，正文保留在本机恢复区", "err"),
               )}>{savedAt}</button>
             ) : savedAt}

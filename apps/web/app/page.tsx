@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import React from "react";
 import MemorialRow from "@/components/MemorialRow";
+import ImportQuestions from "@/components/ImportQuestions";
 import {
   Empty,
   IconArrowRight,
@@ -13,7 +14,6 @@ import {
 } from "@/components/ui";
 import { api, toast } from "@/lib/api";
 import { useLoad } from "@/lib/hooks";
-import { watchJob } from "@/lib/jobwatch";
 import type {
   DomainCount,
   EventItem,
@@ -53,9 +53,10 @@ export default function DeskHome() {
   const [syncJob, setSyncJob] = React.useState<Job | null>(null);
 
   const all = q.data?.questions ?? [];
-  const pending = all.filter((x) => x.status === "pending_review");
+  const pending = all.filter((x) => x.status === "pending_review" && x.source !== "imported");
   const researching = all.filter((x) => x.status === "researching");
-  const queue = all.filter((x) => x.status === "inbox" && x.bucket === "selected");
+  const queue = all.filter((x) => x.status === "inbox" && x.bucket === "selected" && x.source !== "imported");
+  const imported = all.filter((x) => x.source === "imported");
 
   const slots = slotStates(se.data?.cronTimes ?? ["07:00", "15:00", "20:00"], ss.data?.lastSyncAt ?? null);
 
@@ -90,21 +91,6 @@ export default function DeskHome() {
     }
   }
 
-  async function research(item: Question) {
-    try {
-      const r = await api.post<{ message?: string }>(`/api/questions/${item.id}/research`);
-      toast(r?.message || "智能体已接手，正在检索资料", "ok");
-      q.reload(true);
-      watchJob(item.id, "research", () => {
-        q.reload(true);
-        st.reload(true);
-        ev.reload(true);
-      });
-    } catch (e) {
-      toast(e instanceof Error ? e.message : "启动失败", "err");
-    }
-  }
-
   return (
     <main className="page">
       <header className="page-head">
@@ -121,6 +107,7 @@ export default function DeskHome() {
           </p>
         </div>
         <div className="page-actions">
+          <ImportQuestions onImported={() => { void q.reload(true); void st.reload(true); }} />
           <button className="btn" onClick={() => void syncNow()} disabled={syncJob?.state === "running"}>
             <IconRefresh size={14} /> 同步通知
           </button>
@@ -176,6 +163,12 @@ export default function DeskHome() {
 
       <div className="split">
         <div>
+          {imported.length > 0 && <div style={{ marginBottom: 24 }}>
+            <SectionTitle count={imported.length} right={<button className="btn btn-sm" onClick={() => router.push("/inbox")}>查看收件箱 →</button>}>
+              置顶 · 导入问题
+            </SectionTitle>
+            <div className="memorial-list">{imported.slice(0, 5).map((item) => <MemorialRow key={item.id} q={item} compact />)}</div>
+          </div>}
           <SectionTitle
             count={pending.length}
             right={
@@ -190,13 +183,13 @@ export default function DeskHome() {
           {pending.length === 0 && (
             <Empty glyph="空">
               目前没有待批阅的稿子。可以在「奏章」里挑一个感兴趣的问题，
-              点播放键让智能体开始拟稿。
+              打开写作台，填写答题思路或生成初稿。
             </Empty>
           )}
 
           <div className="memorial-list" style={{ borderTop: pending.length ? undefined : "none" }}>
             {pending.slice(0, 6).map((item) => (
-              <MemorialRow key={item.id} q={item} onResearch={research} />
+              <MemorialRow key={item.id} q={item} />
             ))}
           </div>
 
@@ -212,7 +205,7 @@ export default function DeskHome() {
               </div>
               <div className="memorial-list">
                 {queue.slice(0, 5).map((item) => (
-                  <MemorialRow key={item.id} q={item} onResearch={research} compact />
+                  <MemorialRow key={item.id} q={item} compact />
                 ))}
               </div>
             </>

@@ -18,7 +18,8 @@ MINECRAFT_SOURCES = (
 
 def question_text(question):
     return "\n".join([str(question.get("title") or "")[:220], str(question.get("excerpt") or "")[:800],
-                       " ".join(question.get("tags") or [])[:180]])
+                       " ".join(question.get("tags") or [])[:180],
+                       ("答主希望核查或展开的方向：" + str(question["direction"])[:2000]) if question.get("direction") else ""])
 
 
 def source_catalog(question, configured):

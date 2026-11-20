@@ -8,11 +8,25 @@ import urllib.parse
 from unittest.mock import patch
 
 import investigation
+import main
 import research
 import zhihu_open_search as search
 
 
 class ZhihuOpenSearchTests(unittest.TestCase):
+    def test_question_discovery_falls_back_on_quota_and_excludes_other_content(self):
+        expected = "https://www.zhihu.com/question/123/answer/456"
+
+        def fallback(query, **options):
+            self.assertEqual(query, "site:zhihu.com/question 铁路信号")
+            self.assertTrue(options["recent"])
+            return [url for url in [expected, "https://zhuanlan.zhihu.com/p/123", "https://example.org/question/123"]
+                    if options["allowed"](url)]
+
+        with patch.object(search, "search_urls", side_effect=search.SearchError("HTTP 429")), \
+                patch.object(research, "web_search", side_effect=fallback):
+            self.assertEqual(main.discover_questions({"topics": ["铁路信号"], "zhihuAccessSecret": "fixture"}), {"urls": [expected]})
+
     def test_disabled_path_ignores_legacy_environment_secret(self):
         with patch.dict(os.environ, {"ZHIHU_ACCESS_SECRET": "old-fixture"}), \
                 patch.object(search, "search_urls") as provider, \

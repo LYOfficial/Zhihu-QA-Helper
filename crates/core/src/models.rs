@@ -33,6 +33,7 @@ pub struct ZhihuUser {
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub logged_in: bool,
+    pub onboarding_required: bool,
     pub user: Option<ZhihuUser>,
     pub expires_at: Option<String>,
     pub last_sync_at: Option<String>,
@@ -258,6 +259,7 @@ pub struct ModelConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    pub writing_mode: String,
     pub cron_times: Vec<String>,
     pub pick_ratio: f64,
     pub draft_min: i64,

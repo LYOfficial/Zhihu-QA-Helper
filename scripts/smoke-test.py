@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 QUESTION = "如何配置铁路信号？"
 FIRST_DRAFT = "先看入口是否有信号，再检查区段边界。"
 MANUAL_DRAFT = "手工补充：先在测试线路上验证区段边界。"
+DIRECTION = "我的判断：先检查入口，不应该一开始就重做全线。"
 
 
 def free_port():
@@ -72,10 +73,16 @@ class Agent(BaseHTTPRequestHandler):
                        "zhihu_search": {"ok": True, "message": "连接成功"},
                        "global_search": {"ok": False, "message": "HTTP 429"}})
         elif stage == "collect":
+            if self.calls[stage] == 1:
+                assert payload["direction"] == DIRECTION
             self.send({"docs": [], "plan": {}, "warnings": ["回归测试：未连接外部资料站"]})
         elif stage == "qualify":
             self.send({**payload["material"], "findings": []})
         elif stage == "draft":
+            if self.calls[stage] <= 2:
+                assert payload["direction"] == DIRECTION
+            elif self.calls[stage] == 3:
+                assert payload["direction"] == "这是重新拟稿时填写的判断。"
             if self.calls[stage] == 1:
                 self.send({"ok": False, "error": "回归测试：模拟模型暂时不可用"})
             else:
@@ -146,8 +153,12 @@ class Smoke:
             database.execute("UPDATE settings SET auto_sync=0")
             database.execute("INSERT INTO account (id, name, cookie, zhihu_id) VALUES (1, '本机测试答主', 'fixture', 'first-account')")
             for qid, title in (("rail", QUESTION), ("other", "另一条测试问题")):
-                database.execute("INSERT INTO questions (id,title,domain,tags) VALUES (?,?,?,?)",
-                                 (qid, title, "测试资料", '["铁路"]'))
+                database.execute("INSERT INTO questions (id,question_id,title,domain,tags) VALUES (?,?,?,?,?)",
+                                 (qid, "123456789" if qid == "other" else "987654321", title, "测试资料", '["铁路"]'))
+            database.execute("UPDATE questions SET bucket='selected' WHERE id='rail'")
+            database.execute("INSERT INTO questions (id,question_id,title) VALUES ('already','42','已经回答的题')")
+            database.execute("INSERT INTO answered_questions VALUES ('first-account','42')")
+            database.execute("INSERT INTO answered_questions VALUES ('other-account','123456789')")
 
     def stage(self):
         return self.request("/questions/rail/research")
@@ -161,11 +172,30 @@ class Smoke:
     def test_workflow(self):
         with self.core():
             self.seed()
+            assert self.request("/session")["onboardingRequired"]
+            assert {item["id"] for item in self.request("/questions?status=all")["questions"]} == {"rail", "other"}
+            self.request("/session/onboarding/finish", "POST", {})
+            assert not self.request("/session")["onboardingRequired"]
+            shares = "另一条测试问题 - 知乎\nhttps://www.zhihu.com/question/123456789\nhttps://www.zhihu.com/question/123456789/answer/12\nhttps://zhuanlan.zhihu.com/p/555"
+            imported = self.request("/questions/import", "POST", {"url": shares})["results"]
+            assert [result.get("id") for result in imported] == ["other", None] and "专栏" in imported[1]["error"]
+            assert self.request("/questions")["questions"][0]["source"] == "imported"
+            assert self.request("/settings")["writingMode"] == "automatic"
+            self.request("/settings", "PUT", {"writingMode": "subjective"})
+            try:
+                self.start()
+            except urllib.error.HTTPError as error:
+                assert error.code == 400 and "主观模式" in json.load(error)["error"]
+            else:
+                raise AssertionError("主观模式重点题必须填写思路")
+            self.request("/drafts/rail/direction", "PUT", {"direction": DIRECTION})
+            assert self.draft()["direction"] == DIRECTION and self.draft()["markdown"] == ""
             assert self.request("/settings")["verifyTimeoutSeconds"] == 180
             self.request("/settings", "PUT", {"verifyTimeoutSeconds": 90})
             assert self.request("/settings")["verifyTimeoutSeconds"] == 90
             self.start()
             wait_for(lambda: self.stage()["job"]["state"] == "failed")
+            assert self.draft()["direction"] == DIRECTION and self.draft()["markdown"] == ""
             assert self.stage()["resumable"] and not self.stage()["draftSaved"]
             job = self.start()
             assert job == self.start(), "重复点击不能创建第二份稿子"
@@ -193,10 +223,13 @@ class Smoke:
             assert not self.stage()["resumable"]
             assert Agent.calls["collect"] == 1 and Agent.calls["qualify"] == 1 and Agent.calls["draft"] == 2
             assert self.draft()["doubts"][0]["evidence"][0]["url"] == "https://example.org/manual"
+            self.request("/settings", "PUT", {"writingMode": "automatic"})
+            print("PASS API：按账号过滤已答、分享导入去重置顶、主观模式校验、思路保存并用于失败续跑")
             print("PASS API：前置核查、查证出处、自动配图、失败续跑、重启恢复及保留手工正文")
 
     def check_zhihu_settings(self, page, output):
         page.goto(self.base + "/settings/")
+        page.get_by_role("button", name="配置 Access Secret").click()
         zhihu = page.get_by_role("region", name="知乎开放平台")
         secret = zhihu.get_by_label("Access Secret 值")
         enabled = zhihu.get_by_role("checkbox", name="启用知乎 API")
@@ -221,6 +254,7 @@ class Smoke:
         expected = {"enabled": True, "configured": True, "profileEnabled": True}
         wait_for(lambda: self.request(credentials_path) == expected)
         page.reload()
+        page.get_by_role("button", name="配置 Access Secret").click()
         wait_for(lambda: enabled.is_checked() and "已保存" in (secret.get_attribute("placeholder") or ""))
         assert secret.input_value() == ""
         zhihu.screenshot(path=output / "zhihu-open-settings.png")
@@ -234,6 +268,8 @@ class Smoke:
         zhihu.get_by_text("知乎搜索：连接成功", exact=True).wait_for()
         zhihu.get_by_role("button", name="移除密钥").click()
         wait_for(lambda: self.request(credentials_path) == initial)
+        with sqlite3.connect(self.directory / "zhihu-qa.db") as database:
+            database.execute("UPDATE account SET zhihu_id='first-account' WHERE id=1")
         print("PASS 知乎开放平台设置：外链、凭证测试、保存、重载不回显、账户隔离、关闭、移除")
 
     def test_browser(self, output):
@@ -254,6 +290,40 @@ class Smoke:
             assert reopened.value.ok
             page.unroute("**/api/session")
             self.check_zhihu_settings(page, output)
+            page.goto(self.base + "/settings/")
+            page.get_by_role("button", name="重新查看使用引导").click()
+            guide = page.get_by_role("dialog", name="欢迎使用知乎答主助手")
+            guide.get_by_role("heading", name="连接大模型").wait_for()
+            guide.get_by_role("button", name="下一步").click()
+            guide.get_by_role("heading", name="配置知乎 Access Secret").wait_for()
+            guide.get_by_role("button", name="下一步").click()
+            guide.get_by_role("radio", name="主观模式").check()
+            wait_for(lambda: self.request("/settings")["writingMode"] == "subjective")
+            page.screenshot(path=output / "onboarding-mode.png")
+            guide.get_by_role("radio", name="全自动模式").check()
+            wait_for(lambda: self.request("/settings")["writingMode"] == "automatic")
+            for title in ["分析领域画像", "同步问题", "试写第一份初稿"]:
+                guide.get_by_role("button", name="下一步").click()
+                guide.get_by_role("heading", name=title).wait_for()
+            guide.get_by_role("button", name="跳过引导").click()
+            guide.wait_for(state="hidden")
+            page.screenshot(path=output / "settings.png")
+            page.goto(self.base + "/inbox/")
+            page.get_by_role("button", name="主动找题").click()
+            page.get_by_text("请先分析领域画像或添加擅长的领域", exact=False).wait_for()
+            page.get_by_role("button", name="导入问题").click()
+            dialog = page.get_by_role("dialog", name="导入知乎问题")
+            dialog.get_by_label("问题或回答链接").fill("测试 - 知乎\nhttps://www.zhihu.com/question/123456789/answer/321\nhttps://zhuanlan.zhihu.com/p/555")
+            dialog.get_by_role("button", name="导入并置顶").click()
+            dialog.get_by_text("已导入或置顶 1 个问题").wait_for()
+            dialog.get_by_text("专栏文章不是问题", exact=False).first.wait_for()
+            bounds = dialog.bounding_box()
+            assert abs(bounds["x"] + bounds["width"] / 2 - 640) < 4
+            assert abs(bounds["y"] + bounds["height"] / 2 - 429) < 4
+            page.screenshot(path=output / "import-questions.png")
+            dialog.get_by_role("button", name="完成").click()
+            assert "另一条测试问题" in page.locator(".memorial").first.inner_text()
+            print("PASS 界面：精简设置、六步引导、模式切换、分享文本批量导入与置顶")
             page.goto(self.base + "/desk/?id=rail")
             editor = page.get_by_role("textbox", name="回答正文")
             editor.wait_for()
@@ -295,7 +365,10 @@ class Smoke:
             assert page.locator(".page-scroll").evaluate("el => el.scrollWidth <= el.clientWidth + 1")
             page.get_by_role("combobox", name="切换问题").select_option("other")
             page.get_by_role("heading", name="另一条测试问题").wait_for()
-            assert editor.input_value() == ""
+            thoughts = page.get_by_role("textbox", name="答题思路")
+            assert thoughts.input_value() == ""
+            thoughts.fill("先核对问题的前提。")
+            wait_for(lambda: self.request("/drafts/other")["direction"] == "先核对问题的前提。")
 
             page.get_by_role("button", name="弃用", exact=True).click()
             page.get_by_role("button", name="确认弃用").click()
@@ -325,9 +398,10 @@ class Smoke:
             assert blank["images"] == assets and not self.stage()["resumable"]
             page.reload()
             page.get_by_role("button", name="生成初稿").wait_for()
-            assert editor.input_value() == "" and self.draft()["markdown"] == ""
+            assert thoughts.input_value() == "" and self.draft()["markdown"] == ""
             previous_job = self.stage()["job"]["id"]
             collect_count = Agent.calls["collect"]
+            thoughts.fill("这是重新拟稿时填写的判断。")
             Agent.review_release.clear()
             try:
                 page.get_by_role("button", name="生成初稿").click()
@@ -341,6 +415,7 @@ class Smoke:
                 Agent.review_release.set()
             wait_for(lambda: self.stage()["job"]["id"] != previous_job and self.stage()["job"]["state"] == "done")
             assert Agent.calls["collect"] == collect_count + 1 and FIRST_DRAFT in self.draft()["markdown"]
+            assert self.draft()["direction"] == "这是重新拟稿时填写的判断。"
             assert not errors, errors
             browser.close()
             print("PASS 界面：登录可重试、Logo 对齐、刷新恢复、搜图、导入去重、窄窗口、切换问题")

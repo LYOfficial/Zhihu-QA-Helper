@@ -8,14 +8,12 @@ import { relTime, FitMeter, IconPlay, IconQuill, IconRefresh, IconTrash } from "
 
 export default function MemorialRow({
   q,
-  onResearch,
   onDismiss,
   onRestore,
   restoreDisabled,
   compact,
 }: {
   q: Question;
-  onResearch?: (q: Question) => void;
   onDismiss?: (q: Question) => void;
   onRestore?: (q: Question) => void;
   restoreDisabled?: boolean;
@@ -36,8 +34,8 @@ export default function MemorialRow({
       <div className="memorial-body">
         <button
           className="memorial-title"
-          onClick={() => q.status === "dismissed" ? openExternal(q.url) : router.push(`/desk?id=${q.id}`)}
-          title={q.status === "dismissed" ? "在知乎打开" : "打开批阅台"}
+          onClick={() => ["dismissed", "answered"].includes(q.status) ? openExternal(q.url) : router.push(`/desk?id=${q.id}`)}
+          title={["dismissed", "answered"].includes(q.status) ? "在知乎打开" : "打开批阅台"}
         >
           {q.title}
         </button>
@@ -52,7 +50,9 @@ export default function MemorialRow({
           )}
           {q.domain && <span className="chip blue">{q.domain}</span>}
           {q.subDomain && <span className="chip">{q.subDomain}</span>}
-          <span className="chip plain">{q.source === "invite" ? "邀请回答" : "推荐回答"}</span>
+          <span className={`chip ${q.source === "imported" ? "blue" : "plain"}`}>
+            {q.source === "imported" ? "置顶 · 手动导入" : q.source === "discovered" ? "主动找题" : q.source === "invite" ? "邀请回答" : "推荐回答"}
+          </span>
           <span className="sep">·</span>
           <span>
             <b>{q.answerCount}</b> 回答 · <b>{q.followerCount}</b> 关注
@@ -102,8 +102,8 @@ export default function MemorialRow({
           <button className="btn btn-sm" disabled={restoreDisabled} onClick={() => onRestore(q)}>
             <IconRefresh size={13} /> 恢复到待解答
           </button>
-        ) : q.status === "inbox" && onResearch ? (
-          <button className="play-btn" title="让智能体开始拟稿" onClick={() => onResearch(q)}>
+        ) : q.status === "inbox" ? (
+          <button className="play-btn" title="打开写作台，填写思路或拟稿" onClick={() => router.push(`/desk?id=${q.id}`)}>
             <IconPlay size={11} />
           </button>
         ) : null}

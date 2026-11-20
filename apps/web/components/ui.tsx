@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { createPortal } from "react-dom";
 
 /* ---------------------------------------------------------------- 图标 */
 type P = { size?: number; className?: string };
@@ -241,34 +242,64 @@ export function Modal({
   onClose,
   children,
   width,
+  dismissible = true,
 }: {
   title: string;
   sub?: string;
   onClose: () => void;
   children: React.ReactNode;
   width?: number;
+  dismissible?: boolean;
 }) {
+  const titleId = React.useId();
+  const box = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
+    const previous = document.activeElement;
+    const frame = requestAnimationFrame(() => {
+      if (!box.current?.contains(document.activeElement)) box.current?.focus();
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
+    };
+  }, []);
+  React.useEffect(() => {
+    if (!dismissible) return;
     const h = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [onClose]);
+  }, [onClose, dismissible]);
 
-  return (
-    <div className="overlay" onClick={onClose}>
+  if (typeof document === "undefined") return null;
+  return createPortal(
+    <div className="overlay" onClick={dismissible ? onClose : undefined}>
       <div
         className="modal"
+        ref={box}
+        role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}
+        onKeyDown={(event) => {
+          if (event.key !== "Tab" || !box.current) return;
+          const focusable = [...box.current.querySelectorAll<HTMLElement>("button, input, textarea, select, summary, a[href]")]
+            .filter((item) => !item.matches(":disabled") && item.getClientRects().length > 0);
+          const first = focusable[0], last = focusable.at(-1);
+          if (event.shiftKey && (document.activeElement === first || document.activeElement === box.current)) {
+            event.preventDefault(); last?.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault(); first?.focus();
+          }
+        }}
         style={width ? { width: `min(${width}px, 100%)` } : undefined}
         onClick={(e) => e.stopPropagation()}
       >
-        <h3>{title}</h3>
+        <h3 id={titleId}>{title}</h3>
         {sub && <p className="sub">{sub}</p>}
-        <button className="btn-icon modal-close" onClick={onClose} aria-label="关闭">
+        {dismissible && <button className="btn-icon modal-close" onClick={onClose} aria-label="关闭">
           <IconX size={16} />
-        </button>
+        </button>}
         {children}
       </div>
-    </div>
+    </div>,
+    document.querySelector(".app-window") ?? document.body,
   );
 }
 

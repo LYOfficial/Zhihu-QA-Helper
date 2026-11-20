@@ -2,6 +2,7 @@
 
 import React from "react";
 import MemorialRow from "@/components/MemorialRow";
+import ImportQuestions from "@/components/ImportQuestions";
 import {
   Empty,
   IconRefresh,
@@ -12,7 +13,6 @@ import {
 import { api, toast } from "@/lib/api";
 import { clearDraftRecovery } from "@/lib/draft-recovery";
 import { useLoad } from "@/lib/hooks";
-import { watchJob } from "@/lib/jobwatch";
 import type { DomainCount, Job, Question } from "@/lib/types";
 
 const TABS = [
@@ -31,6 +31,7 @@ export default function InboxPage() {
   const [confirmDismiss, setConfirmDismiss] = React.useState<Question | null>(null);
   const [restoring, setRestoring] = React.useState(false);
   const [syncJob, setSyncJob] = React.useState<Job | null>(null);
+  const [starting, setStarting] = React.useState(false);
 
   const qs = useLoad<{ questions: Question[]; domains: DomainCount[] }>(() =>
     api.get("/api/questions?status=all")
@@ -48,7 +49,7 @@ export default function InboxPage() {
         if (job.state === "done" || job.state === "failed") {
           window.clearInterval(timer);
           qs.reload(true);
-          toast(job.state === "done" ? job.message || "同步完成" : `同步失败：${job.message}`, job.state === "done" ? "ok" : "err");
+          toast(job.message, job.state === "done" ? "ok" : "err");
         }
       } catch {
         // 单次进度查询失败时，下一次轮询继续尝试。
@@ -71,18 +72,25 @@ export default function InboxPage() {
     }
     const order: Record<string, number> = { pending_review: 0, researching: 1, inbox: 2 };
     return l.sort(
-      (a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3) || b.fit - a.fit
+      (a, b) => Number(b.source === "imported") - Number(a.source === "imported") ||
+        (a.source === "imported" && b.source === "imported" ? b.syncedAt.localeCompare(a.syncedAt) : 0) ||
+        (order[a.status] ?? 3) - (order[b.status] ?? 3) || b.fit - a.fit
     );
   }, [all, tab, domain, kw]);
 
-  async function research(item: Question) {
+  async function findQuestions() {
+    setStarting(true);
     try {
-      const r = await api.post<{ message?: string }>(`/api/questions/${item.id}/research`);
-      toast(r?.message || "已交给智能体，正在检索资料并起草", "ok");
-      setTimeout(() => qs.reload(true), 1200);
-      watchJob(item.id, "research", () => qs.reload(true));
+      const result = await api.post<{ jobId: string }>("/api/questions/discover");
+      setSyncJob({ id: result.jobId, kind: "discover_questions", questionId: null, stage: "准备", progress: 0.02,
+        message: "正在准备按领域找题", state: "running", startedAt: new Date().toISOString(), finishedAt: null });
+      setTab("todo");
+      setDomain("all");
+      setKw("");
     } catch (e) {
-      toast(e instanceof Error ? e.message : "启动失败", "err");
+      toast(e instanceof Error ? e.message : "找题未能启动", "err");
+    } finally {
+      setStarting(false);
     }
   }
 
@@ -132,13 +140,15 @@ export default function InboxPage() {
       <header className="page-head">
         <div>
           <h1 className="page-title">
-            全部奏章 <small>{all.length} MEMORIALS</small>
+            问题收件箱 <small>{all.length} QUESTIONS</small>
           </h1>
-          <p className="page-sub">
-            自动登录后按领域归档；重点队列取契合度最高的前 40%，其余留在这里等你偶遇。
-          </p>
+          <p className="page-sub">邀请、主动发现和手动导入的问题都在这里。手动导入置顶。</p>
         </div>
         <div className="page-actions">
+          <ImportQuestions onImported={() => { setTab("todo"); setDomain("all"); setKw(""); void qs.reload(true); }} />
+          <button className="btn btn-primary" onClick={() => void findQuestions()} disabled={starting || syncJob?.state === "running"}>
+            <IconSearch size={14} /> 主动找题
+          </button>
           <button className="btn" onClick={() => void syncNow(false)} disabled={syncJob?.state === "running"}>
             <IconRefresh size={14} /> 立即同步
           </button>
@@ -150,7 +160,7 @@ export default function InboxPage() {
 
       {syncJob && (
         <div className="sync-progress" role="status" aria-live="polite">
-          <div className="sync-progress-head"><span>{syncJob.state === "failed" ? "同步失败" : syncJob.state === "done" ? "同步完成" : syncJob.stage}</span><span>{Math.round(syncJob.progress * 100)}%</span></div>
+          <div className="sync-progress-head"><span>{syncJob.state === "failed" ? "未完成" : syncJob.state === "done" ? "已完成" : syncJob.stage}</span><span>{Math.round(syncJob.progress * 100)}%</span></div>
           <div className="sync-progress-track"><i style={{ width: `${Math.max(2, Math.round(syncJob.progress * 100))}%` }} /></div>
           <div className="sync-progress-message">{syncJob.message}</div>
         </div>
@@ -243,7 +253,7 @@ export default function InboxPage() {
         </div>
       )}
 
-      <SectionTitle count={list.length} right={<span className="dim">契合度降序</span>}>
+      <SectionTitle count={list.length} right={<span className="dim">导入置顶 · 按状态与契合度排序</span>}>
         清单
       </SectionTitle>
 
@@ -257,7 +267,6 @@ export default function InboxPage() {
             <MemorialRow
               key={item.id}
               q={item}
-              onResearch={research}
               onDismiss={setConfirmDismiss}
               onRestore={restore}
               restoreDisabled={restoring}

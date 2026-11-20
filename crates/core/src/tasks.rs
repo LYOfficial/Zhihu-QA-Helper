@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::models::*;
-use crate::state::{zhihu_client, AppState, ZhihuOpenSettings};
+use crate::state::{AppState, ZhihuOpenSettings};
+use crate::zhihu::{answer_question_id, parse_shared_link, RawQuestion, SharedLink, ZhihuClient};
 
 // ---------------- job 基础设施 ----------------
 
@@ -109,6 +110,81 @@ fn classify(title: &str, tags: &[String], terms: &[ProfileTerm]) -> (String, Str
     (best.0, best.1, best.2)
 }
 
+pub const IS_ANSWERED: &str = "EXISTS(SELECT 1 FROM answered_questions h JOIN account a ON a.zhihu_id=h.account_id
+    WHERE a.id=1 AND a.cookie<>'' AND h.question_id=q.question_id)";
+
+pub fn onboarding_required(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM account a WHERE a.id=1 AND a.cookie<>'' AND a.zhihu_id<>''
+         AND NOT EXISTS(SELECT 1 FROM onboarding_finished WHERE account_id=a.zhihu_id))", [], |row| row.get(0),
+    )
+}
+
+fn account_identity(conn: &rusqlite::Connection) -> Result<(String, String)> {
+    conn.query_row("SELECT zhihu_id, url_token FROM account WHERE id=1 AND cookie<>'' AND zhihu_id<>''",
+        [], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|_| anyhow::anyhow!("尚未登录知乎账号"))
+}
+
+async fn account_client(state: &AppState) -> Result<(String, String, ZhihuClient)> {
+    let db = state.db.lock().await;
+    let (account_id, token) = account_identity(&db.conn)?;
+    Ok((account_id, token, crate::state::zhihu_client_from_db(&db)?))
+}
+
+fn remember_answers(conn: &rusqlite::Connection, account_id: &str, answers: &[Value]) -> Result<usize> {
+    let mut insert = conn.prepare("INSERT OR IGNORE INTO answered_questions VALUES (?1,?2)")?;
+    let mut added = 0;
+    for id in answers.iter().map(answer_question_id).filter(|id| !id.is_empty()) {
+        added += insert.execute(params![account_id, id])?;
+    }
+    Ok(added)
+}
+
+async fn refresh_answer_history(state: &AppState, client: &ZhihuClient, account_id: &str, token: &str) -> Result<bool> {
+    let _lock = state.answer_history_lock.lock().await;
+    anyhow::ensure!(!token.is_empty(), "无法识别答主主页");
+    let mut backfill = {
+        let db = state.db.lock().await;
+        db.conn.query_row("SELECT next_offset FROM answer_history_progress WHERE account_id=?1",
+            [account_id], |row| row.get::<_, i64>(0)).optional()?.unwrap_or(0)
+    };
+    let mut newest = Some(0);
+    for turn in 0..10 {
+        let head = newest.is_some() && (turn < 5 || backfill < 0);
+        let offset = if head { newest.unwrap_or_default() } else if backfill >= 0 { backfill as usize } else { break };
+        let (answers, end) = client.answer_history_page(token, offset).await?;
+        anyhow::ensure!(answers.iter().all(|answer| !answer_question_id(answer).is_empty()), "回答记录缺少问题编号");
+        let mut db = state.db.lock().await;
+        let tx = db.conn.transaction()?;
+        let added = remember_answers(&tx, account_id, &answers)?;
+        let next = (offset + answers.len()) as i64;
+        if head {
+            newest = if end || (backfill != 0 && added == 0) { None } else { Some(next as usize) };
+        }
+        if offset as i64 == backfill || (head && end) {
+            backfill = if end { -1 } else { next };
+            tx.execute("INSERT OR REPLACE INTO answer_history_progress VALUES (?1,?2)", params![account_id, backfill])?;
+        }
+        tx.commit()?;
+        if backfill < 0 && newest.is_none() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn sync_answer_history(state: &AppState, client: &ZhihuClient, account_id: &str, token: &str) -> &'static str {
+    match tokio::time::timeout(std::time::Duration::from_secs(35), refresh_answer_history(state, client, account_id, token)).await {
+        Ok(Ok(true)) => "",
+        Ok(Ok(false)) => "；已排除已记录的回答，剩余历史会在下次同步继续补齐",
+        result => {
+            tracing::warn!("回答历史同步未完成：{result:?}");
+            "；未能同步全部回答记录，已使用本机已知记录排除"
+        }
+    }
+}
+
 fn load_terms(conn: &rusqlite::Connection) -> Result<Vec<ProfileTerm>> {
     let mut stmt = conn.prepare(
         "SELECT id, kind, label, weight, keywords, locked, note FROM profile_terms ORDER BY ord, weight DESC",
@@ -146,18 +222,247 @@ fn prioritize(
     Ok(selected)
 }
 
+fn is_answered(conn: &rusqlite::Connection, account_id: &str, id: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM answered_questions WHERE account_id=?1 AND question_id=?2)",
+        params![account_id, id], |row| row.get(0))?)
+}
+
+fn existing_question(conn: &rusqlite::Connection, id: &str) -> Result<Option<(String, String)>> {
+    Ok(conn.query_row("SELECT id, status FROM questions WHERE question_id=?1 LIMIT 1", [id],
+        |row| Ok((row.get(0)?, row.get(1)?))).optional()?)
+}
+
+fn insert_question(conn: &rusqlite::Connection, raw: &RawQuestion, created: i64, terms: &[ProfileTerm]) -> Result<(String, f64)> {
+    let (domain, sub, fit) = classify(&raw.title, &raw.tags, terms);
+    let id = Uuid::new_v4().to_string();
+    let synced = now_iso();
+    let created = chrono::DateTime::from_timestamp(created, 0).filter(|_| created > 0)
+        .map(|time| time.to_rfc3339()).unwrap_or_else(|| synced.clone());
+    conn.execute(
+        "INSERT INTO questions (id, zhihu_id, question_id, source, title, excerpt, url, domain, sub_domain,
+         fit, status, bucket, answer_count, follower_count, asker_name, asker_headline, tags, created_at, synced_at, fit_evaluated)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'inbox','queue',?11,?12,?13,?14,?15,?16,?17,?18)",
+        params![id, raw.zhihu_id, raw.question_id, raw.source, raw.title, raw.excerpt, raw.url, domain, sub, fit,
+            raw.answer_count, raw.follower_count, raw.asker_name, raw.asker_headline,
+            serde_json::to_string(&raw.tags)?, created, synced, !terms.is_empty()],
+    )?;
+    Ok((id, fit))
+}
+
+fn share_urls(text: &str) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    text.split(|character: char| character.is_whitespace() || "[]()<>\"'`，。；（）【】".contains(character))
+        .filter(|part| part.starts_with("https://") || part.starts_with("http://"))
+        .filter(|part| seen.insert(*part)).collect()
+}
+
+pub async fn import_questions(state: &AppState, text: &str) -> Result<Vec<Value>> {
+    anyhow::ensure!(text.len() <= 64000, "分享文本过长");
+    let normalized = text.replace("\\:", ":").replace("\\.", ".");
+    let urls = share_urls(&normalized);
+    anyhow::ensure!(!urls.is_empty() && urls.len() <= 10, "请粘贴 1–10 条知乎分享链接");
+    let (account_id, _, client) = account_client(state).await?;
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for url in urls {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let question_id = match parse_shared_link(url)? {
+                SharedLink::Question(id) => id,
+                SharedLink::Answer(id) => client.question_from_answer(&id).await?,
+            };
+            if seen.contains(&question_id) {
+                return Ok(None);
+            }
+            {
+                let db = state.db.lock().await;
+                anyhow::ensure!(account_identity(&db.conn)?.0 == account_id, "知乎账号已切换，请重试");
+                if let Some(id) = pin_existing(&db.conn, &account_id, &question_id)? {
+                    seen.insert(question_id);
+                    return Ok(Some(id));
+                }
+            }
+            let (question, created, _) = client.question_details(&question_id, "imported").await?;
+            let db = state.db.lock().await;
+            anyhow::ensure!(account_identity(&db.conn)?.0 == account_id, "知乎账号已切换，请重试");
+            if let Some(id) = pin_existing(&db.conn, &account_id, &question_id)? {
+                seen.insert(question_id);
+                return Ok(Some(id));
+            }
+            let terms = load_terms(&db.conn)?;
+            let (id, _) = insert_question(&db.conn, &question, created, &terms)?;
+            seen.insert(question_id);
+            Ok(Some(id))
+        }).await;
+        let result: Result<Option<String>> = result.unwrap_or_else(|_| Err(anyhow::anyhow!("读取知乎问题超时")));
+        results.push(match result {
+            Ok(Some(id)) => json!({"url": url, "id": id}),
+            Ok(None) => continue,
+            Err(error) => json!({"url": url, "error": error.to_string()}),
+        });
+    }
+    Ok(results)
+}
+
+fn pin_existing(conn: &rusqlite::Connection, account_id: &str, question_id: &str) -> Result<Option<String>> {
+    anyhow::ensure!(!is_answered(conn, account_id, question_id)?, "你已回答过该问题");
+    let Some((id, status)) = existing_question(conn, question_id)? else { return Ok(None) };
+    anyhow::ensure!(status != "answered", "该问题已标记为已回答");
+    anyhow::ensure!(status != "dismissed", "该问题已弃用，请从「已弃用」恢复后再导入");
+    conn.execute("UPDATE questions SET source='imported', synced_at=?2 WHERE id=?1", params![id, now_iso()])?;
+    Ok(Some(id))
+}
+
+pub async fn start_question_discovery(state: &crate::state::Shared) -> Result<String> {
+    let _lock = state.discovery_lock.lock().await;
+    let (account_id, token, terms, secret, client) = {
+        let db = state.db.lock().await;
+        if let Some(id) = db.conn.query_row("SELECT id FROM jobs WHERE kind='discover_questions' AND state='running' LIMIT 1",
+            [], |row| row.get(0)).optional()? { return Ok(id); }
+        let (account_id, token) = account_identity(&db.conn)?;
+        let terms = load_terms(&db.conn)?;
+        anyhow::ensure!(!terms.is_empty(), "请先分析领域画像或添加擅长的领域，再主动找题");
+        let open = ZhihuOpenSettings::load(&db)?;
+        (account_id, token, terms, if open.enabled { open.secret } else { String::new() }, crate::state::zhihu_client_from_db(&db)?)
+    };
+    let job = job_start(state, "discover_questions", None, "正在准备按领域找题").await;
+    let job_id = job.clone();
+    let state = state.clone();
+    tokio::spawn(async move {
+        match discover_questions_inner(&state, &client, &job_id, &account_id, &token, terms, secret).await {
+            Ok(message) => job_end(&state, &job_id, true, &message).await,
+            Err(error) => job_end(&state, &job_id, false, &error.to_string()).await,
+        }
+    });
+    Ok(job)
+}
+
+async fn discover_questions_inner(state: &AppState, client: &ZhihuClient, job: &str, account_id: &str, token: &str, mut terms: Vec<ProfileTerm>, secret: String) -> Result<String> {
+    job_step(state, job, "筛选已答", 0.1, "更新本机回答记录").await;
+    let note = sync_answer_history(state, client, account_id, token).await;
+    terms.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+    let topics: Vec<_> = terms.iter().filter(|term| !term.label.trim().is_empty()).take(4).map(|term| term.label.clone()).collect();
+    job_step(state, job, "检索知乎", 0.25, "按画像检索近期问题").await;
+    let payload = json!({"topics": topics, "zhihuAccessSecret": secret});
+    let (native, found) = tokio::join!(search_native(client, topics), agent_stage(state, "/v1/questions/discover", &payload, 30));
+    anyhow::ensure!(native.is_ok() || found.is_ok(), "暂时无法检索知乎问题，请检查网络或稍后重试");
+    let external: Vec<_> = found.unwrap_or(Value::Null)["urls"].as_array().into_iter().flatten().filter_map(Value::as_str)
+        .filter_map(|url| match parse_shared_link(url) { Ok(SharedLink::Question(id)) => Some(id), _ => None }).collect();
+    let native = native.unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut checks = tokio::task::JoinSet::new();
+    let mut ids = Vec::new();
+    {
+        let db = state.db.lock().await;
+        for index in 0..native.len().max(external.len()) {
+            for id in [native.get(index), external.get(index)].into_iter().flatten() {
+                if seen.insert(id.clone()) && !is_answered(&db.conn, account_id, id)? && existing_question(&db.conn, id)?.is_none() {
+                    ids.push(id.clone());
+                }
+            }
+        }
+    }
+    job_step(state, job, "评估候选", 0.52, "核对发问时间、关注度和领域契合度").await;
+    let now = chrono::Utc::now().timestamp();
+    let mut ranked = Vec::new();
+    let mut readable = 0;
+    let candidates = ids.len();
+    for group in ids.chunks(4).take(5) {
+        for id in group {
+            let client = client.clone();
+            let id = id.clone();
+            checks.spawn(async move { tokio::time::timeout(std::time::Duration::from_secs(9), client.question_details(&id, "discovered")).await });
+        }
+        while let Some(outcome) = checks.join_next().await {
+            let Ok(Ok(Ok((question, created, views)))) = outcome else { continue };
+            readable += 1;
+            if let Some(score) = discovery_score(&question, created, views, now, &terms) {
+                ranked.push((score, question, created));
+            }
+        }
+        if ranked.len() >= 12 { break; }
+    }
+    anyhow::ensure!(candidates == 0 || readable > 0, "找到了候选链接，但知乎未返回问题详情，请稍后重试");
+    ranked.sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.question_id.cmp(&right.1.question_id)));
+    let mut db = state.db.lock().await;
+    let tx = db.conn.transaction()?;
+    anyhow::ensure!(account_identity(&tx)?.0 == account_id, "知乎账号已切换，请重试");
+    let mut added = 0;
+    for (_, question, created) in ranked.into_iter().take(8) {
+        if !is_answered(&tx, account_id, &question.question_id)? && existing_question(&tx, &question.question_id)?.is_none() {
+            insert_question(&tx, &question, created, &terms)?;
+            added += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(if added == 0 { format!("没有发现新的合适问题，可调整领域关键词后重试{note}") }
+        else { format!("已加入 {added} 个近期相关问题，不会自动拟稿{note}") })
+}
+
+async fn search_native(client: &ZhihuClient, topics: Vec<String>) -> Result<Vec<String>> {
+    let mut searches = tokio::task::JoinSet::new();
+    for (index, topic) in topics.into_iter().enumerate() {
+        let client = client.clone();
+        searches.spawn(async move { (index, tokio::time::timeout(std::time::Duration::from_secs(8), client.search_recent_questions(&topic)).await) });
+    }
+    let mut groups = Vec::new();
+    while let Some(result) = searches.join_next().await {
+        if let Ok((index, Ok(Ok(ids)))) = result { groups.push((index, ids)); }
+    }
+    anyhow::ensure!(!groups.is_empty(), "知乎站内检索暂不可用");
+    groups.sort_by_key(|(index, _)| *index);
+    Ok((0..groups.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0))
+        .flat_map(|position| groups.iter().filter_map(move |(_, ids)| ids.get(position).cloned())).collect())
+}
+
+fn discovery_score(question: &RawQuestion, created: i64, views: i64, now: i64, terms: &[ProfileTerm]) -> Option<f64> {
+    let age = now.checked_sub(created)?;
+    if !(0..=90 * 86400).contains(&age) { return None; }
+    let (_, _, fit) = classify(&question.title, &question.tags, terms);
+    let activity = question.follower_count.max(0) as f64 + 2.0 * question.answer_count.max(0) as f64
+        + views.max(0) as f64 / 100.0;
+    (fit > 0.0 && activity > 0.0).then(|| fit * 3.0 + activity.ln_1p() / 5.0 - age as f64 / (90.0 * 86400.0))
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_ranks_relevant_recent_questions_with_real_activity() {
+        let terms = [ProfileTerm {
+            id: "rail".into(), kind: "primary".into(), label: "铁路".into(), weight: 1.0,
+            keywords: vec!["信号".into()], locked: false, note: String::new(),
+        }];
+        let mut question = RawQuestion {
+            question_id: "123".into(), zhihu_id: "123".into(), title: "铁路信号怎么设置？".into(),
+            source: "discovered".into(), excerpt: String::new(), url: String::new(), asker_name: String::new(),
+            asker_headline: String::new(), answer_count: 0, follower_count: 0, tags: Vec::new(),
+        };
+        let now = 1_800_000_000;
+        let created = now - 86_400;
+        assert!(discovery_score(&question, created, 0, now, &terms).is_none());
+        assert!(discovery_score(&question, now - 91 * 86_400, 100, now, &terms).is_none());
+        let score = discovery_score(&question, created, 100, now, &terms).unwrap();
+        assert!(discovery_score(&question, created, 500, now, &terms).unwrap() > score);
+        assert!(discovery_score(&question, created - 86_400, 100, now, &terms).unwrap() < score);
+        question.title = "如何给水彩配色？".into();
+        assert!(discovery_score(&question, created, 1_000_000, now, &terms).is_none());
+    }
+}
+
 pub(crate) fn refresh_inbox_fit(conn: &rusqlite::Connection) -> Result<()> {
     let terms = load_terms(conn)?;
-    let mut select = conn.prepare(
-        "SELECT id, title, tags FROM questions
+    let mut select = conn.prepare(&format!(
+        "SELECT id, title, tags, source FROM questions q
          WHERE status='inbox' AND bucket IN ('queue', 'selected')
+         AND NOT {IS_ANSWERED}
          ORDER BY synced_at DESC, id",
-    )?;
+    ))?;
     let questions = select
         .query_map([], |row| {
             let tags =
                 serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?).unwrap_or_default();
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, tags))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, tags, row.get::<_, String>(3)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut update = conn.prepare(
@@ -165,10 +470,10 @@ pub(crate) fn refresh_inbox_fit(conn: &rusqlite::Connection) -> Result<()> {
          WHERE id=?1",
     )?;
     let mut candidates = Vec::with_capacity(questions.len());
-    for (id, title, tags) in questions {
+    for (id, title, tags, source) in questions {
         let (domain, sub, fit) = classify(&title, &tags, &terms);
         update.execute(params![id, domain, sub, fit, !terms.is_empty()])?;
-        candidates.push((id, fit));
+        if !matches!(source.as_str(), "imported" | "discovered") { candidates.push((id, fit)); }
     }
     prioritize(conn, &mut candidates)?;
     Ok(())
@@ -194,7 +499,7 @@ pub async fn run_sync_recent(state: &crate::state::Shared, days: i64) -> Result<
     run_sync_window(state, Some(days)).await
 }
 
-pub async fn start_sync(state: &crate::state::Shared, days: Option<i64>) -> String {
+pub async fn start_sync(state: &crate::state::Shared, days: Option<i64>, select_only: bool) -> String {
     let message = if days.is_some() {
         "正在准备最近 3 天通知"
     } else {
@@ -204,7 +509,7 @@ pub async fn start_sync(state: &crate::state::Shared, days: Option<i64>) -> Stri
     let state = state.clone();
     let job_id = job.clone();
     tokio::spawn(async move {
-        let result = sync_inner(&state, &job_id, days).await;
+        let result = sync_inner(&state, &job_id, days, select_only).await;
         match &result {
             Ok(report) => job_end(&state, &job_id, true, &report.message).await,
             Err(error) => {
@@ -261,7 +566,7 @@ pub async fn bootstrap_if_empty(state: &crate::state::Shared) {
             .conn
             .query_row("SELECT COUNT(*) FROM questions", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0);
-        logged_in && questions == 0
+        logged_in && questions == 0 && !onboarding_required(&db.conn).unwrap_or(true)
     };
     if should_sync {
         if let Err(e) = run_sync_recent(state, 3).await {
@@ -272,7 +577,7 @@ pub async fn bootstrap_if_empty(state: &crate::state::Shared) {
 
 async fn run_sync_window(state: &crate::state::Shared, days: Option<i64>) -> Result<SyncReport> {
     let job = job_start(state, "sync", None, "正在连接知乎").await;
-    let result = sync_inner(state, &job, days).await;
+    let result = sync_inner(state, &job, days, false).await;
     match &result {
         Ok(r) => job_end(state, &job, true, &r.message).await,
         Err(e) => {
@@ -287,6 +592,7 @@ async fn sync_inner(
     state: &crate::state::Shared,
     job: &str,
     days: Option<i64>,
+    select_only: bool,
 ) -> Result<SyncReport> {
     job_step(
         state,
@@ -300,13 +606,15 @@ async fn sync_inner(
         },
     )
     .await;
-    let client = zhihu_client(state).await?;
+    let (account_id, token, client) = account_client(state).await?;
     let batch = match days {
         Some(days) => client.fetch_invites_since(days).await?,
         None => client.fetch_invites(20).await?,
     };
     let received = batch.received;
     let raws = batch.questions;
+    job_step(state, job, "排除已答", 0.32, "正在更新本机答题记录").await;
+    let history_note = sync_answer_history(state, &client, &account_id, &token).await;
 
     job_step(
         state,
@@ -322,48 +630,13 @@ async fn sync_inner(
     let (added, selected_ids) = {
         let mut db = state.db.lock().await;
         let tx = db.conn.transaction()?;
+        anyhow::ensure!(account_identity(&tx)?.0 == account_id, "知乎账号已切换，请重试");
         let terms = load_terms(&tx)?;
         let mut inserted = Vec::new();
         for rq in &raws {
-            let exists: Option<String> = tx
-                .query_row(
-                    "SELECT id FROM questions WHERE question_id = ?1 LIMIT 1",
-                    params![rq.question_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if exists.is_some() {
-                continue;
+            if !is_answered(&tx, &account_id, &rq.question_id)? && existing_question(&tx, &rq.question_id)?.is_none() {
+                inserted.push(insert_question(&tx, rq, 0, &terms)?);
             }
-            let (domain, sub, fit) = classify(&rq.title, &rq.tags, &terms);
-            let id = Uuid::new_v4().to_string();
-            tx.execute(
-                "INSERT INTO questions
-                 (id, zhihu_id, question_id, source, title, excerpt, url, domain, sub_domain,
-                  fit, status, bucket, answer_count, follower_count, asker_name, asker_headline,
-                  tags, created_at, synced_at, fit_evaluated)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'inbox','queue',?11,?12,?13,?14,?15,?16,?16,?17)",
-                params![
-                    id,
-                    rq.zhihu_id,
-                    rq.question_id,
-                    rq.source,
-                    rq.title,
-                    rq.excerpt,
-                    rq.url,
-                    domain,
-                    sub,
-                    fit,
-                    rq.answer_count,
-                    rq.follower_count,
-                    rq.asker_name,
-                    rq.asker_headline,
-                    serde_json::to_string(&rq.tags).unwrap_or_else(|_| "[]".into()),
-                    now_iso(),
-                    !terms.is_empty(),
-                ],
-            )?;
-            inserted.push((id, fit));
         }
         let selected_ids = prioritize(&tx, &mut inserted)?;
         tx.execute(
@@ -410,7 +683,7 @@ async fn sync_inner(
         added,
         selected: selected_ids.len(),
         by_domain,
-        message: if added == 0 {
+        message: (if added == 0 {
             format!(
                 "读取 {received} 条通知，识别 {} 条邀请/推荐，没有新的问题",
                 raws.len()
@@ -420,16 +693,21 @@ async fn sync_inner(
                 "读取 {received} 条通知，新增 {added} 个问题，{} 个进入重点队列",
                 selected_ids.len()
             )
-        },
+        }) + history_note,
     };
 
-    // 新进入重点队列的，自动开始研究
-    for id in selected_ids {
-        let st = state.clone();
-        tokio::spawn(async move {
-            let _ = start_research(&st, &id).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    if !select_only {
+        let auto_draft = {
+            let db = state.db.lock().await;
+            load_settings(&db).writing_mode == "automatic" && !onboarding_required(&db.conn)?
+        };
+        if auto_draft {
+            for id in selected_ids {
+                let st = state.clone();
+                tokio::spawn(async move { let _ = start_research(&st, &id, None, true).await; });
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
     }
 
     Ok(report)
@@ -461,34 +739,15 @@ pub async fn run_profile_job(state: &AppState, job: String) -> Result<()> {
 }
 
 async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
-    let (url_token, account_id, cookie_empty, open_settings) = {
+    let (url_token, account_id, open_settings, client) = {
         let db = state.db.lock().await;
-        let tok: String = db
-            .conn
-            .query_row("SELECT url_token FROM account WHERE id = 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap_or_default();
-        let ck: String = db
-            .conn
-            .query_row("SELECT cookie FROM account WHERE id = 1", [], |r| r.get(0))
-            .unwrap_or_default();
-        let account_id = db
-            .conn
-            .query_row("SELECT zhihu_id FROM account WHERE id=1", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()?
-            .unwrap_or_default();
-        (tok, account_id, ck.trim().is_empty(), ZhihuOpenSettings::load(&db)?)
+        let (account_id, token) = account_identity(&db.conn)?;
+        (token, account_id, ZhihuOpenSettings::load(&db)?, crate::state::zhihu_client_from_db(&db)?)
     };
-    if cookie_empty {
-        anyhow::bail!("请先登录知乎账号");
-    }
 
     job_step(state, job, "抓取回答", 0.16, "正在获取回答列表").await;
-    let client = zhihu_client(state).await?;
     let answers = client.my_answers(&url_token, 3).await.unwrap_or_default();
+    remember_answers(&state.db.lock().await.conn, &account_id, &answers)?;
     job_step(
         state,
         job,
@@ -793,9 +1052,20 @@ async fn discover_inner(state: &AppState, job: &str) -> Result<()> {
 
 /// 同时最多跑两份稿子。三份以上一起打同一个模型 Key，既容易限流，
 /// 也会让每一份都慢到让人以为卡死。
-pub async fn start_research(state: &crate::state::Shared, question_id: &str) -> Result<String> {
+pub fn save_direction(conn: &rusqlite::Connection, id: &str, text: &str) -> Result<()> {
+    anyhow::ensure!(text.chars().count() <= 6000, "答题思路不能超过 6000 字");
+    let previous: Option<String> = conn.query_row("SELECT text FROM author_directions WHERE question_id=?1", [id], |row| row.get(0)).optional()?;
+    if previous.as_deref().unwrap_or_default() != text {
+        conn.execute("INSERT INTO author_directions VALUES (?1,?2) ON CONFLICT(question_id) DO UPDATE SET text=excluded.text", params![id, text])?;
+        conn.execute("DELETE FROM research_checkpoints WHERE question_id=?1 AND drafted=0", [id])?;
+    }
+    Ok(())
+}
+
+pub async fn start_research(state: &crate::state::Shared, question_id: &str, direction: Option<&str>, automatic: bool) -> Result<String> {
     let job = {
         let mut db = state.db.lock().await;
+        let settings = load_settings(&db);
         let tx = db.conn.transaction()?;
         if let Some(existing) = tx
             .query_row(
@@ -807,21 +1077,20 @@ pub async fn start_research(state: &crate::state::Shared, question_id: &str) -> 
         {
             return Ok(existing);
         }
-        let status: String = tx
+        let (status, bucket, source, answered): (String, String, String, bool) = tx
             .query_row(
-                "SELECT status FROM questions WHERE id=?1",
+                &format!("SELECT status, bucket, source, {IS_ANSWERED} FROM questions q WHERE id=?1"),
                 params![question_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(|_| anyhow::anyhow!("问题不存在"))?;
-        let resume = tx
+        let checkpoint = tx
             .query_row(
-                "SELECT 1 FROM research_checkpoints WHERE question_id=?1",
+                "SELECT drafted FROM research_checkpoints WHERE question_id=?1",
                 params![question_id],
-                |_| Ok(()),
+                |row| row.get::<_, bool>(0),
             )
-            .optional()?
-            .is_some();
+            .optional()?;
         let has_draft = tx
             .query_row(
                 "SELECT 1 FROM drafts WHERE question_id=?1 AND trim(markdown)<>''",
@@ -835,9 +1104,23 @@ pub async fn start_research(state: &crate::state::Shared, question_id: &str) -> 
             "该问题已归档，不能拟稿"
         );
         anyhow::ensure!(
-            !has_draft || resume,
+            !has_draft || checkpoint == Some(true),
             "已有正文。为避免覆盖手工改动，不会重新生成。"
         );
+        anyhow::ensure!(!answered, "该问题已回答，无需再次拟稿");
+        let suggestion = bucket == "selected" && !matches!(source.as_str(), "imported" | "discovered");
+        let saved_direction: String = tx.query_row("SELECT text FROM author_directions WHERE question_id=?1", [question_id],
+            |row| row.get(0)).optional()?.unwrap_or_default();
+        if automatic {
+            anyhow::ensure!(settings.writing_mode == "automatic" && suggestion && !onboarding_required(&tx)?
+                && saved_direction.trim().is_empty() && checkpoint.is_none(), "该问题等待作者确认后再拟稿");
+        }
+        if !has_draft {
+            let text = direction.unwrap_or(&saved_direction);
+            anyhow::ensure!(settings.writing_mode != "subjective" || !suggestion || !text.trim().is_empty(),
+                "主观模式下，请先写一段自己的判断和解答方向");
+            if let Some(text) = direction { save_direction(&tx, question_id, text)?; }
+        }
         let job = format!("j_{}", Uuid::new_v4().simple());
         tx.execute(
             "INSERT INTO jobs (id, kind, question_id, stage, message, started_at) VALUES (?1,'research',?2,'排队','等待拟稿名额',?3)",
@@ -1081,7 +1364,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
     };
 
     let img_dir = state.data_dir.join("images").join(crate::db::sanitize(qid));
-    let (checkpoint, samples) = {
+    let (checkpoint, samples, direction) = {
         let db = state.db.lock().await;
         let checkpoint = db
             .conn
@@ -1103,10 +1386,13 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
         (
             checkpoint,
             serde_json::from_str::<Value>(&samples).unwrap_or(json!([])),
+            db.conn.query_row("SELECT text FROM author_directions WHERE question_id=?1", [qid],
+                |row| row.get::<_, String>(0)).optional()?.unwrap_or_default(),
         )
     };
     let mut payload = json!({
         "question": question,
+        "direction": direction,
         "profile": { "summary": meta_summary, "terms": terms, "style": meta_style, "samples": samples },
         "sources": sources,
         "model": model,
@@ -1300,10 +1586,11 @@ pub fn load_settings(db: &crate::db::Db) -> Settings {
     db.conn
         .query_row(
             "SELECT cron_times, pick_ratio, draft_min, draft_max, image_min, image_max,
-                    auto_sync, minimize_to_tray, auto_launch, sign_mode, verify_timeout_seconds FROM settings WHERE id=1",
+                    auto_sync, minimize_to_tray, auto_launch, sign_mode, verify_timeout_seconds, writing_mode FROM settings WHERE id=1",
             [],
             |r| {
                 Ok(Settings {
+                    writing_mode: r.get(11)?,
                     cron_times: serde_json::from_str(&r.get::<_, String>(0)?)
                         .unwrap_or_else(|_| vec!["07:00".into(), "15:00".into(), "20:00".into()]),
                     pick_ratio: r.get(1)?,
@@ -1321,6 +1608,7 @@ pub fn load_settings(db: &crate::db::Db) -> Settings {
             },
         )
         .unwrap_or(Settings {
+            writing_mode: "automatic".into(),
             cron_times: vec!["07:00".into(), "15:00".into(), "20:00".into()],
             pick_ratio: 0.4,
             draft_min: 500,

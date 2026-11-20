@@ -332,6 +332,24 @@ fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !has_column("settings", "writing_mode") {
+        conn.execute("ALTER TABLE settings ADD COLUMN writing_mode TEXT NOT NULL DEFAULT 'automatic'", [])?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS author_directions (
+            question_id TEXT PRIMARY KEY REFERENCES questions(id) ON DELETE CASCADE,
+            text TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS answered_questions (
+            account_id TEXT NOT NULL, question_id TEXT NOT NULL,
+            PRIMARY KEY (account_id, question_id)
+         );
+         CREATE TABLE IF NOT EXISTS answer_history_progress (
+            account_id TEXT PRIMARY KEY, next_offset INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS onboarding_finished (account_id TEXT PRIMARY KEY);
+         CREATE INDEX IF NOT EXISTS idx_q_zhihu_question ON questions(question_id);",
+    )?;
     if !has_column("questions", "fit_evaluated") {
         let tx = conn.unchecked_transaction()?;
         tx.execute(

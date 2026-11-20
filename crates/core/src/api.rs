@@ -43,6 +43,7 @@ pub fn router(state: Shared) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/session", get(get_session))
+        .route("/session/onboarding/finish", post(finish_onboarding))
         .route("/session/qrcode", post(create_qrcode))
         .route("/session/qrcode/{token}", get(poll_qrcode))
         .route("/session/cookie", post(login_with_cookie))
@@ -60,6 +61,8 @@ pub fn router(state: Shared) -> Router {
         .route("/sources", get(get_sources).put(put_sources))
         .route("/sources/discover", post(discover_sources))
         .route("/questions", get(list_questions))
+        .route("/questions/import", post(import_question))
+        .route("/questions/discover", post(discover_questions))
         .route("/questions/sync", post(sync_now))
         .route("/questions/sync/recent", post(sync_recent_now))
         .route("/questions/{id}", get(get_question))
@@ -72,6 +75,7 @@ pub fn router(state: Shared) -> Router {
         .route("/questions/{id}/dismiss", post(dismiss_question))
         .route("/questions/{id}/restore", post(restore_question))
         .route("/drafts/{qid}", get(get_draft).put(put_draft))
+        .route("/drafts/{qid}/direction", axum::routing::put(put_direction))
         .route("/drafts/{qid}/reset", post(reset_draft))
         .route("/images/{qid}", get(list_images).post(search_images))
         .route(
@@ -173,11 +177,21 @@ async fn get_session(State(st): State<Shared>) -> R {
 
     Ok(Json(json!(Session {
         logged_in,
+        onboarding_required: logged_in && tasks::onboarding_required(&db.conn)?,
         user,
         expires_at,
         last_sync_at: last_sync,
         sign_mode,
     })))
+}
+
+async fn finish_onboarding(State(st): State<Shared>) -> R {
+    let db = st.db.lock().await;
+    db.conn.execute(
+        "INSERT OR IGNORE INTO onboarding_finished SELECT zhihu_id FROM account
+         WHERE id=1 AND cookie<>'' AND zhihu_id<>''", [],
+    )?;
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn create_qrcode(State(st): State<Shared>) -> R {
@@ -219,20 +233,6 @@ async fn persist_account(st: &Shared, cookie: &str, user: &ZhihuUser) {
         ],
     );
     db.log_event("login", None, "登录成功", &user.name);
-    let should_bootstrap = db
-        .conn
-        .query_row("SELECT COUNT(*) FROM questions", [], |r| r.get::<_, i64>(0))
-        .unwrap_or(0)
-        == 0;
-    drop(db);
-    if should_bootstrap {
-        let state = st.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tasks::run_sync_recent(&state, 3).await {
-                tracing::warn!("首次登录补齐最近 3 天通知失败：{e}");
-            }
-        });
-    }
 }
 
 async fn poll_qrcode(State(st): State<Shared>, Path(token): Path<String>) -> R {
@@ -686,7 +686,7 @@ fn row_to_question(r: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {
 const Q_SELECT: &str = "SELECT q.id, q.zhihu_id, q.question_id, q.source, q.title, q.excerpt, q.url,
     q.domain, q.sub_domain, q.fit, q.status, q.bucket, q.answer_count, q.follower_count,
     q.asker_name, q.asker_headline, q.tags, q.created_at, q.synced_at,
-    (SELECT COUNT(*) FROM drafts d WHERE d.question_id = q.id) AS has_draft,
+    (SELECT COUNT(*) FROM drafts d WHERE d.question_id = q.id AND trim(d.markdown)<>'') AS has_draft,
     (SELECT COUNT(*) FROM images i WHERE i.question_id = q.id) AS image_count,
     COALESCE((SELECT d.word_count FROM drafts d WHERE d.question_id = q.id), 0) AS word_count,
     COALESCE((SELECT json_array_length(d.doubts) FROM drafts d WHERE d.question_id = q.id), 0) AS doubt_count,
@@ -720,9 +720,10 @@ async fn list_questions(State(st): State<Shared>, Query(qp): Query<HashMap<Strin
     if qp.get("status").is_none() {
         where_parts.push("q.status IN ('inbox','researching','pending_review')".into());
     }
+    where_parts.push(format!("(q.status NOT IN ('inbox','researching','pending_review') OR NOT {})", tasks::IS_ANSWERED));
 
     let sql = format!(
-        "{Q_SELECT}{} ORDER BY CASE q.status WHEN 'pending_review' THEN 0 WHEN 'researching' THEN 1 ELSE 2 END, q.fit DESC, q.synced_at DESC LIMIT 500",
+        "{Q_SELECT}{} ORDER BY (q.source='imported') DESC, CASE WHEN q.source='imported' THEN q.synced_at END DESC, CASE q.status WHEN 'pending_review' THEN 0 WHEN 'researching' THEN 1 ELSE 2 END, q.fit DESC, q.synced_at DESC LIMIT 500",
         if where_parts.is_empty() {
             String::new()
         } else {
@@ -766,21 +767,34 @@ async fn get_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
 }
 
 async fn sync_now(State(st): State<Shared>) -> R {
-    let job_id = tasks::start_sync(&st, None).await;
+    let job_id = tasks::start_sync(&st, None, false).await;
     Ok(Json(
         json!({ "ok": true, "jobId": job_id, "message": "开始同步知乎通知" }),
     ))
 }
 
-async fn sync_recent_now(State(st): State<Shared>) -> R {
-    let job_id = tasks::start_sync(&st, Some(3)).await;
+async fn sync_recent_now(State(st): State<Shared>, body: Option<Json<Value>>) -> R {
+    let select_only = body.as_ref().and_then(|body| body.get("selectOnly")).and_then(Value::as_bool).unwrap_or(false);
+    let job_id = tasks::start_sync(&st, Some(3), select_only).await;
     Ok(Json(
         json!({ "ok": true, "jobId": job_id, "message": "开始同步最近 3 天的邀请与推荐" }),
     ))
 }
 
-async fn research_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
-    let job = tasks::start_research(&st, &id).await?;
+async fn import_question(State(st): State<Shared>, Json(body): Json<Value>) -> R {
+    let url = body.get("url").and_then(Value::as_str).unwrap_or_default();
+    let results = tasks::import_questions(&st, url).await?;
+    Ok(Json(json!({"ok": true, "results": results})))
+}
+
+async fn discover_questions(State(st): State<Shared>) -> R {
+    let job = tasks::start_question_discovery(&st).await?;
+    Ok(Json(json!({"ok": true, "jobId": job})))
+}
+
+async fn research_question(State(st): State<Shared>, Path(id): Path<String>, body: Option<Json<Value>>) -> R {
+    let direction = body.as_ref().and_then(|body| body.get("direction")).and_then(Value::as_str);
+    let job = tasks::start_research(&st, &id, direction, false).await?;
     Ok(Json(json!({ "ok": true, "jobId": job })))
 }
 
@@ -860,10 +874,15 @@ async fn mark_answered(State(st): State<Shared>, Path(id): Path<String>) -> R {
             }
         }
         let freed = db.purge_images(&id).unwrap_or(0);
-        let _ = db.conn.execute(
+        db.conn.execute(
+            "INSERT OR IGNORE INTO answered_questions SELECT a.zhihu_id, q.question_id
+             FROM account a JOIN questions q ON q.id=?1
+             WHERE a.id=1 AND a.cookie<>'' AND a.zhihu_id<>'' AND q.question_id<>''", params![id],
+        )?;
+        db.conn.execute(
             "UPDATE questions SET status='answered', bucket='archived' WHERE id=?1",
             params![id],
-        );
+        )?;
         db.log_event(
             "answered",
             Some(&id),
@@ -877,16 +896,18 @@ async fn mark_answered(State(st): State<Shared>, Path(id): Path<String>) -> R {
 
 async fn dismiss_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
     let freed = {
-        let db = st.db.lock().await;
+        let mut db = st.db.lock().await;
         ensure_not_researching(&db, &id)?;
         let freed = db.purge_images(&id).unwrap_or(0);
-        let _ = db
-            .conn
-            .execute("DELETE FROM drafts WHERE question_id=?1", params![id]);
-        let _ = db.conn.execute(
+        let tx = db.conn.transaction()?;
+        tx.execute("DELETE FROM drafts WHERE question_id=?1", params![id])?;
+        tx.execute("DELETE FROM author_directions WHERE question_id=?1", params![id])?;
+        tx.execute("DELETE FROM research_checkpoints WHERE question_id=?1", params![id])?;
+        tx.execute(
             "UPDATE questions SET status='dismissed', bucket='archived' WHERE id=?1",
             params![id],
-        );
+        )?;
+        tx.commit()?;
         db.log_event("dismiss", Some(&id), "弃用该问题", "");
         freed
     };
@@ -950,8 +971,10 @@ async fn get_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
 
     let images = load_images(&db.conn, &qid)?;
 
-    match row {
-        Some((md, doubts, cites, model, wc, upd, warns)) => Ok(Json(json!(Draft {
+    let direction = db.conn.query_row("SELECT text FROM author_directions WHERE question_id=?1",
+        params![qid], |row| row.get::<_, String>(0)).optional()?.unwrap_or_default();
+    let mut draft = match row {
+        Some((md, doubts, cites, model, wc, upd, warns)) => json!(Draft {
             question_id: qid,
             markdown: md,
             doubts: serde_json::from_str(&doubts).unwrap_or_default(),
@@ -961,12 +984,14 @@ async fn get_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
             word_count: wc,
             updated_at: upd,
             model,
-        }))),
-        None => Ok(Json(json!({
+        }),
+        None => json!({
             "questionId": qid, "markdown": "", "doubts": [], "citations": [],
             "images": images, "warnings": [], "wordCount": 0, "updatedAt": "", "model": ""
-        }))),
-    }
+        }),
+    };
+    draft["direction"] = json!(direction);
+    Ok(Json(draft))
 }
 
 fn load_images(conn: &rusqlite::Connection, qid: &str) -> rusqlite::Result<Vec<ImageAsset>> {
@@ -1124,6 +1149,23 @@ async fn put_draft(
     Ok(Json(json!({ "ok": true, "wordCount": wc })))
 }
 
+async fn put_direction(State(st): State<Shared>, Path(qid): Path<String>, Json(body): Json<Value>) -> R {
+    let direction = body.get("direction").and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("缺少答题思路"))?;
+    let mut db = st.db.lock().await;
+    let tx = db.conn.transaction()?;
+    let editable: bool = tx.query_row(
+        "SELECT status='inbox' AND NOT EXISTS(SELECT 1 FROM drafts WHERE question_id=?1 AND trim(markdown)<>'')
+         FROM questions WHERE id=?1", params![qid], |row| row.get(0),
+    ).optional()?.unwrap_or(false);
+    if !editable {
+        return Err(anyhow::anyhow!("当前不能修改拟稿前的答题思路").into());
+    }
+    tasks::save_direction(&tx, &qid, direction)?;
+    tx.commit()?;
+    Ok(Json(json!({"ok": true})))
+}
+
 async fn reset_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
     let mut db = st.db.lock().await;
     let tx = db.conn.transaction()?;
@@ -1136,6 +1178,7 @@ async fn reset_draft(State(st): State<Shared>, Path(qid): Path<String>) -> R {
         return Err(anyhow::anyhow!("只有已结束拟稿、等待批阅的问题可以清空稿件。").into());
     }
     tx.execute("DELETE FROM drafts WHERE question_id=?1", params![qid])?;
+    tx.execute("DELETE FROM author_directions WHERE question_id=?1", params![qid])?;
     tx.execute(
         "DELETE FROM research_checkpoints WHERE question_id=?1",
         params![qid],
@@ -1508,10 +1551,14 @@ async fn put_settings(State(st): State<Shared>, Json(body): Json<Value>) -> R {
         .unwrap_or(cur.image_max)
         .clamp(image_min, 20);
 
+    let writing_mode = g("writingMode", &cur.writing_mode);
+    if !matches!(writing_mode.as_str(), "automatic" | "subjective") {
+        return Err(anyhow::anyhow!("不支持的拟稿模式").into());
+    }
     db.conn.execute(
         "UPDATE settings SET cron_times=?1, pick_ratio=?2, draft_min=?3, draft_max=?4,
          image_min=?5, image_max=?6, auto_sync=?7, minimize_to_tray=?8, auto_launch=?9, sign_mode=?10,
-         verify_timeout_seconds=?11 WHERE id=1",
+         verify_timeout_seconds=?11, writing_mode=?12 WHERE id=1",
         params![
             serde_json::to_string(&times).unwrap_or_else(|_| "[]".into()),
             pick_ratio,
@@ -1524,6 +1571,7 @@ async fn put_settings(State(st): State<Shared>, Json(body): Json<Value>) -> R {
             body.get("autoLaunch").and_then(|x| x.as_bool()).unwrap_or(cur.auto_launch) as i64,
             if g("signMode", &cur.sign_mode).is_empty() { cur.sign_mode } else { g("signMode", &cur.sign_mode) },
             body.get("verifyTimeoutSeconds").and_then(Value::as_i64).unwrap_or(cur.verify_timeout_seconds).clamp(30, 180),
+            writing_mode,
         ],
     )?;
     Ok(Json(json!(tasks::load_settings(&db))))
@@ -1606,8 +1654,8 @@ async fn stats_overview(State(st): State<Shared>) -> R {
     let db = st.db.lock().await;
     let count = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
     let total = count("SELECT COUNT(*) FROM questions");
-    let inbox = count("SELECT COUNT(*) FROM questions WHERE status='inbox'");
-    let pending = count("SELECT COUNT(*) FROM questions WHERE status='pending_review'");
+    let inbox = count(&format!("SELECT COUNT(*) FROM questions q WHERE status='inbox' AND NOT {}", tasks::IS_ANSWERED));
+    let pending = count(&format!("SELECT COUNT(*) FROM questions q WHERE status='pending_review' AND NOT {}", tasks::IS_ANSWERED));
     let answered = count("SELECT COUNT(*) FROM questions WHERE status='answered'");
     let dismissed = count("SELECT COUNT(*) FROM questions WHERE status='dismissed'");
     let drafts = count("SELECT COUNT(*) FROM drafts");

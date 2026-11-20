@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import React from "react";
 import {
   getMode,
@@ -15,6 +15,7 @@ import { useLoad } from "@/lib/hooks";
 import { getTheme, saveTheme, type Theme } from "@/lib/theme";
 import type { Health, Session, Settings, StatsOverview } from "@/lib/types";
 import LoginScreen from "./LoginScreen";
+import Onboarding from "./Onboarding";
 import {
   IconChart,
   IconDesk,
@@ -172,6 +173,8 @@ function Offline({ onRetry }: { onRetry: () => void }) {
 
 export default function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const router = useRouter();
+  const [showGuide, setShowGuide] = React.useState(false);
   const [mode, setMode] = React.useState<Mode>(getMode());
   const [theme, setTheme] = React.useState<Theme>("zhihu");
   const [toasts, setToasts] = React.useState<Toast[]>([]);
@@ -181,6 +184,11 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   const settings = useLoad<Settings>(() => api.get("/api/settings"));
   const health = useLoad<Health>(() => api.get("/api/health"));
   const stats = useLoad<StatsOverview>(() => api.get("/api/stats/overview"));
+  React.useEffect(() => {
+    const replay = () => setShowGuide(true);
+    window.addEventListener("zhihu-show-onboarding", replay);
+    return () => window.removeEventListener("zhihu-show-onboarding", replay);
+  }, []);
 
   React.useEffect(() => {
     probe().then(setMode);
@@ -351,6 +359,12 @@ export default function Shell({ children }: { children: React.ReactNode }) {
         </div>
       </div>
 
+      {(showGuide || session.data.onboardingRequired) && <Onboarding key={user?.id} account={user} onExit={async (path) => {
+        await session.reload(true);
+        setShowGuide(false);
+        void stats.reload(true);
+        if (path) router.push(path);
+      }} />}
       {toastHost}
     </div>
     </DesktopFrame>

@@ -20,7 +20,7 @@ pub fn spawn(state: Shared) {
             };
             let auto_sync = {
                 let db = state.db.lock().await;
-                tasks::load_settings(&db).auto_sync
+                tasks::load_settings(&db).auto_sync && !tasks::onboarding_required(&db.conn).unwrap_or(true)
             };
 
             let today = now.format("%Y-%m-%d").to_string();

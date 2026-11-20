@@ -19,6 +19,8 @@ pub struct AppState {
     /// 拟稿并发名额：同时最多两份，避免多份稿子抢同一个模型 Key
     pub research_slots: tokio::sync::Semaphore,
     pub image_slots: tokio::sync::Semaphore,
+    pub answer_history_lock: Mutex<()>,
+    pub discovery_lock: Mutex<()>,
 }
 
 pub type Shared = Arc<AppState>;
@@ -56,6 +58,8 @@ impl AppState {
             browser_login_pending: Mutex::new(false),
             research_slots: tokio::sync::Semaphore::new(2),
             image_slots: tokio::sync::Semaphore::new(1),
+            answer_history_lock: Mutex::new(()),
+            discovery_lock: Mutex::new(()),
         })
     }
 }
@@ -133,8 +137,11 @@ impl AgentBridge {
 
 /// 组一个带当前登录态的知乎客户端
 pub async fn zhihu_client(state: &AppState) -> anyhow::Result<ZhihuClient> {
+    zhihu_client_from_db(&*state.db.lock().await)
+}
+
+pub fn zhihu_client_from_db(db: &Db) -> anyhow::Result<ZhihuClient> {
     let (cookie, sign_mode) = {
-        let db = state.db.lock().await;
         let cookie: String = db
             .conn
             .query_row("SELECT cookie FROM account WHERE id = 1", [], |r| {

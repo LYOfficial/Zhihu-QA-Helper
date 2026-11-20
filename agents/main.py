@@ -21,6 +21,8 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -302,7 +304,7 @@ def _strip_images(markdown: str) -> str:
 
 
 def collect_material(payload: dict) -> dict:
-    question = payload.get("question") or {}
+    question = {**(payload.get("question") or {}), "direction": str(payload.get("direction") or "")[:6000]}
     sources = investigation.source_catalog(question, payload.get("sources"))
     plan = investigation.plan_question(question, payload.get("model") or {}, sources)
     docs = investigation.gather_queries(plan["queries"], sources, time.time() + 23, hotspot=plan["hotspot"],
@@ -408,6 +410,7 @@ def write_draft(payload: dict) -> dict:
         title=question.get("title", ""),
         excerpt=(question.get("excerpt") or "（无补充说明）")[:2400],
         tags="、".join(question.get("tags") or []) or "（无）",
+        direction=str(payload.get("direction") or "（答主未提供）")[:6000],
         profile=(profile.get("summary") or "（暂无画像）")[:1000],
         style=_fmt_style(profile.get("style")),
         examples=_writing_examples(examples, question),
@@ -517,6 +520,37 @@ def collect_images(payload: dict) -> dict:
 
 # ---------------------------------------------------------------- HTTP
 
+def discover_questions(payload: dict) -> dict:
+    def question_url(url):
+        try:
+            parsed = urlsplit(url)
+            return parsed.hostname in {"zhihu.com", "www.zhihu.com", "m.zhihu.com"} and bool(
+                re.fullmatch(r"/question/[0-9]+(?:/answer/[0-9]+)?/?", parsed.path)
+            )
+        except ValueError:
+            return False
+
+    secret = payload.get("zhihuAccessSecret") or ""
+
+    def search_topic(topic):
+        links = []
+        if secret:
+            try:
+                links = [url for url in zhihu_open_search.search_urls("zhihu_search", topic, secret=secret, count=8)
+                         if question_url(url)]
+            except zhihu_open_search.SearchError:
+                pass
+        if len(links) < 6:
+            links += research.web_search(f"site:zhihu.com/question {topic}", limit=8, timeout=7,
+                                         allowed=question_url, recent=True)
+        return list(dict.fromkeys(links))
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        groups = list(workers.map(search_topic, _str_list(payload.get("topics"), 4)))
+    urls = [group[index] for index in range(max(map(len, groups), default=0)) for group in groups if index < len(group)]
+    return {"urls": list(dict.fromkeys(urls))}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"ZhihuQAAgent/{VERSION}"
 
@@ -572,6 +606,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, zhihu_open_search.check_credentials(payload["zhihuAccessSecret"]))
             elif route == "/v1/zhihu-open/profile":
                 self._send(200, zhihu_open_search.profile_samples(payload["zhihuAccessSecret"]))
+            elif route == "/v1/questions/discover":
+                self._send(200, discover_questions(payload))
             elif route == "/v1/sources":
                 self._send(200, do_sources(payload))
             elif route == "/v1/models":
