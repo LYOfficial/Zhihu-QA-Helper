@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::models::ZhihuUser;
+use crate::models::{now_iso, QuestionMetrics, ZhihuUser};
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const ZSE93: &str = "101_3_3.0";
@@ -602,6 +602,32 @@ impl ZhihuClient {
         Ok(question_id)
     }
 
+    pub async fn creator_answers_page(&self, offset: usize) -> Result<(Vec<Value>, Option<usize>)> {
+        let url = format!("https://www.zhihu.com/api/v4/creators/creations/v2/answer?start=0&end=0&limit=20&offset={offset}&need_co_creation=1&sort_type=created");
+        let response = self.send(reqwest::Method::GET, &url, true).await?;
+        let rows = response["data"].as_array().ok_or_else(|| anyhow!("知乎创作中心没有返回回答列表"))?;
+        let paging = &response["paging"];
+        let end = paging["is_end"].as_bool().ok_or_else(|| anyhow!("知乎创作中心没有返回分页状态"))?;
+        if end {
+            return Ok((rows.clone(), None));
+        }
+        let next = paging["next"].as_str()
+            .and_then(|url| reqwest::Url::parse(url).ok())
+            .and_then(|url| url.query_pairs().find(|(key, _)| key == "offset").and_then(|(_, value)| value.parse().ok()));
+        anyhow::ensure!(!rows.is_empty() && next.is_some_and(|next| next > offset), "知乎回答列表分页异常");
+        Ok((rows.clone(), next))
+    }
+
+    pub async fn creator_answer_content(&self, id: &str) -> Result<(String, bool)> {
+        anyhow::ensure!(is_content_id(id), "无效的回答编号");
+        let url = format!("https://www.zhihu.com/api/v4/answers/{id}?include=content,content_need_truncated");
+        let data = self.send(reqwest::Method::GET, &url, true).await?;
+        anyhow::ensure!(as_str(&data, &["id"]) == id, "知乎没有返回对应的回答");
+        let content = data["content"].as_str().filter(|content| !content.trim().is_empty())
+            .ok_or_else(|| anyhow!("知乎未提供回答正文"))?;
+        Ok((content.to_owned(), data["content_need_truncated"].as_bool().unwrap_or(false)))
+    }
+
     pub async fn search_recent_questions(&self, topic: &str) -> Result<Vec<String>> {
         let mut url = reqwest::Url::parse("https://www.zhihu.com/api/v4/search_v3")?;
         url.query_pairs_mut().extend_pairs([
@@ -613,12 +639,14 @@ impl ZhihuClient {
     }
 
     pub async fn question_details(&self, id: &str, source: &str) -> Result<(RawQuestion, i64, i64)> {
+        anyhow::ensure!(is_content_id(id), "无效的知乎问题编号");
         let url = format!("https://www.zhihu.com/api/v4/questions/{id}?include=detail,excerpt,created,created_time,answer_count,follower_count,visit_count,read_count,topics,author");
         let data = self.send(reqwest::Method::GET, &url, true).await?;
         let title = strip_html(data["title"].as_str().unwrap_or_default());
         anyhow::ensure!(as_str(&data, &["id"]) == id && !title.trim().is_empty(), "知乎没有返回可读取的问题标题");
-        let created = ["created", "created_time"].iter().find_map(|key| as_str(&data, &[*key]).parse().ok()).unwrap_or(0);
-        let views = data["visit_count"].as_i64().unwrap_or(0).max(data["read_count"].as_i64().unwrap_or(0));
+        let metrics = question_metrics(&data);
+        let created = metrics.created_time.unwrap_or(0);
+        let views = metrics.views.unwrap_or(0);
         let tags = data["topics"].as_array().into_iter().flatten()
             .filter_map(|topic| topic["name"].as_str().map(str::to_owned)).collect();
         Ok((RawQuestion {
@@ -627,9 +655,10 @@ impl ZhihuClient {
             excerpt: slim(&strip_html(&first_text([as_str(&data, &["detail"]), as_str(&data, &["excerpt"])])), 4000),
             asker_name: as_str(&data, &["author", "name"]),
             asker_headline: as_str(&data, &["author", "headline"]),
-            answer_count: data["answer_count"].as_i64().unwrap_or(0),
-            follower_count: data["follower_count"].as_i64().unwrap_or(0),
+            answer_count: metrics.answers.unwrap_or(0),
+            follower_count: metrics.followers.unwrap_or(0),
             tags,
+            metrics: Some(metrics),
         }, created, views))
     }
 
@@ -794,7 +823,7 @@ fn search_question_ids(search: &Value) -> Vec<String> {
         }).collect()
 }
 
-fn is_content_id(id: &str) -> bool {
+pub(crate) fn is_content_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 32 && id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
@@ -834,9 +863,10 @@ pub struct RawQuestion {
     pub answer_count: i64,
     pub follower_count: i64,
     pub tags: Vec<String>,
+    pub metrics: Option<QuestionMetrics>,
 }
 
-fn strip_html(s: &str) -> String {
+pub(crate) fn strip_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
     for c in s.chars() {
@@ -853,7 +883,7 @@ fn strip_html(s: &str) -> String {
         .to_string()
 }
 
-fn as_str(v: &Value, path: &[&str]) -> String {
+pub(crate) fn as_str(v: &Value, path: &[&str]) -> String {
     let mut cur = v;
     for k in path {
         cur = match cur.get(*k) {
@@ -865,6 +895,23 @@ fn as_str(v: &Value, path: &[&str]) -> String {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
         _ => String::new(),
+    }
+}
+
+pub(crate) fn count_field(data: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        let value = data.get(*key)?;
+        value.as_i64().or_else(|| value.as_str()?.parse().ok()).filter(|count| *count >= 0)
+    })
+}
+
+fn question_metrics(data: &Value) -> QuestionMetrics {
+    QuestionMetrics {
+        views: count_field(data, &["visit_count", "read_count", "view_count"]),
+        answers: count_field(data, &["answer_count", "answerCount"]),
+        followers: count_field(data, &["follower_count", "follow_num", "followNum", "follow_count"]),
+        created_time: notification_timestamp(data).filter(|time| *time > 0),
+        synced_at: now_iso(),
     }
 }
 
@@ -1014,6 +1061,7 @@ fn parse_notification(item: &Value, assume_invite: bool) -> Option<RawQuestion> 
         as_str(item, &["uniqueId"]),
     ]);
 
+    let metrics = question_metrics(&question);
     Some(RawQuestion {
         zhihu_id,
         question_id: qid.clone(),
@@ -1027,16 +1075,9 @@ fn parse_notification(item: &Value, assume_invite: bool) -> Option<RawQuestion> 
         },
         asker_name: as_str(&asker, &["name"]),
         asker_headline: as_str(&asker, &["headline"]),
-        answer_count: question
-            .get("answer_count")
-            .and_then(|x| x.as_i64())
-            .unwrap_or(0),
-        follower_count: question
-            .get("follower_count")
-            .or_else(|| question.get("follow_num"))
-            .or_else(|| question.get("followNum"))
-            .and_then(|x| x.as_i64())
-            .unwrap_or(0),
+        answer_count: metrics.answers.unwrap_or(0),
+        follower_count: metrics.followers.unwrap_or(0),
+        metrics: metrics.views.is_some().then_some(metrics),
         tags,
     })
 }

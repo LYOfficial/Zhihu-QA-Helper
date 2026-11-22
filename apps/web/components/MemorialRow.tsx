@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import React from "react";
 import type { Question } from "@/lib/types";
 import { openExternal } from "@/lib/api";
+import { formatMetric, opportunityLevel, questionOpportunity } from "@/lib/creator-metrics";
 import { relTime, FitMeter, IconPlay, IconQuill, IconRefresh, IconTrash } from "./ui";
 
 export default function MemorialRow({
@@ -12,14 +13,20 @@ export default function MemorialRow({
   onRestore,
   restoreDisabled,
   compact,
+  showOpportunity,
 }: {
   q: Question;
   onDismiss?: (q: Question) => void;
   onRestore?: (q: Question) => void;
   restoreDisabled?: boolean;
   compact?: boolean;
+  showOpportunity?: boolean;
 }) {
   const router = useRouter();
+  const metrics = q.metrics;
+  const score = showOpportunity ? questionOpportunity(metrics) : null;
+  const level = score === null ? null : opportunityLevel(score);
+  const countsOnly = /^[\d,.万亿]+\s*回答\s*[·・]\s*[\d,.万亿]+\s*关注$/.test(q.excerpt.trim());
 
   return (
     <article className="memorial" data-status={q.status}>
@@ -40,7 +47,7 @@ export default function MemorialRow({
           {q.title}
         </button>
 
-        {!compact && q.excerpt && <p className="memorial-excerpt">{q.excerpt}</p>}
+        {!compact && q.excerpt && !countsOnly && <p className="memorial-excerpt">{q.excerpt}</p>}
 
         <div className="meta">
           {q.status === "pending_review" && (
@@ -55,7 +62,8 @@ export default function MemorialRow({
           </span>
           <span className="sep">·</span>
           <span>
-            <b>{q.answerCount}</b> 回答 · <b>{q.followerCount}</b> 关注
+            <b>{showOpportunity ? formatMetric(metrics?.answers ?? (q.answerCount || null)) : q.answerCount}</b> 回答 ·{" "}
+            <b>{showOpportunity ? formatMetric(metrics?.followers ?? (q.followerCount || null)) : q.followerCount}</b> 关注
           </span>
           <span className="sep">·</span>
           <span>{q.askerName || "匿名用户"}</span>
@@ -76,6 +84,18 @@ export default function MemorialRow({
             </span>
           )}
         </div>
+
+        {showOpportunity && (
+          <div className="creator-metrics" title={q.metricsError || (metrics ? `机会数据更新于 ${new Date(metrics.syncedAt).toLocaleString("zh-CN")}` : undefined)}>
+            <span className="creator-grade" data-tone={level?.tone ?? "low"}>
+              {level ? `答题分 ${formatMetric(score)} · ${level.label}` : q.metricsError ? q.metricsError : metrics ? "机会数据不足，待补齐" : "机会数据待同步"}
+            </span>
+            {metrics?.views != null && <span>浏览 <b>{formatMetric(metrics.views)}</b></span>}
+            {metrics?.views != null && metrics.answers != null && (
+              <span>缺口值 <b>{metrics.answers === 0 ? "无回答" : formatMetric(metrics.views / metrics.answers)}</b></span>
+            )}
+          </div>
+        )}
 
         {q.tags.length > 0 && (
           <div className="kw">

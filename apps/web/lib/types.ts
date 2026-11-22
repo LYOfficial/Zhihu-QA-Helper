@@ -91,6 +91,32 @@ export interface Source {
   ok: boolean;
 }
 
+export interface QuestionMetrics {
+  views: number | null;
+  answers: number | null;
+  followers: number | null;
+  createdTime: number | null;
+  syncedAt: string;
+}
+
+export interface AnswerMetrics {
+  reads: number | null;
+  votes: number | null;
+  comments: number | null;
+  favorites: number | null;
+  likes: number | null;
+}
+
+export interface CreatorAnswer {
+  id: string;
+  questionId: string;
+  title: string;
+  excerpt: string;
+  createdTime: number | null;
+  updatedTime: number | null;
+  metrics: AnswerMetrics;
+}
+
 export interface Question {
   id: string;
   zhihuId: string;
@@ -107,6 +133,8 @@ export interface Question {
   bucket: Bucket;
   answerCount: number;
   followerCount: number;
+  metrics: QuestionMetrics | null;
+  metricsError: string;
   askerName: string;
   askerHeadline: string;
   tags: string[];
@@ -202,7 +230,7 @@ export interface Settings {
 
 export interface Job {
   id: string;
-  kind: "sync" | "research" | "profile" | "sources" | "discover_questions";
+  kind: "sync" | "research" | "profile" | "sources" | "discover_questions" | "creator_answers" | "question_metrics";
   questionId: string | null;
   stage: string;
   progress: number;

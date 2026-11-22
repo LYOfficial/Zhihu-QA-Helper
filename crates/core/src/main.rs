@@ -4,6 +4,7 @@
 //! 桌面壳（Tauri）或浏览器都指向 http://127.0.0.1:8787 。
 
 mod api;
+mod creator;
 mod db;
 mod models;
 mod scheduler;

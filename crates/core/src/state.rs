@@ -20,6 +20,7 @@ pub struct AppState {
     pub research_slots: tokio::sync::Semaphore,
     pub image_slots: tokio::sync::Semaphore,
     pub answer_history_lock: Mutex<()>,
+    pub creator_jobs_lock: Mutex<()>,
     pub discovery_lock: Mutex<()>,
 }
 
@@ -59,6 +60,7 @@ impl AppState {
             research_slots: tokio::sync::Semaphore::new(2),
             image_slots: tokio::sync::Semaphore::new(1),
             answer_history_lock: Mutex::new(()),
+            creator_jobs_lock: Mutex::new(()),
             discovery_lock: Mutex::new(()),
         })
     }

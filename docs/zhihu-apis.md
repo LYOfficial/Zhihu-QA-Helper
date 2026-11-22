@@ -87,6 +87,18 @@ GET https://www.zhihu.com/api/v4/members/{url_token}/articles?include=data[*].co
 翻页用 `offset`，`data` 长度不足 20 即视为到底。默认各取 3 页 / 2 页，够画像用了，
 再多会把 token 烧在无关的早期内容上。
 
+## 历史作答与选题数据
+
+| 请求 | 用途 |
+| --- | --- |
+| `GET https://www.zhihu.com/api/v4/creators/creations/v2/answer?start=0&end=0&limit=20&offset=0&need_co_creation=1&sort_type=created` | 从当前登录账号的创作中心读取历史回答。用 `paging.next` 中的偏移量翻页，`paging.is_end` 为真时结束。正文摘要在条目的 `data` 中，阅读、赞同、评论、收藏和喜欢在 `reaction` 中。 |
+| `GET https://www.zhihu.com/api/v4/answers/{id}?include=content,content_need_truncated` | 打开历史回答时读取正文，根据 `content_need_truncated` 标注正文是否截断。 |
+| `GET https://www.zhihu.com/api/v4/questions/{id}` | 导入、主动找题或刷新收件箱机会数据时读取浏览数、回答数、关注数与提问时间。 |
+
+质效分与答题分参考 [知乎创作效率工具箱](https://github.com/kestory/zhihu-creator-userscripts)。
+缺失的互动数据保留为空，返回零时按零参与计算。
+打开问题收件箱或同步通知时，从已保存的原题链接自动补齐待答问题的数据。查询失败时保留上次已取得的数据，手动刷新可以立即重试。
+
 ## 签名 x-zse-96
 
 网页端 v4 接口普遍要求：
@@ -114,4 +126,4 @@ x-zse-96: 2.0_<加密后的签名>
 ## 不要做的事
 
 - 本项目**不调用**任何写接口（点赞、关注、发回答、发评论）。所有写操作都由你本人在知乎完成。
-- 不做批量爬取、不遍历他人主页、不加并发。三次值守分别拉一轮通知，足够了。
+- 只同步本人的历史作答。收件箱的机会数据刷新限于本机收件箱中已收录的待答问题。

@@ -11,6 +11,7 @@ import {
   SectionTitle,
 } from "@/components/ui";
 import { api, toast } from "@/lib/api";
+import { questionOpportunity } from "@/lib/creator-metrics";
 import { clearDraftRecovery } from "@/lib/draft-recovery";
 import { useLoad } from "@/lib/hooks";
 import type { DomainCount, Job, Question } from "@/lib/types";
@@ -28,17 +29,62 @@ export default function InboxPage() {
   const [tab, setTab] = React.useState("todo");
   const [domain, setDomain] = React.useState("all");
   const [kw, setKw] = React.useState("");
+  const [sort, setSort] = React.useState("fit");
   const [confirmDismiss, setConfirmDismiss] = React.useState<Question | null>(null);
   const [restoring, setRestoring] = React.useState(false);
   const [syncJob, setSyncJob] = React.useState<Job | null>(null);
   const [starting, setStarting] = React.useState(false);
+  const [metricsJobId, setMetricsJobId] = React.useState<string | null>(null);
+  const [metricsJob, setMetricsJob] = React.useState<Job | null>(null);
 
-  const qs = useLoad<{ questions: Question[]; domains: DomainCount[] }>(() =>
+  const qs = useLoad<{ questions: Question[]; domains: DomainCount[]; metricsJobId: string | null }>(() =>
     api.get("/api/questions?status=all")
   );
-
+  const { reload } = qs;
   const all = qs.data?.questions ?? [];
   const domains = qs.data?.domains ?? [];
+  const activeMetricsJob = metricsJobId ?? qs.data?.metricsJobId;
+  const refreshingMetrics = Boolean(activeMetricsJob && (metricsJob?.id !== activeMetricsJob || metricsJob.state === "running"));
+
+  const refreshMetrics = React.useCallback(async (missingOnly: boolean) => {
+    try {
+      const result = await api.post<{ jobId: string | null }>("/api/questions/metrics/sync", { missingOnly });
+      if (result.jobId) setMetricsJobId(result.jobId);
+      else if (!missingOnly) toast("收件箱没有可刷新数据的待答问题");
+    } catch (error) {
+      if (!missingOnly) toast(error instanceof Error ? error.message : "无法刷新机会数据", "err");
+    }
+  }, []);
+
+  React.useEffect(() => { void refreshMetrics(true); }, [refreshMetrics]);
+
+  React.useEffect(() => {
+    if (!activeMetricsJob) return;
+    let active = true;
+    let progress = -1;
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
+      try {
+        const job = await api.get<Job>(`/api/jobs/${activeMetricsJob}`);
+        if (!active) return;
+        setMetricsJob(job);
+        if (job.state !== "running") {
+          await reload(true);
+          if (active) setMetricsJobId(null);
+          return;
+        }
+        if (job.progress !== progress) {
+          progress = job.progress;
+          void reload(true);
+        }
+      } catch {
+        if (!active) return;
+      }
+      timer = setTimeout(poll, 1000);
+    }
+    void poll();
+    return () => { active = false; clearTimeout(timer); };
+  }, [activeMetricsJob, reload]);
 
   React.useEffect(() => {
     if (!syncJob || syncJob.state !== "running") return;
@@ -74,9 +120,11 @@ export default function InboxPage() {
     return l.sort(
       (a, b) => Number(b.source === "imported") - Number(a.source === "imported") ||
         (a.source === "imported" && b.source === "imported" ? b.syncedAt.localeCompare(a.syncedAt) : 0) ||
-        (order[a.status] ?? 3) - (order[b.status] ?? 3) || b.fit - a.fit
+        (order[a.status] ?? 3) - (order[b.status] ?? 3) ||
+        (sort === "opportunity" ? (questionOpportunity(b.metrics) ?? -1) - (questionOpportunity(a.metrics) ?? -1) : 0) ||
+        b.fit - a.fit
     );
-  }, [all, tab, domain, kw]);
+  }, [all, tab, domain, kw, sort]);
 
   async function findQuestions() {
     setStarting(true);
@@ -116,6 +164,7 @@ export default function InboxPage() {
       await api.post(`/api/questions/${item.id}/restore`);
       clearDraftRecovery(item.id);
       await qs.reload(true);
+      void refreshMetrics(true);
       toast("已恢复到待解答，可在「待阅」中查看", "ok");
     } catch (e) {
       toast(e instanceof Error ? e.message : "恢复失败", "err");
@@ -135,6 +184,8 @@ export default function InboxPage() {
     }
   }
 
+  const syncing = starting || syncJob?.state === "running";
+
   return (
     <main className="page">
       <header className="page-head">
@@ -146,13 +197,13 @@ export default function InboxPage() {
         </div>
         <div className="page-actions">
           <ImportQuestions onImported={() => { setTab("todo"); setDomain("all"); setKw(""); void qs.reload(true); }} />
-          <button className="btn btn-primary" onClick={() => void findQuestions()} disabled={starting || syncJob?.state === "running"}>
+          <button className="btn btn-primary" onClick={() => void findQuestions()} disabled={syncing}>
             <IconSearch size={14} /> 主动找题
           </button>
-          <button className="btn" onClick={() => void syncNow(false)} disabled={syncJob?.state === "running"}>
+          <button className="btn" onClick={() => void syncNow(false)} disabled={syncing}>
             <IconRefresh size={14} /> 立即同步
           </button>
-          <button className="btn" onClick={() => void syncNow(true)} disabled={syncJob?.state === "running"}>
+          <button className="btn" onClick={() => void syncNow(true)} disabled={syncing}>
             <IconRefresh size={14} /> 同步近 3 天
           </button>
         </div>
@@ -167,6 +218,11 @@ export default function InboxPage() {
       )}
 
       <div className="page-body">
+      {refreshingMetrics || metricsJob ? (
+        <p className="answer-sync-status" role={metricsJob?.state === "failed" && !refreshingMetrics ? "alert" : "status"}>
+          {refreshingMetrics && metricsJob?.id !== activeMetricsJob ? "正在查询待答题的原题数据…" : metricsJob?.message}
+        </p>
+      ) : null}
 
       <div
         style={{
@@ -204,7 +260,11 @@ export default function InboxPage() {
           })}
         </div>
 
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+        <div className="inbox-filters">
+          <select className="select" aria-label="排序依据" value={sort} onChange={(event) => setSort(event.target.value)}>
+            <option value="fit">按契合度</option>
+            <option value="opportunity">按答题分</option>
+          </select>
           <div style={{ position: "relative" }}>
             <span
               style={{
@@ -225,6 +285,9 @@ export default function InboxPage() {
               onChange={(e) => setKw(e.target.value)}
             />
           </div>
+          <button className="btn" disabled={refreshingMetrics} onClick={() => void refreshMetrics(false)}>
+            <IconRefresh size={14} /> {refreshingMetrics ? "正在补齐机会数据" : "刷新机会数据"}
+          </button>
         </div>
       </div>
 
@@ -253,7 +316,13 @@ export default function InboxPage() {
         </div>
       )}
 
-      <SectionTitle count={list.length} right={<span className="dim">导入置顶 · 按状态与契合度排序</span>}>
+      <details className="creator-help">
+        <summary>怎么看答题分和缺口值</summary>
+        <p>答题分综合浏览、关注、回答数和问题新鲜度。浏览或关注越多、回答越少、问题越新，分数通常越高。缺少提问时间时按发布 180 天估算。</p>
+        <p>缺口值是浏览数除以回答数，反映有多少浏览对应一条回答。可以结合领域契合度一起筛题。</p>
+        <p>打开收件箱或同步知乎通知时，会按原题链接自动补齐缺失数据。也可以手动刷新已有数据。</p>
+      </details>
+      <SectionTitle count={list.length} right={<span className="dim">导入置顶 · 按状态与{sort === "opportunity" ? "答题分" : "契合度"}排序</span>}>
         清单
       </SectionTitle>
 
@@ -270,6 +339,7 @@ export default function InboxPage() {
               onDismiss={setConfirmDismiss}
               onRestore={restore}
               restoreDisabled={restoring}
+              showOpportunity={!["answered", "dismissed"].includes(item.status)}
             />
           ))}
         </div>

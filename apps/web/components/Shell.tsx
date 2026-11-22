@@ -18,6 +18,7 @@ import LoginScreen from "./LoginScreen";
 import Onboarding from "./Onboarding";
 import {
   IconChart,
+  IconCheckCircle,
   IconDesk,
   IconGlobe,
   IconInbox,
@@ -125,6 +126,7 @@ const GROUPS = [
       { href: "/", label: "概览", icon: IconDesk, badge: "" },
       { href: "/inbox", label: "问题收件箱", icon: IconInbox, badge: "inbox" },
       { href: "/desk", label: "写作台", icon: IconQuill, badge: "pending" },
+      { href: "/answers", label: "历史作答", icon: IconCheckCircle, badge: "" },
     ],
   },
   {
@@ -294,6 +296,8 @@ export default function Shell({ children }: { children: React.ReactNode }) {
                     key={it.href}
                     href={it.href}
                     className="side-item"
+                    aria-label={it.label}
+                    title={it.label}
                     data-active={active(it.href)}
                   >
                     <Icon size={16} />
@@ -351,7 +355,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
           <span className="sep" />
           <span>{pending > 0 ? `${pending} 件待批` : "案头已清"}</span>
           <span className="sep" />
-          <span>v{health.data?.version ?? "0.1.1"}</span>
+          <span>v{health.data?.version ?? "0.1.2"}</span>
           <span className="grow" />
           <span className="path" title={health.data?.dataDir}>
             {health.data?.dataDir}

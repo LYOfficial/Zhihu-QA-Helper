@@ -75,6 +75,9 @@ CREATE TABLE IF NOT EXISTS questions (
   answer_count  INTEGER NOT NULL DEFAULT 0,
   follower_count INTEGER NOT NULL DEFAULT 0,
   asker_name    TEXT NOT NULL DEFAULT '',
+  metrics       TEXT,
+  metrics_attempted_at TEXT NOT NULL DEFAULT '',
+  metrics_error TEXT NOT NULL DEFAULT '',
   asker_headline TEXT NOT NULL DEFAULT '',
   tags          TEXT NOT NULL DEFAULT '[]',
   created_at    TEXT NOT NULL DEFAULT '',
@@ -360,6 +363,35 @@ fn migrate(conn: &Connection) -> Result<()> {
         crate::tasks::refresh_inbox_fit(&tx)?;
         tx.commit()?;
     }
+    if !has_column("questions", "metrics") {
+        conn.execute("ALTER TABLE questions ADD COLUMN metrics TEXT", [])?;
+    }
+    if !has_column("questions", "metrics_attempted_at") {
+        conn.execute("ALTER TABLE questions ADD COLUMN metrics_attempted_at TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    if !has_column("questions", "metrics_error") {
+        conn.execute("ALTER TABLE questions ADD COLUMN metrics_error TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS creator_answers (
+            account_id TEXT NOT NULL,
+            answer_id TEXT NOT NULL,
+            question_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            excerpt TEXT NOT NULL,
+            created_time INTEGER,
+            updated_time INTEGER,
+            metrics TEXT NOT NULL,
+            synced_at TEXT NOT NULL,
+            content TEXT,
+            truncated INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (account_id, answer_id)
+         );
+         CREATE TABLE IF NOT EXISTS creator_answer_sync (
+            account_id TEXT PRIMARY KEY,
+            synced_at TEXT NOT NULL
+         );",
+    )?;
     Ok(())
 }
 

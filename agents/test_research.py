@@ -124,7 +124,7 @@ class ResearchTests(unittest.TestCase):
             self.assertEqual({file.name for file in Path(directory).iterdir()}, {image["filename"] for image in saved})
             self.assertTrue(all(image["sourceUrl"].endswith("/manual") for image in saved))
 
-    def test_actual_style_examples_and_citation_allowlist(self):
+    def test_draft_and_editor_receive_separate_context(self):
         html = "<p>我先放结果。" + "用最低限度的步骤跑一次。" * 16 + "</p><p>再说为什么。</p>"
         raw = [{"kind": "answer", "title": "铁路信号", "text": html}]
         examples = main._retain_examples(raw * 2)
@@ -132,21 +132,32 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("\n\n再说为什么。", examples[0]["text"])
         self.assertNotIn("<p>", examples[0]["text"])
         doc = {"title": "手册", "sourceName": "官方", "sourceUrl": "https://manual.example/doc", "text": "铁路信号示意"}
-        with patch.object(llm, "chat_json", return_value={
-            "markdown": "正文。[[S1]][[S99]]\n\n[IMG:fake.png]\n\n![随机图](https://other.example/image.png)",
+        with patch.object(llm, "chat_json", side_effect=[{
+            "markdown": "这是有关铁路的说明。信号用于显示区段状态。[[S1]][[S99]]",
             "citations": [{"url": "https://invented.example"}, {"id": "S1", "snippet": "说明信号用途"}],
             "doubts": [{"text": "信号是否默认开启"}],
-        }) as call:
-            output = main.write_draft({"question": {"title": "铁路信号"}, "profile": {"samples": examples,
-                "style": {"guide": "统一模板哨兵", "variants": ["教程会先给可复现步骤", "短评会先交代例外"]}}, "material": {"docs": [doc]}})
-        prompt = call.call_args.args[1][1]["content"]
-        self.assertIn("我先放结果。", prompt)
-        self.assertIn("教程会先给可复现步骤", prompt)
-        self.assertIn("短评会先交代例外", prompt)
-        self.assertNotIn("统一模板哨兵", prompt)
-        self.assertEqual(output["draft"]["markdown"], "正文。[1]\n\n### 参考资料\n\n[1] 手册 — https://manual.example/doc")
+        }, {"markdown": "铁路信号显示区段状态。[[S1]][[S99]]\n\n[IMG:fake.png]\n\n![随机图](https://other.example/image.png)"}]) as call:
+            output = main.write_draft({
+                "question": {"title": "铁路信号"}, "direction": "先说明信号的用途。",
+                "profile": {"samples": examples, "style": {
+                    "signature": ["口头禅哨兵"], "variants": ["教程先给可复现步骤"],
+                }},
+                "material": {"docs": [doc]},
+            })
+        draft_prompt, editor_prompt = [entry.args[1][1]["content"] for entry in call.call_args_list]
+        self.assertIn(doc["sourceUrl"], draft_prompt)
+        self.assertNotIn(doc["sourceUrl"], editor_prompt)
+        self.assertIn("先说明信号的用途。", draft_prompt)
+        self.assertIn("先说明信号的用途。", editor_prompt)
+        self.assertIn("教程先给可复现步骤", editor_prompt)
+        self.assertNotIn("教程先给可复现步骤", draft_prompt)
+        for prompt in (draft_prompt, editor_prompt):
+            self.assertNotIn("我先放结果。", prompt)
+            self.assertNotIn("口头禅哨兵", prompt)
+        self.assertEqual(output["draft"]["markdown"], "铁路信号显示区段状态。[1]\n\n### 参考资料\n\n[1] 手册 — https://manual.example/doc")
         self.assertEqual([citation["url"] for citation in output["draft"]["citations"]], [doc["sourceUrl"]])
         self.assertEqual(output["draft"]["doubts"][0]["status"], "unverified")
+        self.assertEqual(output["warnings"], [])
 
     def test_no_evidence_is_not_verification(self):
         doubt = {"text": "最大长度", "status": "unverified"}
@@ -232,13 +243,39 @@ class ResearchTests(unittest.TestCase):
         self.assertTrue(all(entry["page"] == page and not entry["autoInsert"] for entry in candidates))
         search.assert_not_called()
 
-    def test_style_editor_keeps_cited_lines_and_numbers(self):
-        draft = "先看现场。\n\n预览版在 26.70.26 支持这项功能。[[S1]]"
-        bad = "先看现场。\n\n正式版在 26.70.26 支持这项功能。[[S1]]"
-        good = draft.replace("先看现场。", "先看怎么跑。")
-        with patch.object(llm, "chat_json", side_effect=[{"markdown": bad}, {"markdown": good}]):
-            self.assertEqual(main._edit_draft(draft, {}, "", 20), draft)
-            self.assertEqual(main._edit_draft(draft, {}, "", 20), good)
+    def test_editor_can_reorder_cited_facts_and_cut_repetition(self):
+        draft = (
+            "这里先来聊一下，为什么这个系统会这样设计。\n\n"
+            "随身合成区是 2×2。[[S1]] 门口的工作台能提供 3×3 的格子。[[S2]]\n\n"
+            "归根结底，工作台能提供 3×3 的格子。[[S2]]"
+        )
+        edited = "工作台有 3 × 3 格。[[S2]] 随身合成区只有 2 × 2 格。[[S1]]"
+        docs = [
+            {"title": title, "sourceName": "手册", "sourceUrl": f"https://manual.example/{index}", "text": title}
+            for index, title in enumerate(("随身合成区", "工作台"), 1)
+        ]
+        with patch.object(llm, "chat_json", side_effect=[{"markdown": draft}, {"markdown": edited}]):
+            output = main.write_draft({"material": {"docs": docs}})
+        self.assertTrue(output["draft"]["markdown"].startswith("工作台有 3 × 3 格。[1] 随身合成区只有 2 × 2 格。[2]"))
+        self.assertEqual([item["label"] for item in output["draft"]["citations"]], ["工作台", "随身合成区"])
+        self.assertEqual(output["warnings"], [])
+
+    def test_editor_falls_back_when_edit_fails_or_changes_protected_details(self):
+        draft = "预览版 26.70.26 支持这项功能。[[S1]]\n\n运行 `ping`：\n\n~~~sh\n  ping localhost\n~~~"
+        variants = [
+            {"markdown": draft.replace("26.70.26", "26.70.27")},
+            {"markdown": draft.replace("S1", "S2")},
+            {"markdown": draft.replace("  ping", "ping")},
+            {"markdown": draft.replace("`ping`", "`pong`")},
+            {"markdown": draft, "_salvaged": True},
+            llm.LLMError("模拟编辑请求超时"),
+        ]
+        doc = {"title": "预览版", "sourceName": "手册", "sourceUrl": "https://manual.example/preview", "text": "预览版"}
+        for variant in variants:
+            with self.subTest(variant=variant), patch.object(llm, "chat_json", side_effect=[{"markdown": draft}, variant]):
+                output = main.write_draft({"material": {"docs": [doc]}})
+                self.assertTrue(output["draft"]["markdown"].startswith(draft.replace("[[S1]]", "[1]")))
+                self.assertIn("已保留第一版初稿", output["warnings"][0])
 
     def test_search_union_keeps_original_result_urls(self):
         html = '<a data-mdurl="https://www.cas.cn/article">月壤</a><a data-mdurl="https://ai.so.com/search">聚合摘要</a>'

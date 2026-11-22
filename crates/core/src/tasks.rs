@@ -120,13 +120,13 @@ pub fn onboarding_required(conn: &rusqlite::Connection) -> rusqlite::Result<bool
     )
 }
 
-fn account_identity(conn: &rusqlite::Connection) -> Result<(String, String)> {
+pub(crate) fn account_identity(conn: &rusqlite::Connection) -> Result<(String, String)> {
     conn.query_row("SELECT zhihu_id, url_token FROM account WHERE id=1 AND cookie<>'' AND zhihu_id<>''",
         [], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|_| anyhow::anyhow!("尚未登录知乎账号"))
 }
 
-async fn account_client(state: &AppState) -> Result<(String, String, ZhihuClient)> {
+pub(crate) async fn account_client(state: &AppState) -> Result<(String, String, ZhihuClient)> {
     let db = state.db.lock().await;
     let (account_id, token) = account_identity(&db.conn)?;
     Ok((account_id, token, crate::state::zhihu_client_from_db(&db)?))
@@ -240,11 +240,12 @@ fn insert_question(conn: &rusqlite::Connection, raw: &RawQuestion, created: i64,
         .map(|time| time.to_rfc3339()).unwrap_or_else(|| synced.clone());
     conn.execute(
         "INSERT INTO questions (id, zhihu_id, question_id, source, title, excerpt, url, domain, sub_domain,
-         fit, status, bucket, answer_count, follower_count, asker_name, asker_headline, tags, created_at, synced_at, fit_evaluated)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'inbox','queue',?11,?12,?13,?14,?15,?16,?17,?18)",
+         fit, status, bucket, answer_count, follower_count, asker_name, asker_headline, tags, created_at, synced_at, fit_evaluated, metrics)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'inbox','queue',?11,?12,?13,?14,?15,?16,?17,?18,?19)",
         params![id, raw.zhihu_id, raw.question_id, raw.source, raw.title, raw.excerpt, raw.url, domain, sub, fit,
             raw.answer_count, raw.follower_count, raw.asker_name, raw.asker_headline,
-            serde_json::to_string(&raw.tags)?, created, synced, !terms.is_empty()],
+            serde_json::to_string(&raw.tags)?, created, synced, !terms.is_empty(),
+            raw.metrics.as_ref().map(serde_json::to_string).transpose()?],
     )?;
     Ok((id, fit))
 }
@@ -436,7 +437,7 @@ mod question_tests {
         let mut question = RawQuestion {
             question_id: "123".into(), zhihu_id: "123".into(), title: "铁路信号怎么设置？".into(),
             source: "discovered".into(), excerpt: String::new(), url: String::new(), asker_name: String::new(),
-            asker_headline: String::new(), answer_count: 0, follower_count: 0, tags: Vec::new(),
+            asker_headline: String::new(), answer_count: 0, follower_count: 0, tags: Vec::new(), metrics: None,
         };
         let now = 1_800_000_000;
         let created = now - 86_400;
@@ -647,6 +648,10 @@ async fn sync_inner(
         (inserted.len(), selected_ids)
     };
 
+    if let Err(error) = crate::creator::start_question_metrics(state, true).await {
+        tracing::debug!("机会数据同步未启动：{error}");
+    }
+
     job_step(state, job, "归档", 0.9, "写入领域目录").await;
 
     let by_domain = {
@@ -699,7 +704,8 @@ async fn sync_inner(
     if !select_only {
         let auto_draft = {
             let db = state.db.lock().await;
-            load_settings(&db).writing_mode == "automatic" && !onboarding_required(&db.conn)?
+            account_identity(&db.conn).is_ok_and(|(id, _)| id == account_id)
+                && load_settings(&db).writing_mode == "automatic" && !onboarding_required(&db.conn)?
         };
         if auto_draft {
             for id in selected_ids {
@@ -1281,7 +1287,7 @@ fn append_draft_illustrations(markdown: &str, filenames: &[String]) -> String {
 }
 
 async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
-    let (question, terms, meta_summary, meta_style, sources, model, settings) = {
+    let (question, style, sources, model, settings) = {
         let db = state.db.lock().await;
         let q = db
             .conn
@@ -1307,6 +1313,8 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
                         bucket: r.get(11)?,
                         answer_count: r.get(12)?,
                         follower_count: r.get(13)?,
+                        metrics: None,
+                        metrics_error: String::new(),
                         asker_name: r.get(14)?,
                         asker_headline: r.get(15)?,
                         tags: serde_json::from_str(&r.get::<_, String>(16)?).unwrap_or_default(),
@@ -1321,13 +1329,6 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             )
             .map_err(|_| anyhow::anyhow!("问题不存在"))?;
 
-        let summary: String = db
-            .conn
-            .query_row("SELECT summary FROM profile_meta WHERE id=1", [], |r| {
-                r.get(0)
-            })
-            .unwrap_or_default();
-
         let style: Value = db
             .conn
             .query_row("SELECT style FROM profile_meta WHERE id=1", [], |r| {
@@ -1340,31 +1341,11 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
 
         let src = research_sources(&db)?;
 
-        let s = load_settings(&db);
-        let mut tstmt = db.conn.prepare(
-            "SELECT id, kind, label, weight, keywords, locked, note FROM profile_terms ORDER BY ord",
-        )?;
-        let terms: Vec<ProfileTerm> = tstmt
-            .query_map([], |r| {
-                Ok(ProfileTerm {
-                    id: r.get(0)?,
-                    kind: r.get(1)?,
-                    label: r.get(2)?,
-                    weight: r.get(3)?,
-                    keywords: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
-                    locked: r.get::<_, i64>(5)? != 0,
-                    note: r.get(6)?,
-                })
-            })?
-            .filter_map(|x| x.ok())
-            .collect();
-        drop(tstmt);
-
-        (q, terms, summary, style, src, load_model(&db), s)
+        (q, style, src, load_model(&db), load_settings(&db))
     };
 
     let img_dir = state.data_dir.join("images").join(crate::db::sanitize(qid));
-    let (checkpoint, samples, direction) = {
+    let (checkpoint, direction) = {
         let db = state.db.lock().await;
         let checkpoint = db
             .conn
@@ -1374,18 +1355,8 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
             )
             .optional()?;
-        let samples = db
-            .conn
-            .query_row(
-                "SELECT samples FROM writing_samples WHERE account_id=(SELECT zhihu_id FROM account WHERE id=1 AND cookie<>'')",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .unwrap_or_default();
         (
             checkpoint,
-            serde_json::from_str::<Value>(&samples).unwrap_or(json!([])),
             db.conn.query_row("SELECT text FROM author_directions WHERE question_id=?1", [qid],
                 |row| row.get::<_, String>(0)).optional()?.unwrap_or_default(),
         )
@@ -1393,7 +1364,7 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
     let mut payload = json!({
         "question": question,
         "direction": direction,
-        "profile": { "summary": meta_summary, "terms": terms, "style": meta_style, "samples": samples },
+        "profile": { "style": style },
         "sources": sources,
         "model": model,
         "settings": settings,
@@ -1443,11 +1414,11 @@ async fn research_inner(state: &AppState, qid: &str, job: &str) -> Result<()> {
             job,
             "拟稿与找图",
             0.55,
-            "按答主文风起草，优先从取材原文抓图，不足再按画面搜索",
+            "根据问题和资料起草，再通读整理全文。配图优先取自原文",
         )
         .await;
         let (draft_result, images) = tokio::join!(
-            agent_stage(state, "/v1/research/draft", &payload, 145),
+            agent_stage(state, "/v1/research/draft", &payload, 205),
             async {
                 if material.get("autoImageFiles").is_some() || settings.image_max == 0 {
                     return Ok(None);

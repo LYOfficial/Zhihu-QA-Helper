@@ -33,7 +33,7 @@ import illustrations
 import investigation
 import zhihu_open_search
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 DATA_DIR = os.path.join(os.getcwd(), "data")
 
 
@@ -66,21 +66,6 @@ def _norm_style(raw) -> dict:
     style["avoid"] = _str_list(raw.get("avoid"), 4)
     style["variants"] = investigation.strings(raw.get("variants"), 6, 480)
     return style
-
-
-def _writing_examples(samples: list[dict], question: dict) -> str:
-    target = research.keywords(str(question.get("title") or "") + " " + " ".join(question.get("tags") or []))
-    ranked = sorted(samples, key=lambda sample: (
-        sample.get("kind") != "answer",
-        -len(target & research.keywords(str(sample.get("title") or "") + " " + str(sample.get("text") or "")[:350])),
-    ))
-    closest = ranked[:2]
-    others = [sample for sample in ranked[2:] if sample.get("kind") != (closest[0].get("kind") if closest else None)]
-    selected = (closest + others[:1] + [sample for sample in ranked[2:] if sample not in others[:1]])[:4]
-    return "\n\n".join(
-        f"样本 {index}｜{'回答' if sample.get('kind') == 'answer' else '文章'}｜{sample.get('title', '')}\n{sample.get('text', '')[:1800]}"
-        for index, sample in enumerate(selected, start=1)
-    ) or "（没有答主真人样本；不虚构个人经历）"
 
 
 def _retain_examples(samples: list[dict]) -> list[dict]:
@@ -269,37 +254,31 @@ def do_sources(payload: dict) -> dict:
 
 # ---------------------------------------------------------------- research
 
-def _fmt_style(style) -> str:
-    """把画像里的文风档案摊成提示词块。字段缺了就跳过，不要留空标题。"""
+def _editor_preferences(style) -> str:
     if not isinstance(style, dict):
-        return "（暂无文风档案，按老练答主的常规写法作答）"
+        return ""
     labels = (
-        ("voice", "语气与人称"),
-        ("structure", "文章结构的差异"),
-        ("sentence", "句子节奏"),
+        ("structure", "组织偏好"),
         ("pacing", "详略取舍"),
         ("formatting", "排版习惯"),
         ("examples", "论据偏好"),
-        ("length", "常见篇幅"),
     )
     parts = [
-        f"- {label}：{str(style.get(key) or '').strip()}"
+        f"- {label}：{str(style.get(key) or '').strip()[:400]}"
         for key, label in labels
         if str(style.get(key) or "").strip()
     ]
-    for key, label in (("variants", "不同场景的文风观察"), ("openers", "常用开头"), ("signature", "口头禅"), ("avoid", "较少出现的写法")):
-        items = investigation.strings(style.get(key), 8, 600)
+    for key, label in (("variants", "不同题材的组织偏好"), ("avoid", "较少使用的写法")):
+        items = investigation.strings(style.get(key), 4, 200)
         if items:
             parts.append(f"- {label}：" + "；".join(items))
-    return "\n".join(parts) if parts else "（暂无文风档案，按老练答主的常规写法作答）"
+    return "\n".join(parts)
 
 
 def _strip_images(markdown: str) -> str:
     markdown = re.sub(r"^[ \t]*\[IMG:[^\]]*\][ \t]*\r?\n?", "", markdown, flags=re.M)
     markdown = re.sub(r"\[IMG:[^\]]*\]|<img\b[^>]*>", "", markdown, flags=re.I)
     markdown = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", markdown)
-    markdown = re.sub(r"[ \t]{2,}", " ", markdown)
-    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
     return markdown.strip()
 
 
@@ -331,6 +310,9 @@ def qualify_material(payload: dict) -> dict:
     return {**material, "docs": docs, "plan": plan, "findings": findings, "warnings": warnings}
 
 
+DRAFT_CITATION = re.compile(r"\[\[(S\d+)\]\]")
+
+
 def _draft_references(markdown, entries, exposed):
     by_url = {doc["sourceUrl"]: key for key, (doc, _) in exposed.items()}
     notes, ordered = {}, []
@@ -349,7 +331,7 @@ def _draft_references(markdown, entries, exposed):
             ordered.append(key)
         return f"[{ordered.index(key) + 1}]"
 
-    markdown = re.sub(r"\[\[(S\d+)\]\]", number, markdown)
+    markdown = DRAFT_CITATION.sub(number, markdown)
     inline_count = len(ordered)
     ordered.extend(key for key in notes if key not in ordered)
     citations = []
@@ -365,37 +347,49 @@ def _draft_references(markdown, entries, exposed):
     return markdown, citations
 
 
-def _edit_draft(markdown, cfg, user, timeout):
-    def protected(text):
-        return ([line for line in text.splitlines() if re.search(r"\[\[?S\d+\]\]?", line, re.I)],
-                sorted(re.findall(r"[0-9]+(?:[.\-/][0-9]+)*%?", text)),
-                re.findall(r"```[\s\S]*?```|https?://[^\s)]+", text))
+def _protected_draft_details(markdown):
+    body = DRAFT_CITATION.sub("", markdown)
+    fences = re.finditer(r"(?m)^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*$", body)
+    code_blocks = {match[0] for match in fences}
+    inline = re.findall(r"(?m)^[ \t]*>[^\n]+|`+[^`\n]+`+|https?://[^\s<>()\]，。；、！？]+", body)
+    numbers = re.sub(r"(?m)^[ \t]*\d+[.)][ \t]+", "", body)
+    numbers = re.sub(r"(?<=\d)[ \t]*×[ \t]*(?=\d)", "×", numbers)
+    return (
+        set(DRAFT_CITATION.findall(markdown)),
+        set(re.findall(r"[0-9]+(?:[.,×:/-][0-9]+)*%?", numbers)),
+        code_blocks,
+        set(inline),
+    )
 
+
+def _edit_draft(markdown, cfg, brief, findings, style, draft_min, draft_max, timeout):
+    user = brief + "\n\n【写作前的逐项核查】\n" + findings
+    if preferences := _editor_preferences(style):
+        user += "\n\n【适合本题时可参考的编辑偏好】\n" + preferences
+    user += "\n\n【待编辑初稿】\n" + markdown
+    system = prompts.DRAFT_EDIT_SYSTEM.format(draft_min=draft_min, draft_max=draft_max)
     try:
-        result = llm.chat_json(cfg, [{"role": "system", "content": prompts.STYLE_EDIT_SYSTEM},
-                                    {"role": "user", "content": user + "\n\n【待编辑初稿】\n" + markdown}],
-                               temperature=0, max_tokens=min(9000, max(2000, len(markdown) * 3)),
+        result = llm.chat_json(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                               temperature=0, max_tokens=min(12000, max(3000, len(markdown) * 3 + 1400)),
                                retry_tokens=0, timeout=timeout)
     except llm.LLMError:
-        return markdown
+        return None
     edited = result.get("markdown")
-    if (isinstance(edited, str) and not result.get("_salvaged") and
-            len(markdown) * 0.7 <= len(edited) <= len(markdown) * 1.12 and protected(edited) == protected(markdown)):
-        return edited.strip()
-    return markdown
+    edited = _strip_images(edited) if isinstance(edited, str) else ""
+    if (edited and not result.get("_salvaged") and len(edited) * 3 >= len(markdown)
+            and _protected_draft_details(edited) == _protected_draft_details(markdown)):
+        return edited
+    return None
 
 
 def write_draft(payload: dict) -> dict:
     started = time.monotonic()
-    question, profile, cfg = (payload.get(key) or {} for key in ("question", "profile", "model"))
+    question, cfg = (payload.get(key) or {} for key in ("question", "model"))
     material = payload.get("material") or {}
     settings = payload.get("settings") or {}
     draft_min = int(settings.get("draftMin", 500))
     draft_max = int(settings.get("draftMax", 1000))
-    examples = profile.get("samples") or []
     warnings = list(material.get("warnings") or [])
-    if not examples:
-        warnings.append("没有答主原文样本；更新领域画像后，新初稿会参考真实回答。")
     findings = list(material.get("findings") or [])
     supported = {entry.get("url") for item in findings for entry in item.get("evidence", [])}
     ranked_docs = sorted(material.get("docs") or [], key=lambda doc: doc["sourceUrl"] not in supported)
@@ -406,23 +400,18 @@ def write_draft(payload: dict) -> dict:
         " ".join(f"[{by_url[entry['url']]}]" for entry in item.get("evidence", []) if entry.get("url") in by_url)
         for item in findings
     ) or "（没有前置结论；按资料限定适用范围。）"
-    user = prompts.DRAFT_USER.format(
+    brief = prompts.DRAFT_QUESTION.format(
         title=question.get("title", ""),
         excerpt=(question.get("excerpt") or "（无补充说明）")[:2400],
         tags="、".join(question.get("tags") or []) or "（无）",
         direction=str(payload.get("direction") or "（答主未提供）")[:6000],
-        profile=(profile.get("summary") or "（暂无画像）")[:1000],
-        style=_fmt_style(profile.get("style")),
-        examples=_writing_examples(examples, question),
-        docs=docs,
-        findings=summary,
     )
     data = llm.chat_json(cfg, [
         {"role": "system", "content": prompts.DRAFT_SYSTEM.format(draft_min=draft_min, draft_max=draft_max)},
-        {"role": "user", "content": user},
+        {"role": "user", "content": prompts.DRAFT_USER.format(question=brief, docs=docs, findings=summary)},
     ], temperature=float(cfg.get("temperature", 0.3)),
         max_tokens=max(3000, min(12000, draft_max * 3 + 1400)),
-        retry_tokens=0, timeout=125, min_chars=max(60, draft_min // 4))
+        retry_tokens=0, timeout=125)
     markdown = data.get("markdown")
     markdown = _strip_images(markdown.strip()) if isinstance(markdown, str) else ""
     if not markdown:
@@ -430,9 +419,16 @@ def write_draft(payload: dict) -> dict:
     if data.get("_salvaged"):
         warnings.append("模型返回不完整，已保留可读正文。请检查结尾是否完整。")
     else:
-        remaining = min(35, int(137 - (time.monotonic() - started)))
+        # 为二次编辑留出单独的时间，并在核心服务超时前返回。
+        remaining = min(65, int(195 - (time.monotonic() - started)))
+        edited = None
         if remaining >= 12:
-            markdown = _strip_images(_edit_draft(markdown, cfg, user, remaining))
+            style = (payload.get("profile") or {}).get("style")
+            edited = _edit_draft(markdown, cfg, brief, summary, style, draft_min, draft_max, remaining)
+        if edited is None:
+            warnings.append("全文编辑未完成或未通过完整性检查，已保留第一版初稿。")
+        else:
+            markdown = edited
     doubts = list(findings)
     covered = {item["text"] for item in doubts}
     for entry in (data.get("doubts") or [])[:4]:

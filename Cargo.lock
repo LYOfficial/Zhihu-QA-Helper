@@ -5397,7 +5397,7 @@ dependencies = [
 
 [[package]]
 name = "zhihu-qa-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -5423,7 +5423,7 @@ dependencies = [
 
 [[package]]
 name = "zhihu-qa-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",

@@ -138,6 +138,16 @@ pub struct Source {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct QuestionMetrics {
+    pub views: Option<i64>,
+    pub answers: Option<i64>,
+    pub followers: Option<i64>,
+    pub created_time: Option<i64>,
+    pub synced_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Question {
     pub id: String,
     pub zhihu_id: String,
@@ -154,6 +164,8 @@ pub struct Question {
     pub bucket: String, // queue | selected | archived
     pub answer_count: i64,
     pub follower_count: i64,
+    pub metrics: Option<QuestionMetrics>,
+    pub metrics_error: String,
     pub asker_name: String,
     pub asker_headline: String,
     pub tags: Vec<String>,

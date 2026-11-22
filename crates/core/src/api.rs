@@ -37,7 +37,7 @@ where
     }
 }
 
-type R = Result<Json<Value>, ApiError>;
+pub(crate) type R = Result<Json<Value>, ApiError>;
 
 pub fn router(state: Shared) -> Router {
     let api = Router::new()
@@ -61,6 +61,10 @@ pub fn router(state: Shared) -> Router {
         .route("/sources", get(get_sources).put(put_sources))
         .route("/sources/discover", post(discover_sources))
         .route("/questions", get(list_questions))
+        .route("/questions/metrics/sync", post(crate::creator::sync_question_metrics))
+        .route("/answers", get(crate::creator::list_answers))
+        .route("/answers/sync", post(crate::creator::sync_answers))
+        .route("/answers/{id}", get(crate::creator::get_answer))
         .route("/questions/import", post(import_question))
         .route("/questions/discover", post(discover_questions))
         .route("/questions/sync", post(sync_now))
@@ -671,6 +675,8 @@ fn row_to_question(r: &rusqlite::Row<'_>) -> rusqlite::Result<Question> {
         bucket: r.get(11)?,
         answer_count: r.get(12)?,
         follower_count: r.get(13)?,
+        metrics: r.get::<_, Option<String>>(24)?.and_then(|text| serde_json::from_str(&text).ok()),
+        metrics_error: r.get(25)?,
         asker_name: r.get(14)?,
         asker_headline: r.get(15)?,
         tags: serde_json::from_str(&r.get::<_, String>(16)?).unwrap_or_default(),
@@ -690,7 +696,7 @@ const Q_SELECT: &str = "SELECT q.id, q.zhihu_id, q.question_id, q.source, q.titl
     (SELECT COUNT(*) FROM images i WHERE i.question_id = q.id) AS image_count,
     COALESCE((SELECT d.word_count FROM drafts d WHERE d.question_id = q.id), 0) AS word_count,
     COALESCE((SELECT json_array_length(d.doubts) FROM drafts d WHERE d.question_id = q.id), 0) AS doubt_count,
-    q.fit_evaluated
+    q.fit_evaluated, q.metrics, q.metrics_error
     FROM questions q";
 
 async fn list_questions(State(st): State<Shared>, Query(qp): Query<HashMap<String, String>>) -> R {
@@ -753,7 +759,8 @@ async fn list_questions(State(st): State<Shared>, Query(qp): Query<HashMap<Strin
         rows
     };
 
-    Ok(Json(json!({ "questions": list, "domains": domains })))
+    let metrics_job = crate::creator::running_metrics_job(&db.conn)?;
+    Ok(Json(json!({ "questions": list, "domains": domains, "metricsJobId": metrics_job })))
 }
 
 async fn get_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
