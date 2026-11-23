@@ -13,7 +13,7 @@ import {
 import { api, toast } from "@/lib/api";
 import { questionOpportunity } from "@/lib/creator-metrics";
 import { clearDraftRecovery } from "@/lib/draft-recovery";
-import { useLoad } from "@/lib/hooks";
+import { useLoad, usePoll } from "@/lib/hooks";
 import type { DomainCount, Job, Question, Session } from "@/lib/types";
 
 const TABS = [
@@ -43,6 +43,7 @@ export default function InboxPage() {
   const session = useLoad<Session>(() => api.get("/api/session"));
   const canSync = session.data?.canSyncNotifications;
   const { reload } = qs;
+  usePoll(() => void reload(true), 5000, true);
   const all = qs.data?.questions ?? [];
   const domains = qs.data?.domains ?? [];
   const activeMetricsJob = metricsJobId ?? qs.data?.metricsJobId;

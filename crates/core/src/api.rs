@@ -155,6 +155,8 @@ async fn get_session(State(st): State<Shared>) -> R {
         None => (None, None, None, false),
     };
 
+    let can_sync_answers = can_sync_notifications || user.as_ref()
+        .is_some_and(|account| ZhihuOpenSettings::load(&db).is_ok_and(|settings| settings.profile_enabled(&account.id)));
     Ok(Json(json!(Session {
         logged_in,
         onboarding_required: logged_in && tasks::onboarding_required(&db.conn)?,
@@ -162,6 +164,7 @@ async fn get_session(State(st): State<Shared>) -> R {
         expires_at,
         last_sync_at,
         can_sync_notifications,
+        can_sync_answers,
     })))
 }
 
@@ -1464,14 +1467,16 @@ async fn stats_overview(State(st): State<Shared>) -> R {
         })
         .unwrap_or(0.0);
     let answers_30d = count("SELECT COUNT(*) FROM questions WHERE status='answered' AND synced_at > date('now','-30 day')");
-    let v: i64 = db
-        .conn
-        .query_row("SELECT COALESCE(SUM(voteups),0) FROM stats_snapshots WHERE date > date('now','-30 day')", [], |r| r.get(0))
-        .unwrap_or(0);
-    let c: i64 = db
-        .conn
-        .query_row("SELECT COALESCE(SUM(comments),0) FROM stats_snapshots WHERE date > date('now','-30 day')", [], |r| r.get(0))
-        .unwrap_or(0);
+    let activity: Option<(i64, String)> = db.conn.query_row(
+        "SELECT stats.votes, stats.end_date FROM creator_account_activity stats
+         JOIN active_account a ON a.zhihu_id=stats.account_id",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let answer_votes: Option<i64> = db.conn.query_row(
+        "SELECT SUM(json_extract(c.metrics,'$.votes')) FROM creator_answers c
+         JOIN active_account a ON a.zhihu_id=c.account_id",
+        [], |row| row.get(0),
+    )?;
     let hit = if total > 0 {
         answered as f64 / total as f64
     } else {
@@ -1488,8 +1493,9 @@ async fn stats_overview(State(st): State<Shared>) -> R {
         images,
         images_bytes: bytes,
         answers_30d,
-        voteups_30d: v,
-        new_comments_30d: c,
+        voteups_30d: activity.as_ref().map(|(votes, _)| *votes),
+        voteups_through: activity.map(|(_, end)| end),
+        synced_answer_voteups: answer_votes,
         avg_fit,
         hit_rate: hit,
         saved_minutes: drafts * 25,

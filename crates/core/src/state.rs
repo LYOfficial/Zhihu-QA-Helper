@@ -19,6 +19,7 @@ pub struct AppState {
     pub answer_history_lock: Mutex<()>,
     pub creator_jobs_lock: Mutex<()>,
     pub discovery_lock: Mutex<()>,
+    pub login_sync_session: Mutex<String>,
 }
 
 pub type Shared = Arc<AppState>;
@@ -58,6 +59,7 @@ impl AppState {
             answer_history_lock: Mutex::new(()),
             creator_jobs_lock: Mutex::new(()),
             discovery_lock: Mutex::new(()),
+            login_sync_session: Mutex::new(String::new()),
         })
     }
 }

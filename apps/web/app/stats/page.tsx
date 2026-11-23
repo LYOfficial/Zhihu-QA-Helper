@@ -1,9 +1,9 @@
 "use client";
 
 import React from "react";
-import { Empty, Spinner, SectionTitle, relTime } from "@/components/ui";
+import { Empty, Spinner, SectionTitle } from "@/components/ui";
 import { api } from "@/lib/api";
-import { useLoad } from "@/lib/hooks";
+import { useLoad, usePoll } from "@/lib/hooks";
 import type { DomainCount, Question, StatsOverview, StatsPoint } from "@/lib/types";
 
 function level(v: number, max: number): 0 | 1 | 2 | 3 {
@@ -44,6 +44,7 @@ function HeatStrip({ points }: { points: StatsPoint[] }) {
 
 export default function StatsPage() {
   const st = useLoad<StatsOverview>(() => api.get("/api/stats/overview"));
+  usePoll(() => void st.reload(true), 5000, true);
   const se = useLoad<{ series: StatsPoint[] }>(() => api.get("/api/stats/series?days=14"));
   const qs = useLoad<{ questions: Question[]; domains: DomainCount[] }>(() =>
     api.get("/api/questions?status=all")
@@ -61,7 +62,7 @@ export default function StatsPage() {
           <h1 className="page-title">
             数据与产出 <small>LEDGER</small>
           </h1>
-          <p className="page-sub">回答量、互动与本地存储。回答后的第三天起会开始出现趋势。</p>
+          <p className="page-sub">回顾问题收录、写作产出与知乎互动。</p>
         </div>
       </header>
 
@@ -90,9 +91,9 @@ export default function StatsPage() {
               <div className="ledger-hint">归档率 {(s.hitRate * 100).toFixed(0)}%</div>
             </div>
             <div className="ledger-cell">
-              <div className="ledger-label">获赞（30 天）</div>
-              <div className="ledger-value">{s.voteups30d}</div>
-              <div className="ledger-hint">新评论 {s.newComments30d}</div>
+              <div className="ledger-label">{s.voteups30d != null ? "获赞（30 天）" : "已同步作答获赞"}</div>
+              <div className="ledger-value">{(s.voteups30d ?? s.syncedAnswerVoteups)?.toLocaleString("zh-CN") ?? "—"}</div>
+              <div className="ledger-hint">{s.voteupsThrough ? "统计截至 " + s.voteupsThrough : s.syncedAnswerVoteups != null ? "已同步回答累计赞同" : "同步作答后查看"}</div>
             </div>
             <div className="ledger-cell">
               <div className="ledger-label">本地占用</div>

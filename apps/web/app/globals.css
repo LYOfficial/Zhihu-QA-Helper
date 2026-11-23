@@ -2241,127 +2241,60 @@ html[data-theme="paper"] .profile-progress {
 
 /* ------------------------------------------------------------------ 登录 / 启动 */
 
+.app-window[data-compact="true"] .app-titlebar {
+  background: var(--paper-raised);
+  border-bottom-color: transparent;
+}
+
+.app-window[data-compact="true"] .app-titlebar-brand {
+  visibility: hidden;
+}
+
 .login {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   display: grid;
-  grid-template-columns: minmax(0, 0.92fr) minmax(400px, 1fr);
-  height: 100vh;
-  background: var(--paper);
+  grid-template-rows: minmax(198px, 1fr) auto;
+  justify-items: center;
+  padding: 16px clamp(24px, 8vw, 54px) clamp(24px, 7vh, 44px);
+  background: var(--paper-raised);
 }
 
 .login-brand {
-  position: relative;
-  background: #1b1a17;
-  color: #ece6d8;
-  padding: 44px 46px 30px;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-.login-brand::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background-image: radial-gradient(520px 340px at 78% 8%, rgba(176, 52, 42, 0.22), transparent 70%),
-    repeating-linear-gradient(122deg, rgba(255, 255, 255, 0.022) 0 1px, transparent 1px 3px);
-  pointer-events: none;
-}
-.login-brand > * {
-  position: relative;
-}
-.login-brand .seal {
-  color: #c8544a;
-  margin-bottom: 26px;
-}
-.login-brand h1 {
-  font-family: var(--font-kai);
-  font-size: 31px;
-  font-weight: 400;
-  letter-spacing: 0.06em;
-  line-height: 1.3;
-  margin-bottom: 10px;
-}
-.login-brand .lead {
-  font-size: 13px;
-  line-height: 1.95;
-  color: rgba(236, 230, 216, 0.62);
-  max-width: 26em;
-}
-.login-points {
-  list-style: none;
-  padding: 0;
-  margin: 34px 0 0;
-  border-top: 1px solid rgba(236, 230, 216, 0.14);
-}
-.login-points li {
-  display: flex;
-  gap: 10px;
-  padding: 12px 0;
-  border-bottom: 1px solid rgba(236, 230, 216, 0.1);
-  font-size: 12px;
-  line-height: 1.65;
-  color: rgba(236, 230, 216, 0.8);
-}
-.login-points li b {
-  font-weight: 400;
-  color: #ece6d8;
-  font-family: var(--font-kai);
-  font-size: 13px;
-  display: block;
-  margin-bottom: 1px;
-}
-.login-points li .idx {
-  font-family: var(--font-num);
-  color: rgba(200, 84, 74, 0.9);
-  font-size: 11px;
-  padding-top: 2px;
-  width: 14px;
-  flex-shrink: 0;
-}
-.login-brand .foot {
-  margin-top: auto;
-  padding-top: 22px;
-  font-size: 10.5px;
-  color: rgba(236, 230, 216, 0.38);
-  letter-spacing: 0.05em;
-  display: flex;
-  gap: 12px;
-  align-items: center;
+  align-self: center;
+  text-align: center;
 }
 
-.login-right {
-  display: grid;
-  place-items: center;
-  padding: 32px;
-  overflow-y: auto;
-  position: relative;
+.login-logo {
+  display: block;
+  margin: 0 auto 26px;
 }
-.login-theme-toggle {
-  position: absolute;
-  top: 18px;
-  right: 22px;
-  color: var(--ink-3);
-  font-size: 11px;
-  border-bottom: 1px solid var(--rule-2);
-  padding-bottom: 2px;
-}
-.login-theme-toggle:hover {
-  color: var(--blue);
-  border-color: var(--blue);
-}
-.login-card {
-  width: min(372px, 100%);
-}
-.login-card h2 {
+
+.login-brand h1 {
+  margin: 0 0 12px;
   font-family: var(--font-kai);
-  font-size: 21px;
-  font-weight: 400;
-  letter-spacing: 0.03em;
+  font-weight: 650;
+  font-size: clamp(24px, 6vw, 32px);
+  line-height: 1.3;
 }
-.login-card .sub {
-  margin-top: 5px;
-  font-size: 11.5px;
-  color: var(--ink-3);
-  line-height: 1.7;
+
+.login-brand p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.login-card {
+  width: min(352px, 100%);
+}
+
+.login-card > .btn {
+  min-height: 46px;
+  border-radius: 9px;
+  font-size: 14px;
+  font-weight: 600;
 }
 .qr-frame {
   margin: 22px auto 14px;
@@ -2478,7 +2411,8 @@ html[data-theme="paper"] .profile-progress {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 10px;
+  justify-content: center;
+  margin-bottom: 10px;
   padding: 8px 10px;
   background: var(--blue-wash);
   border: 1px solid rgba(11, 95, 165, 0.18);
@@ -2699,25 +2633,5 @@ html[data-theme="paper"] .profile-progress {
     display: none;
   }
 
-  .login {
-    display: block;
-    overflow-y: auto;
-  }
 
-  .login-brand {
-    min-height: auto;
-    padding: 28px 24px 24px;
-  }
-
-  .login-points {
-    margin-top: 22px;
-  }
-
-  .login-brand .foot {
-    margin-top: 22px;
-  }
-
-  .login-right {
-    padding: 28px 20px 40px;
-  }
 }

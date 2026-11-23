@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use crate::{
     api::R,
     models::now_iso,
-    state::{zhihu_client_from_db, Shared},
+    state::{zhihu_client_from_db, Shared, ZhihuOpenSettings},
     tasks::{account_client, account_identity, job_end, job_start, job_step, IS_ANSWERED},
     zhihu::{
         as_str, count_field, is_content_id, parse_shared_link, strip_html, SharedLink, ZhihuClient,
@@ -151,31 +151,62 @@ pub(crate) async fn list_answers(State(st): State<Shared>, Query(query): Query<A
 }
 
 pub(crate) async fn sync_answers(State(st): State<Shared>) -> R {
+    let job = start_answer_sync(&st, None).await?;
+    Ok(Json(json!({ "jobId": job })))
+}
+
+pub(crate) async fn start_answer_sync(st: &Shared, expected: Option<&str>) -> Result<String> {
     let _lock = st.creator_jobs_lock.lock().await;
-    let (account, _, client) = account_client(&st).await?;
-    client.require_web_session()?;
-    if let Some(job) = running_job(&st.db.lock().await.conn, ANSWER_SYNC)? {
-        return Ok(Json(json!({ "jobId": job })));
-    }
-    let job = job_start(&st, ANSWER_SYNC, None, "正在连接知乎创作中心").await;
+    let (account, client, access_secret) = {
+        let db = st.db.lock().await;
+        let (account, _) = account_identity(&db.conn)?;
+        ensure!(
+            expected.is_none_or(|expected| expected == account),
+            "知乎账号已切换"
+        );
+        if let Some(job) = running_job(&db.conn, ANSWER_SYNC)? {
+            return Ok(job);
+        }
+        let settings = ZhihuOpenSettings::load(&db)?;
+        let access_secret = settings
+            .profile_enabled(&account)
+            .then_some(settings.secret);
+        (account, zhihu_client_from_db(&db)?, access_secret)
+    };
+    let job = job_start(st, ANSWER_SYNC, None, "正在读取知乎作答").await;
     let state = st.clone();
     let job_id = job.clone();
     tokio::spawn(async move {
-        let result = sync_answers_inner(&state, &job_id, &account, &client).await;
+        let result = match client.require_web_session() {
+            Ok(()) => sync_answers_inner(&state, &job_id, &account, &client).await,
+            Err(error) => Err(error),
+        };
+        let result = match (result, access_secret.as_deref()) {
+            (Err(_), Some(secret)) => sync_open_answers(&state, &job_id, &account, secret).await,
+            (Err(_), None) if client.cookie.trim().is_empty() => Err(anyhow!(
+                "请在设置中启用当前账号的知乎 Access Secret，以同步历史作答"
+            )),
+            (result, _) => result,
+        };
+        if let Some(secret) = access_secret {
+            if let Err(error) = refresh_account_activity(&state, &account, &secret).await {
+                tracing::debug!("创作统计更新未完成：{error}");
+            }
+        }
         match result {
             Ok(count) => {
                 job_end(
                     &state,
                     &job_id,
                     true,
-                    &format!("已同步 {count} 条回答及互动数据"),
+                    &format!("已同步 {count} 条回答及可用互动数据"),
                 )
                 .await
             }
             Err(error) => job_end(&state, &job_id, false, &format!("同步回答失败：{error}")).await,
         }
     });
-    Ok(Json(json!({ "jobId": job })))
+    Ok(job)
 }
 
 async fn sync_answers_inner(
@@ -215,14 +246,125 @@ async fn sync_answers_inner(
         account_identity(&db.conn)?.0 == account,
         "知乎账号已切换，请重新同步"
     );
-    save_answers(&mut db.conn, account, answers.values())?;
+    save_answers(&mut db.conn, account, answers.values(), true)?;
     Ok(answers.len())
+}
+
+fn parse_open_answer(row: &Value) -> Result<CreatorAnswer> {
+    let url = reqwest::Url::parse(row["Url"].as_str().unwrap_or_default())?;
+    let link = parse_shared_link(url.as_str())?;
+    let path = url.path().trim_end_matches('/');
+    let id = path
+        .rsplit('/')
+        .next()
+        .filter(|id| is_content_id(id))
+        .ok_or_else(|| anyhow!("知乎没有返回有效的回答编号"))?;
+    ensure!(
+        row["ContentType"] == "answer" && path.contains("/answer/"),
+        "开放平台返回了非回答内容"
+    );
+    Ok(CreatorAnswer {
+        id: id.to_string(),
+        question_id: match link {
+            SharedLink::Question(id) => id,
+            SharedLink::Answer(_) => String::new(),
+        },
+        title: row["Title"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .unwrap_or("知乎回答")
+            .to_owned(),
+        excerpt: strip_html(row["Summary"].as_str().unwrap_or_default()),
+        created_time: count_field(row, &["CreatedAt"]).filter(|time| *time > 0),
+        updated_time: None,
+        metrics: AnswerMetrics {
+            reads: None,
+            votes: count_field(row, &["LikeCount"]),
+            comments: count_field(row, &["CommentCount"]),
+            favorites: count_field(row, &["FavoriteCount"]),
+            likes: None,
+        },
+    })
+}
+
+async fn sync_open_answers(st: &Shared, job: &str, account: &str, secret: &str) -> Result<usize> {
+    let mut offset = 0u64;
+    let mut answers = std::collections::HashMap::new();
+    for _ in 0..50 {
+        let page = crate::zhihu_open::get(
+            "user/contents",
+            secret,
+            &[
+                ("ContentType", "answer"),
+                ("Limit", "50"),
+                ("Offset", &offset.to_string()),
+            ],
+        )
+        .await?;
+        let rows = page["Items"]
+            .as_array()
+            .ok_or_else(|| anyhow!("知乎没有返回回答列表"))?;
+        for row in rows {
+            let answer = parse_open_answer(row)?;
+            answers.entry(answer.id.clone()).or_insert(answer);
+        }
+        {
+            let db = st.db.lock().await;
+            ensure!(account_identity(&db.conn)?.0 == account, "知乎账号已切换");
+        }
+        job_step(
+            st,
+            job,
+            "同步作答",
+            0.1 + 0.8 * (answers.len() as f64 / (answers.len() as f64 + 100.0)),
+            &format!("已读取 {} 条回答", answers.len()),
+        )
+        .await;
+        if page["Paging"]["IsEnd"] == true {
+            let mut db = st.db.lock().await;
+            ensure!(account_identity(&db.conn)?.0 == account, "知乎账号已切换");
+            save_answers(&mut db.conn, account, answers.values(), false)?;
+            return Ok(answers.len());
+        }
+        offset = page["Paging"]["NextOffset"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|next| *next > offset && !rows.is_empty())
+            .ok_or_else(|| anyhow!("知乎回答分页异常"))?;
+    }
+    anyhow::bail!("知乎回答分页超过本次同步上限")
+}
+
+async fn refresh_account_activity(st: &Shared, account: &str, secret: &str) -> Result<()> {
+    let end = chrono::Local::now().date_naive();
+    let start = (end - chrono::Duration::days(29)).to_string();
+    let end = end.to_string();
+    let stats = crate::zhihu_open::get(
+        "user/creator_account_stats",
+        secret,
+        &[
+            ("ContentType", "all"),
+            ("StartDate", &start),
+            ("EndDate", &end),
+        ],
+    )
+    .await?;
+    let votes = count_field(&stats["Metrics"], &["IncreasedUpvoteCount"])
+        .ok_or_else(|| anyhow!("知乎没有返回该时间段的新增赞同"))?;
+    let db = st.db.lock().await;
+    ensure!(account_identity(&db.conn)?.0 == account, "知乎账号已切换");
+    db.conn.execute(
+        "INSERT OR REPLACE INTO creator_account_activity (account_id, end_date, votes) VALUES (?1,?2,?3)",
+        params![account, end, votes],
+    )?;
+    Ok(())
 }
 
 fn save_answers<'a>(
     conn: &mut Connection,
     account: &str,
     answers: impl IntoIterator<Item = &'a CreatorAnswer>,
+    complete: bool,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     let synced = now_iso();
@@ -230,12 +372,23 @@ fn save_answers<'a>(
         let mut insert = tx.prepare(
             "INSERT INTO creator_answers (account_id, answer_id, question_id, title, excerpt, created_time, updated_time, metrics, synced_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(account_id, answer_id) DO UPDATE SET question_id=excluded.question_id, title=excluded.title,
-                excerpt=excluded.excerpt, created_time=excluded.created_time, updated_time=excluded.updated_time,
-                metrics=excluded.metrics, synced_at=excluded.synced_at,
-                content=CASE WHEN excluded.updated_time IS creator_answers.updated_time THEN creator_answers.content END",
+             ON CONFLICT(account_id, answer_id) DO UPDATE SET
+                question_id=COALESCE(NULLIF(excluded.question_id,''),creator_answers.question_id), title=excluded.title,
+                excerpt=excluded.excerpt, created_time=COALESCE(excluded.created_time,creator_answers.created_time),
+                updated_time=COALESCE(excluded.updated_time,creator_answers.updated_time),
+                metrics=json_object(
+                    'reads', COALESCE(json_extract(excluded.metrics,'$.reads'),json_extract(creator_answers.metrics,'$.reads')),
+                    'votes', COALESCE(json_extract(excluded.metrics,'$.votes'),json_extract(creator_answers.metrics,'$.votes')),
+                    'comments', COALESCE(json_extract(excluded.metrics,'$.comments'),json_extract(creator_answers.metrics,'$.comments')),
+                    'favorites', COALESCE(json_extract(excluded.metrics,'$.favorites'),json_extract(creator_answers.metrics,'$.favorites')),
+                    'likes', COALESCE(json_extract(excluded.metrics,'$.likes'),json_extract(creator_answers.metrics,'$.likes'))
+                ), synced_at=excluded.synced_at,
+                content=CASE WHEN excluded.updated_time IS NULL OR excluded.updated_time IS creator_answers.updated_time THEN creator_answers.content END",
         )?;
-        let mut remember = tx.prepare("INSERT OR IGNORE INTO answered_questions VALUES (?1,?2)")?;
+        let mut remember = tx.prepare(
+            "INSERT OR IGNORE INTO answered_questions SELECT account_id, question_id
+            FROM creator_answers WHERE account_id=?1 AND answer_id=?2 AND question_id<>''",
+        )?;
         for answer in answers {
             insert.execute(params![
                 account,
@@ -248,13 +401,15 @@ fn save_answers<'a>(
                 serde_json::to_string(&answer.metrics)?,
                 synced
             ])?;
-            remember.execute(params![account, answer.question_id])?;
+            remember.execute(params![account, answer.id])?;
         }
     }
-    tx.execute(
-        "DELETE FROM creator_answers WHERE account_id=?1 AND synced_at<>?2",
-        params![account, synced],
-    )?;
+    if complete {
+        tx.execute(
+            "DELETE FROM creator_answers WHERE account_id=?1 AND synced_at<>?2",
+            params![account, synced],
+        )?;
+    }
     tx.execute(
         "INSERT OR REPLACE INTO creator_answer_sync VALUES (?1,?2)",
         params![account, synced],
@@ -264,7 +419,7 @@ fn save_answers<'a>(
 }
 
 pub(crate) async fn get_answer(State(st): State<Shared>, Path(id): Path<String>) -> R {
-    let (account, updated, client) = {
+    let (account, updated, client, secret) = {
         let db = st.db.lock().await;
         let (account, _) = account_identity(&db.conn)?;
         let (content, truncated, updated): (Option<String>, bool, Option<i64>) = db.conn.query_row(
@@ -275,9 +430,30 @@ pub(crate) async fn get_answer(State(st): State<Shared>, Path(id): Path<String>)
         if let Some(content) = content {
             return Ok(Json(json!({ "content": content, "truncated": truncated })));
         }
-        (account, updated, zhihu_client_from_db(&db)?)
+        let settings = ZhihuOpenSettings::load(&db)?;
+        let secret = settings
+            .profile_enabled(&account)
+            .then_some(settings.secret);
+        (account, updated, zhihu_client_from_db(&db)?, secret)
     };
-    let (content, truncated) = client.creator_answer_content(&id).await?;
+    if !is_content_id(&id) {
+        return Err(anyhow!("无效的回答编号").into());
+    }
+    let (content, truncated) = match (secret, client.creator_answer_content(&id).await) {
+        (_, Ok(value)) => value,
+        (Some(secret), Err(_)) => {
+            let url = format!("https://www.zhihu.com/answer/{id}");
+            let data =
+                crate::zhihu_open::get("user/content_detail", &secret, &[("ContentUrl", &url)])
+                    .await?;
+            let body = data["Body"]
+                .as_str()
+                .filter(|body| !body.is_empty())
+                .ok_or_else(|| anyhow!("知乎未提供回答正文"))?;
+            (body.to_owned(), false)
+        }
+        (None, Err(error)) => return Err(error.into()),
+    };
     let db = st.db.lock().await;
     if account_identity(&db.conn)?.0 != account {
         return Err(anyhow!("知乎账号已切换，请重新打开回答").into());

@@ -27,6 +27,7 @@ export interface Session {
   expiresAt: string | null;
   lastSyncAt: string | null;
   canSyncNotifications: boolean;
+  canSyncAnswers: boolean;
 }
 
 export interface ProfileTerm {
@@ -246,8 +247,9 @@ export interface StatsOverview {
   images: number;
   imagesBytes: number;
   answers30d: number;
-  voteups30d: number;
-  newComments30d: number;
+  voteups30d: number | null;
+  voteupsThrough: string | null;
+  syncedAnswerVoteups: number | null;
   avgFit: number;
   hitRate: number;
   savedMinutes: number;

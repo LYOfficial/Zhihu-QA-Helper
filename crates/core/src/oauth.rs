@@ -159,7 +159,12 @@ pub(crate) async fn poll(State(st): State<Shared>, Json(_): Json<Value>) -> R {
         Check::Failed => "failed",
         Check::Complete(auth) => {
             *pending = None;
+            let session = auth.session.clone();
             persist(&st, auth).await?;
+            drop(pending);
+            tokio::spawn(async move {
+                crate::tasks::sync_after_login(&st, Some(&session)).await;
+            });
             return Ok(Json(json!({"status": "complete"})));
         }
     };

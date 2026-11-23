@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::models::*;
 use crate::state::{AppState, ZhihuOpenSettings};
-use crate::zhihu::{answer_question_id, parse_shared_link, RawQuestion, SharedLink, ZhihuClient};
+use crate::zhihu::{answer_question_id, parse_shared_link, strip_html, RawQuestion, SharedLink, ZhihuClient};
 
 // ---------------- job 基础设施 ----------------
 
@@ -495,10 +495,6 @@ pub async fn run_sync(state: &crate::state::Shared) -> Result<SyncReport> {
     run_sync_window(state, None).await
 }
 
-pub async fn run_sync_recent(state: &crate::state::Shared, days: i64) -> Result<SyncReport> {
-    run_sync_window(state, Some(days)).await
-}
-
 pub async fn start_sync(state: &crate::state::Shared, days: Option<i64>, select_only: bool) -> String {
     let message = if days.is_some() {
         "正在准备最近 3 天通知"
@@ -509,7 +505,7 @@ pub async fn start_sync(state: &crate::state::Shared, days: Option<i64>, select_
     let state = state.clone();
     let job_id = job.clone();
     tokio::spawn(async move {
-        let result = sync_inner(&state, &job_id, days, select_only).await;
+        let result = sync_inner(&state, &job_id, days, select_only, None).await;
         match &result {
             Ok(report) => job_end(&state, &job_id, true, &report.message).await,
             Err(error) => {
@@ -552,32 +548,95 @@ pub async fn recover_stale_jobs(state: &AppState) {
     }
 }
 
-pub async fn bootstrap_if_empty(state: &crate::state::Shared) {
-    let should_sync = {
+pub async fn sync_after_login(state: &crate::state::Shared, expected: Option<&str>) {
+    let (account, session, client, secret) = {
+        let mut last = state.login_sync_session.lock().await;
         let db = state.db.lock().await;
-        let logged_in = db
-            .conn
-            .query_row("SELECT cookie FROM active_account", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .map(|cookie| !cookie.trim().is_empty())
-            .unwrap_or(false);
-        let questions = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM questions", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0);
-        logged_in && questions == 0 && !onboarding_required(&db.conn).unwrap_or(true)
-    };
-    if should_sync {
-        if let Err(e) = run_sync_recent(state, 3).await {
-            tracing::warn!("启动时补齐最近 3 天通知失败：{e}");
+        let Ok((account, session)) = db.conn.query_row(
+            "SELECT zhihu_id, oauth_session FROM active_account", [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ) else { return; };
+        if *last == session || expected.is_some_and(|expected| expected != session) {
+            return;
         }
+        let Ok(client) = crate::state::zhihu_client_from_db(&db) else { return; };
+        let settings = ZhihuOpenSettings::load(&db).unwrap_or_default();
+        let secret = settings.profile_enabled(&account).then_some(settings.secret);
+        last.clone_from(&session);
+        (account, session, client, secret)
+    };
+    if let Err(error) = crate::creator::start_answer_sync(state, Some(&account)).await {
+        tracing::debug!("登录后未启动回答同步：{error}");
     }
+    let job = job_start(state, "sync", None, "登录后同步知乎问题").await;
+    let result = async {
+        if client.require_web_session().is_ok() {
+            if let Ok(report) = sync_inner(state, &job, Some(3), true, Some(&session)).await {
+                return Ok(report.message);
+            }
+        }
+        let official_error = if let Some(secret) = secret {
+            match sync_recommended_questions(state, &job, &session, &account, &secret).await {
+                Ok(message) => return Ok(message),
+                Err(error) => Some(error),
+            }
+        } else { None };
+        let terms = {
+            let db = state.db.lock().await;
+            ensure_current_session(&db.conn, &session)?;
+            load_terms(&db.conn)?
+        };
+        if terms.is_empty() {
+            return Err(official_error.unwrap_or_else(|| anyhow::anyhow!("请配置当前账号的知乎 Access Secret，或添加擅长领域后获取公开推荐")));
+        }
+        let (_, token, _) = account_client(state).await?;
+        discover_questions_inner(state, &client, &job, &account, &token, terms, String::new()).await
+    }.await;
+    match result {
+        Ok(message) => job_end(state, &job, true, &message).await,
+        Err(error) => job_end(state, &job, false, &format!("同步问题未完成：{error}")).await,
+    }
+}
+
+fn ensure_current_session(conn: &rusqlite::Connection, session: &str) -> Result<()> {
+    let active: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM active_account WHERE oauth_session=?1)",
+        [session], |row| row.get(0))?;
+    anyhow::ensure!(active, "知乎账号已切换");
+    Ok(())
+}
+
+async fn sync_recommended_questions(state: &AppState, job: &str, session: &str, account: &str, secret: &str) -> Result<String> {
+    job_step(state, job, "同步推荐", 0.4, "正在读取知乎推荐问题").await;
+    let result = crate::zhihu_open::get("user/question_recommendations", secret, &[("Count", "10")]).await?;
+    let items = result["Items"].as_array().ok_or_else(|| anyhow::anyhow!("知乎没有返回推荐列表"))?;
+    let mut db = state.db.lock().await;
+    let tx = db.conn.transaction()?;
+    ensure_current_session(&tx, session)?;
+    let terms = load_terms(&tx)?;
+    let mut added = 0;
+    for item in items {
+        let Some(url) = item["Url"].as_str() else { continue; };
+        let Ok(SharedLink::Question(id)) = parse_shared_link(url) else { continue; };
+        let title = strip_html(item["Title"].as_str().unwrap_or_default());
+        if title.is_empty() || is_answered(&tx, account, &id)? || existing_question(&tx, &id)?.is_some() {
+            continue;
+        }
+        let raw = RawQuestion {
+            zhihu_id: id.clone(), question_id: id.clone(), title,
+            url: format!("https://www.zhihu.com/question/{id}"), source: "discovered".into(),
+            excerpt: String::new(), asker_name: String::new(), asker_headline: String::new(),
+            answer_count: 0, follower_count: 0, tags: vec![], metrics: None,
+        };
+        insert_question(&tx, &raw, 0, &terms)?;
+        added += 1;
+    }
+    tx.commit()?;
+    Ok(format!("已同步知乎推荐，新增 {added} 个问题"))
 }
 
 async fn run_sync_window(state: &crate::state::Shared, days: Option<i64>) -> Result<SyncReport> {
     let job = job_start(state, "sync", None, "正在连接知乎").await;
-    let result = sync_inner(state, &job, days, false).await;
+    let result = sync_inner(state, &job, days, false, None).await;
     match &result {
         Ok(r) => job_end(state, &job, true, &r.message).await,
         Err(e) => {
@@ -593,6 +652,7 @@ async fn sync_inner(
     job: &str,
     days: Option<i64>,
     select_only: bool,
+    expected_session: Option<&str>,
 ) -> Result<SyncReport> {
     job_step(
         state,
@@ -607,6 +667,10 @@ async fn sync_inner(
     )
     .await;
     let (account_id, token, client) = account_client(state).await?;
+    if let Some(session) = expected_session {
+        let db = state.db.lock().await;
+        ensure_current_session(&db.conn, session)?;
+    }
     client.require_web_session()?;
     let batch = match days {
         Some(days) => client.fetch_invites_since(days).await?,
@@ -631,6 +695,9 @@ async fn sync_inner(
     let (added, selected_ids) = {
         let mut db = state.db.lock().await;
         let tx = db.conn.transaction()?;
+        if let Some(session) = expected_session {
+            ensure_current_session(&tx, session)?;
+        }
         anyhow::ensure!(account_identity(&tx)?.0 == account_id, "知乎账号已切换，请重试");
         let terms = load_terms(&tx)?;
         let mut inserted = Vec::new();

@@ -21,12 +21,12 @@ ZHIHU_OAUTH_USERINFO_URL=
 | --- | --- |
 | `ZHIHU_OAUTH_APP_ID` | 知乎审批发放的 APP ID |
 | `ZHIHU_OAUTH_APP_KEY` | 知乎审批发放的 APP Key。只保存在服务器 |
-| `ZHIHU_OAUTH_USERINFO_URL` | 知乎确认的用户信息 HTTPS 地址，支持 `openapi.zhihu.com` 或 `developer.zhihu.com`。服务以 GET 请求并附带 `Authorization: Bearer <access_token>` |
-| `ZHIHU_OAUTH_USERINFO_PATH` | 用户对象在 JSON 中的位置，默认为根对象。若包在 `data.user` 下，填 `/data/user` |
-| `ZHIHU_OAUTH_USERINFO_ID_FIELD`、`ZHIHU_OAUTH_USERINFO_NAME_FIELD` | 默认为 `id`、`name`。ID 必须是知乎返回的稳定用户标识。要关联旧版历史记录，须使用与旧版账号相同的知乎用户 ID |
+| `ZHIHU_OAUTH_USERINFO_URL` | 可留空。默认使用已实测的 `https://openapi.zhihu.com/user`，通过 GET 和 `Authorization: Bearer <access_token>` 查询当前授权账号 |
+| `ZHIHU_OAUTH_USERINFO_PATH` | 默认接口返回根对象，留空即可。若自定义接口把用户对象放在 `data.user` 下，填 `/data/user` |
+| `ZHIHU_OAUTH_USERINFO_ID_FIELD`、`ZHIHU_OAUTH_USERINFO_NAME_FIELD` | 默认接口直接读取 `hash_id`、`fullname`。其他接口可设置字段名，默认读取 `id`、`name` |
 | `ZHIHU_OAUTH_ACCESS_SECRET` | 可选。服务端读取已授权用户公开创作时使用的开放平台 Access Secret，配合该用户的 `X-OAuth-Token` 使用 |
 
-[知乎 OAuth 公共文档](https://developer.zhihu.com/docs?key=zhihu_oauth_integrated)列出了换取令牌的接口，用户信息的地址、返回格式与 `state` 回传行为需要向知乎确认。回调会验证知乎原样回传的 `state` 和发起授权的浏览器。仅填写 APP ID 和 APP Key 时，健康检查会显示登录尚未启用。可向 `openplatform@zhihu.com` 索取用户信息接口说明和 `state` 支持说明。
+使用已登记的回调地址时，通常只需填 APP ID 和 APP Key。回调会验证知乎原样回传的 `state` 和发起授权的浏览器。[知乎 OAuth 公共文档](https://developer.zhihu.com/docs?key=zhihu_oauth_integrated)
 
 需要 Linux、Docker Engine 28 或更高版本，以及支持 `up --wait` 的 Docker Compose v2。配置完成后，从 `deploy` 目录启动：
 
@@ -45,7 +45,7 @@ curl --fail https://zh.ijune.cn/healthz
 docker compose exec oauth python -B server.py --diagnose
 ```
 
-用浏览器打开命令打印的链接，在五分钟内完成知乎授权，再看服务器终端的结果。用户信息接口可以暂时留空。命令只显示校验结果和待补的配置，不打印授权码、APP Key、OAuth 令牌或用户资料。诊断不会生成桌面会话，缺少身份接口时健康检查仍为 `oauthEnabled: false。若知乎未回传匹配的 `state，诊断不会交换授权码。
+用浏览器打开命令打印的链接，在五分钟内完成知乎授权，再看服务器终端的结果。命令会检查 `state`、令牌交换和用户身份查询。诊断只显示校验结果，不打印凭证或用户资料，也不会生成桌面会话。
 
 ## DNS 和反向代理
 

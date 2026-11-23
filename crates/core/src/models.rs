@@ -38,6 +38,7 @@ pub struct Session {
     pub expires_at: Option<String>,
     pub last_sync_at: Option<String>,
     pub can_sync_notifications: bool,
+    pub can_sync_answers: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -306,8 +307,9 @@ pub struct StatsOverview {
     pub images: i64,
     pub images_bytes: i64,
     pub answers_30d: i64,
-    pub voteups_30d: i64,
-    pub new_comments_30d: i64,
+    pub voteups_30d: Option<i64>,
+    pub voteups_through: Option<String>,
+    pub synced_answer_voteups: Option<i64>,
     pub avg_fit: f64,
     pub hit_rate: f64,
     pub saved_minutes: i64,

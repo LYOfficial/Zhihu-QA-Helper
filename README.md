@@ -192,7 +192,7 @@ python -m pip install -r agents/requirements-build.txt
 npm run build:nsis
 ```
 
-使用 Windows x64、对应架构的 Node.js/Python 和 MSVC 工具链构建。输出位于 `target\nsis-build\release\bundle\nsis\`，简体中文安装包使用软件图标，页眉和侧栏从品牌资源生成。安装包内含前端、本地内核及图像处理依赖。可用 `ZHIHU_QA_BUILD_PYTHON` 指定构建环境中的 Python 路径。
+使用 Windows x64、x64 版 Node.js/Python，以及 Visual Studio 的 MSVC x86/x64 C++ 工具链构建。简体中文版安装向导的图形和窗口控件随构建生成。安装包内含前端、本地内核及图像处理依赖，输出位于 `target\nsis-build\release\bundle\nsis\`。可用 `ZHIHU_QA_BUILD_PYTHON` 指定构建环境中的 Python 路径。
 
 回归检查：`python -m unittest discover -s agents -v`、`cargo test --locked -p zhihu-qa-core`。
 构建后可运行 `python scripts/smoke-test.py`；它使用临时数据库和模拟模型测试断点续跑，不会访问你的知乎账号。选装 Playwright 后，加上 `--screenshots shots/smoke` 可验证界面并输出截图。

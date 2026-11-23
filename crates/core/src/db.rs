@@ -401,6 +401,11 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS creator_answer_sync (
             account_id TEXT PRIMARY KEY,
             synced_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS creator_account_activity (
+            account_id TEXT PRIMARY KEY,
+            end_date TEXT NOT NULL,
+            votes INTEGER NOT NULL
          );",
     )?;
     Ok(())

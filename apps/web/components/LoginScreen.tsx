@@ -2,17 +2,12 @@
 
 import React from "react";
 import { api, toast } from "@/lib/api";
-import type { Theme } from "@/lib/theme";
-import { IconExternal, Spinner, Seal } from "./ui";
+import { IconExternal, Spinner } from "./ui";
 
 export default function LoginScreen({
   onSuccess,
-  theme,
-  onThemeChange,
 }: {
   onSuccess: () => void;
-  theme: Theme;
-  onThemeChange: (theme: Theme) => void;
 }) {
   const [waiting, setWaiting] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
@@ -83,80 +78,28 @@ export default function LoginScreen({
   }
 
   return (
-    <div className="login">
+    <main className="login">
       <div className="login-brand">
-        <div className="seal">
-          <Seal size={46} />
-        </div>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img className="login-logo" src="/logo.svg" alt="" width={76} height={76} />
         <h1>知乎答主助手</h1>
-        <p className="lead">
-          把「今天该答哪个问题」变成一份摊在案头的奏章。
-          <br />
-          AI 只备料，落笔永远是你。
-        </p>
-
-        <ul className="login-points">
-          <li>
-            <span className="idx">一</span>
-            <span>
-              <b>收集适合回答的问题</b>
-              按领域找题，也可以直接导入知乎问题链接。
-            </span>
-          </li>
-          <li>
-            <span className="idx">二</span>
-            <span>
-              <b>联网取材与核对</b>
-              只从你认可的权威平台抓资料与配图，生成的每个数值都要能追到原文。
-            </span>
-          </li>
-          <li>
-            <span className="idx">三</span>
-            <span>
-              <b>初稿摆上案头，由你定稿</b>
-              不留 AI 直接发布的入口。存疑处逐条列出，改不改由你决定。
-            </span>
-          </li>
-        </ul>
-
-        <div className="foot">
-          <span>v0.1</span>
-          <span>草稿和资料保存在本机</span>
-        </div>
+        <p>发现值得回答的问题，查资料，写初稿。</p>
       </div>
-
-      <div className="login-right">
-        <button
-          className="login-theme-toggle"
-          onClick={() => onThemeChange(theme === "paper" ? "zhihu" : "paper")}
-        >
-          切换到{theme === "paper" ? "现代主题" : "纸质主题"}
-        </button>
-        <div className="login-card">
-          <h2>登录知乎</h2>
-          <p className="sub">在浏览器的知乎授权页确认后，返回此处即可继续。</p>
-
-          {waiting ? (
-            <>
-              <div className="login-waiting" role="status">
-                <Spinner />
-                <span>正在等待知乎授权</span>
-              </div>
-              <button className="btn btn-block" onClick={cancel}>取消授权等待</button>
-            </>
-          ) : (
-            <button
-              className="btn btn-primary btn-block"
-              style={{ marginTop: 18 }}
-              disabled={busy}
-              onClick={authorize}
-            >
-              {busy ? <Spinner /> : <IconExternal size={14} />} 使用知乎账号登录
-            </button>
-          )}
-          {error && <div className="login-err" role="alert">{error}</div>}
-        </div>
+      <div className="login-card">
+        {waiting ? (
+          <>
+            <div className="login-waiting" role="status">
+              <Spinner /> 请在浏览器完成知乎授权
+            </div>
+            <button className="btn btn-block" onClick={cancel}>取消授权等待</button>
+          </>
+        ) : (
+          <button className="btn btn-primary btn-block" disabled={busy} onClick={authorize}>
+            {busy ? <Spinner /> : <IconExternal size={16} />} 使用知乎账号登录
+          </button>
+        )}
+        {error && <div className="login-err" role="alert">{error}</div>}
       </div>
-    </div>
+    </main>
   );
 }

@@ -4,7 +4,7 @@ import React from "react";
 import { Empty, IconExternal, IconRefresh, IconSearch, Modal, Spinner } from "@/components/ui";
 import { api, openExternal, toast } from "@/lib/api";
 import { answerQuality, formatMetric, qualityLevel } from "@/lib/creator-metrics";
-import { useLoad } from "@/lib/hooks";
+import { useLoad, usePoll } from "@/lib/hooks";
 import type { AnswerMetrics, CreatorAnswer, Job, Session } from "@/lib/types";
 
 interface AnswerPageData {
@@ -110,7 +110,7 @@ function AnswerDetail({ answer, onClose }: { answer: CreatorAnswer; onClose: () 
         )}
       </div>
       <div className="answer-detail-actions">
-        <button className="btn" onClick={() => void openExternal(`https://www.zhihu.com/question/${answer.questionId}/answer/${answer.id}`)}>
+        <button className="btn" onClick={() => void openExternal(`https://www.zhihu.com/answer/${answer.id}`)}>
           <IconExternal size={14} /> 在知乎打开
         </button>
       </div>
@@ -131,8 +131,9 @@ export default function AnswersPage() {
     return api.get(`/api/answers?${params}`);
   }, [page, keyword]);
   const session = useLoad<Session>(() => api.get("/api/session"));
-  const canSync = session.data?.canSyncNotifications;
+  const canSync = session.data?.canSyncAnswers;
   const { reload } = list;
+  usePoll(() => void reload(true), 5000, !list.data?.jobId && !jobId);
   const activeJob = jobId ?? list.data?.jobId;
   const busy = starting || Boolean(activeJob && (!job || job.id !== activeJob || job.state === "running"));
 
@@ -182,7 +183,7 @@ export default function AnswersPage() {
       <header className="page-head">
         <div>
           <h1 className="page-title">历史作答</h1>
-          <p className="page-sub">{list.data?.syncedAt ? `上次同步 ${dateTime.format(new Date(list.data.syncedAt))}` : canSync ? "从知乎创作中心同步本人作答和互动数据" : "查看此账号已保存的历史作答"}</p>
+          <p className="page-sub">{list.data?.syncedAt ? `上次同步 ${dateTime.format(new Date(list.data.syncedAt))}` : "查看知乎作答和互动数据"}</p>
         </div>
         {canSync && <div className="page-actions">
           <button className="btn btn-primary" onClick={() => void sync()} disabled={busy}>
@@ -218,7 +219,7 @@ export default function AnswersPage() {
             ))}
           </div>
         ) : !list.error && (
-          <Empty glyph="答">{keyword ? "没有找到匹配的作答。" : list.data?.syncedAt ? "知乎创作中心没有返回作答记录。" : canSync ? "点击「同步作答」，在这里查看历史回答。" : "此账号暂无已保存的回答。知乎授权暂不支持创作中心同步。"}</Empty>
+          <Empty glyph="答">{keyword ? "没有找到匹配的作答。" : list.data?.syncedAt ? "知乎没有返回作答记录。" : canSync ? "点击「同步作答」，在这里查看历史回答。" : "可在设置中启用当前账号的知乎 Access Secret，同步历史作答。"}</Empty>
         )}
         {pages > 1 && (
           <nav aria-label="作答分页" className="answer-pagination">

@@ -31,7 +31,7 @@ import {
 
 type Toast = { id: number; msg: string; kind: "ok" | "err" | "info" };
 
-function WindowTitlebar() {
+function WindowTitlebar({ compact }: { compact: boolean }) {
   const [maximized, setMaximized] = React.useState(false);
   const isTauriRuntime =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -89,7 +89,7 @@ function WindowTitlebar() {
 
   return (
     <header className="app-titlebar">
-      <div className="app-titlebar-drag" data-tauri-drag-region onDoubleClick={() => void onToggleMaximize()}>
+      <div className="app-titlebar-drag" data-tauri-drag-region onDoubleClick={compact ? undefined : () => void onToggleMaximize()}>
         <Link href="/" className="app-titlebar-brand" onClick={(event) => event.preventDefault()}>
           <span className="mark">
             {/* 使用项目蓝色 Logo，避免标题栏继续显示旧印章图标 */}
@@ -101,19 +101,19 @@ function WindowTitlebar() {
       </div>
       <div className="app-window-actions">
         <button type="button" aria-label="最小化" onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); void onMinimize(); }}>−</button>
-        <button type="button" aria-label={maximized ? "还原" : "最大化"} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); void onToggleMaximize(); }}>
+        {!compact && <button type="button" aria-label={maximized ? "还原" : "最大化"} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); void onToggleMaximize(); }}>
           {maximized ? "❐" : "□"}
-        </button>
+        </button>}
         <button type="button" className="close" aria-label="关闭" onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); void onClose(); }}>×</button>
       </div>
     </header>
   );
 }
 
-function DesktopFrame({ children }: { children: React.ReactNode }) {
+function DesktopFrame({ children, compact = false }: { children: React.ReactNode; compact?: boolean }) {
   return (
-    <div className="app-window">
-      <WindowTitlebar />
+    <div className="app-window" data-compact={compact}>
+      <WindowTitlebar compact={compact} />
       {children}
     </div>
   );
@@ -248,6 +248,24 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     return () => clearTimeout(timer);
   }, [session.data, session.reload]);
 
+  const loggedIn = session.data?.loggedIn;
+  const previousLoginLayout = React.useRef<boolean | undefined>(undefined);
+  React.useEffect(() => {
+    if (loggedIn === undefined || !("__TAURI_INTERNALS__" in window)) return;
+    const previous = previousLoginLayout.current;
+    previousLoginLayout.current = loggedIn;
+    if (previous === undefined || previous === loggedIn) return;
+    void (async () => {
+      const { getCurrentWindow, LogicalSize } = await import("@tauri-apps/api/window");
+      const appWindow = getCurrentWindow();
+      if (!loggedIn && await appWindow.isMaximized()) await appWindow.unmaximize();
+      await appWindow.setMaximizable(loggedIn);
+      await appWindow.setMinSize(loggedIn ? new LogicalSize(820, 580) : new LogicalSize(360, 430));
+      await appWindow.setSize(loggedIn ? new LogicalSize(1280, 840) : new LogicalSize(480, 520));
+      await appWindow.center();
+    })().catch((error) => console.error("无法调整应用窗口大小", error));
+  }, [loggedIn]);
+
   async function retry() {
     const m = await probe();
     setMode(m);
@@ -267,16 +285,14 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     </div>
   );
 
-  if (mode === "unknown") return <DesktopFrame><Boot text="正在唤起本地内核…" /></DesktopFrame>;
-  if (mode === "offline") return <DesktopFrame><Offline onRetry={retry} /></DesktopFrame>;
-  if (session.loading && !session.data) return <DesktopFrame><Boot text="正在读取登录状态…" /></DesktopFrame>;
+  if (mode === "unknown") return <DesktopFrame compact><Boot text="正在唤起本地内核…" /></DesktopFrame>;
+  if (mode === "offline") return <DesktopFrame compact><Offline onRetry={retry} /></DesktopFrame>;
+  if (session.loading && !session.data) return <DesktopFrame compact><Boot text="正在读取登录状态…" /></DesktopFrame>;
 
   if (!session.data?.loggedIn) {
     return (
-      <DesktopFrame>
+      <DesktopFrame compact>
         <LoginScreen
-          theme={theme}
-          onThemeChange={changeTheme}
           onSuccess={refreshAll}
         />
         {toastHost}

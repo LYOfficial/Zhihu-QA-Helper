@@ -251,11 +251,25 @@ fn main() {
                 .clone()
                 .unwrap_or_else(|| format!("http://127.0.0.1:{}/", core_port()));
             let url = tauri::Url::parse(&target)?;
+            let logged_in = core_get("/api/session")
+                .and_then(|response| {
+                    let (headers, body) = response.split_once("\r\n\r\n")?;
+                    headers.starts_with("HTTP/1.1 200").then_some(())?;
+                    serde_json::from_str::<serde_json::Value>(body).ok()
+                })
+                .and_then(|session| session["loggedIn"].as_bool())
+                .unwrap_or(false);
+            let (width, height, min_width, min_height) = if logged_in {
+                (1280.0, 840.0, 820.0, 580.0)
+            } else {
+                (480.0, 520.0, 360.0, 430.0)
+            };
 
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("知乎答主助手")
-                .inner_size(1280.0, 840.0)
-                .min_inner_size(820.0, 580.0)
+                .inner_size(width, height)
+                .min_inner_size(min_width, min_height)
+                .maximizable(logged_in)
                 .decorations(false)
                 .transparent(true)
                 .shadow(false)

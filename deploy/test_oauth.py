@@ -138,3 +138,24 @@ class OAuthTest(unittest.TestCase):
 
         self.oauth.missing_credentials = ["ZHIHU_OAUTH_APP_KEY"]
         self.assertEqual(run_control("/start", {}), {"missing": ["ZHIHU_OAUTH_APP_KEY"]})
+
+    def test_zhihu_userinfo_fields(self):
+        with patch.dict(os.environ, {
+            "ZHIHU_OAUTH_APP_ID": "fixture-app", "ZHIHU_OAUTH_APP_KEY": "fixture-app-key",
+            "ZHIHU_OAUTH_USERINFO_URL": "",
+        }, clear=True):
+            oauth = server.OAuth()
+        self.assertTrue(oauth.enabled)
+        with patch.object(server, "upstream", return_value={
+            "hash_id": "legacy-zhihu-id", "uid": 42, "fullname": "测试答主", "headline": "简介",
+            "url": "https://www.zhihu.com/people/fixture-user",
+            "avatar_path": "https://picx.zhimg.com/avatar.jpg",
+            "phone": "private-field",
+        }) as upstream:
+            user = oauth.identity("fixture-token")
+            upstream.assert_called_once_with(server.USERINFO_URL, headers={"Authorization": "Bearer fixture-token"})
+        self.assertEqual(user["id"], "legacy-zhihu-id")
+        self.assertEqual(user["name"], "测试答主")
+        self.assertEqual(user["urlToken"], "fixture-user")
+        self.assertEqual(user["avatarUrl"], "https://picx.zhimg.com/avatar.jpg")
+        self.assertNotIn("phone", user)

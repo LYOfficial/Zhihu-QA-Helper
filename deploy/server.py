@@ -15,6 +15,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 CALLBACK = "/oauth/zhihu/callback"
 REDIRECT_URI = "https://zh.ijune.cn" + CALLBACK
 OPENAPI = "https://openapi.zhihu.com"
+USERINFO_URL = OPENAPI + "/user"
 CONTENTS = "https://developer.zhihu.com/api/v1/user/contents"
 COOKIE = "__Host-zhihu_qa_oauth"
 CONTROL_URL = "http://127.0.0.1:33112"
@@ -74,7 +75,7 @@ class OAuth:
     def __init__(self):
         self.app_id = os.environ.get("ZHIHU_OAUTH_APP_ID", "").strip()
         self.app_key = os.environ.get("ZHIHU_OAUTH_APP_KEY", "").strip()
-        self.userinfo = os.environ.get("ZHIHU_OAUTH_USERINFO_URL", "").strip()
+        self.userinfo = os.environ.get("ZHIHU_OAUTH_USERINFO_URL", "").strip() or USERINFO_URL
         self.userinfo_path = os.environ.get("ZHIHU_OAUTH_USERINFO_PATH", "").strip()
         self.id_field = os.environ.get("ZHIHU_OAUTH_USERINFO_ID_FIELD", "id").strip()
         self.name_field = os.environ.get("ZHIHU_OAUTH_USERINFO_NAME_FIELD", "name").strip()
@@ -117,17 +118,30 @@ class OAuth:
                 info = info.get(key.replace("~1", "/").replace("~0", "~"))
         if not isinstance(info, dict):
             raise ValueError("知乎用户信息格式有误")
-        account_id = info.get(self.id_field)
+        default_endpoint = self.userinfo == USERINFO_URL
+        account_id = info.get("hash_id" if default_endpoint else self.id_field)
         if type(account_id) is int:
             account_id = str(account_id)
-        name = text_field(info.get(self.name_field))
+        name = text_field(info.get("fullname" if default_endpoint else self.name_field))
         if not isinstance(account_id, str) or not account_id.strip() or len(account_id) > 256 or not name:
             raise ValueError("知乎没有返回稳定账号标识和昵称")
-        avatar = text_field(info.get("avatar_url"), 2048)
+        avatar = text_field(info.get("avatar_path" if default_endpoint else "avatar_url"), 2048)
+        url_token = text_field(info.get("url_token"))
+        if default_endpoint:
+            try:
+                url = urlsplit(text_field(info.get("url"), 2048))
+            except ValueError:
+                url = urlsplit("")
+            if url.netloc in {"", "www.zhihu.com", "zhihu.com"} and url.scheme in {"", "http", "https"}:
+                prefix, separator, slug = url.path.rstrip("/").rpartition("/")
+                if separator and prefix == "/people":
+                    url_token = text_field(slug)
+                elif not separator and not url.netloc and slug.isascii() and all(c.isalnum() or c in "-_" for c in slug):
+                    url_token = text_field(slug)
         return {
             "id": account_id.strip(),
             "name": name,
-            "urlToken": text_field(info.get("url_token")),
+            "urlToken": url_token,
             "avatarUrl": avatar if avatar.startswith("https://") else "",
             "headline": text_field(info.get("headline")),
             "answerCount": self.count(info.get("answer_count")),
@@ -362,14 +376,14 @@ class Handler(BaseHTTPRequestHandler):
         if path not in {"/oauth/zhihu/start", "/oauth/zhihu/poll", "/oauth/zhihu/cancel", "/oauth/zhihu/session",
                         "/oauth/zhihu/logout", "/oauth/zhihu/profile"}:
             return self.respond(404, {"error": "未找到接口"})
-        if not self.oauth.enabled:
-            message = ("知乎授权服务尚未配置用户信息接口" if not self.oauth.missing_credentials
-                       else "知乎 OAuth 登录尚未启用，请联系服务管理员")
-            return self.respond(503, {"error": message})
         try:
             body = self.read_json()
         except (ValueError, OSError):
             return self.respond(400, {"error": "无效请求"})
+        if not self.oauth.enabled:
+            message = ("知乎授权服务尚未配置用户信息接口" if not self.oauth.missing_credentials
+                       else "知乎 OAuth 登录尚未启用，请联系服务管理员")
+            return self.respond(503, {"error": message})
         with self.oauth.lock:
             self.oauth.prune()
             if path.endswith("/start"):
@@ -472,7 +486,7 @@ def diagnose():
         "state_mismatch": "知乎回传了授权码，但 state 与发出的值不同。请将结果反馈给知乎。",
         "code_missing": "state 校验通过，回调缺少 authorization_code。",
         "exchange_failed": "state 校验通过，但用授权码换取令牌失败。请核对 APP 凭证和登记的回调地址。",
-        "identity_unconfigured": "state 校验和令牌交换均通过。还需要知乎给出用户信息接口及稳定账号 ID 字段。",
+        "identity_unconfigured": "state 校验和令牌交换均通过。请检查用户信息接口配置。",
         "identity_failed": "state 校验和令牌交换均通过。已配置的用户信息接口未返回可验证的账号资料。",
         "verified": "state 校验、令牌交换、用户身份查询均通过。现在可以从桌面端验证真实登录。",
         "cancelled": "浏览器已取消授权。",

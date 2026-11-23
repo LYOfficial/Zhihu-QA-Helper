@@ -22,6 +22,7 @@ if (process.platform !== "win32" || process.arch !== "x64") {
 }
 run(python, ["-c", "import struct; import PyInstaller, PIL; assert struct.calcsize('P') == 8"]);
 run(python, ["scripts/generate-nsis-artwork.py", artwork]);
+run("powershell.exe", ["-NoProfile", "-File", "scripts/build-nsis-skin.ps1", artwork]);
 run(process.execPath, ["../../node_modules/next/dist/bin/next", "build"], resolve(root, "apps/web"));
 run("cargo", ["build", "--locked", "--release", "-p", "zhihu-qa-core"]);
 run(python, ["-m", "PyInstaller", "--noconfirm", "--onedir", "--exclude-module", "numpy",
@@ -36,8 +37,9 @@ for (const resource of Object.keys(resources)) {
   if (!existsSync(resolve(desktop, resource))) throw new Error(`缺少安装资源：${resource}`);
 }
 const nsis = {
+  template: "installer/installer.nsi",
+  installerHooks: "installer/appearance.nsh",
   headerImage: relative(desktop, resolve(artwork, "installer-header.bmp")).replaceAll("\\", "/"),
-  sidebarImage: relative(desktop, resolve(artwork, "installer-sidebar.bmp")).replaceAll("\\", "/"),
 };
 run(process.execPath, [resolve(root, "node_modules/@tauri-apps/cli/tauri.js"),
   "build", "--ci", "--features", "installed-runtime", "--bundles", "nsis", "--config",

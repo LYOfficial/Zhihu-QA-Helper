@@ -418,7 +418,7 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
                   onClick={async () => {
                     await api.post("/api/session/logout");
                     toast("已退出登录", "ok");
-                    setTimeout(() => window.location.reload(), 350);
+                    window.dispatchEvent(new Event("zhihu-session-updated"));
                   }}
                 >
                   退出

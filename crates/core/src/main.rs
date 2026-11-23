@@ -12,6 +12,7 @@ mod scheduler;
 mod state;
 mod tasks;
 mod zhihu;
+mod zhihu_open;
 
 use anyhow::Result;
 use axum::http::{header, HeaderValue, Method};
@@ -187,7 +188,7 @@ async fn main() -> Result<()> {
     let bootstrap_state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        tasks::bootstrap_if_empty(&bootstrap_state).await;
+        tasks::sync_after_login(&bootstrap_state, None).await;
     });
 
     // 静态前端：优先 apps/web/.build（next export 的产物），否则给一个提示页
