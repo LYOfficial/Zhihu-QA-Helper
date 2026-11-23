@@ -27,9 +27,9 @@ class OAuthTest(unittest.TestCase):
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.shutdown)
 
-    def request(self, path, body=None, cookie=None):
-        connection = HTTPConnection("127.0.0.1", self.port, timeout=3)
-        prefix = "/oauth/zhihu"
+    def request(self, path, body=None, cookie=None, *, control_port=None):
+        connection = HTTPConnection("127.0.0.1", control_port or self.port, timeout=3)
+        prefix = "" if control_port else "/oauth/zhihu"
         headers = {"Content-Type": "application/json"} if body is not None else {}
         if cookie:
             headers["Cookie"] = cookie
@@ -47,6 +47,9 @@ class OAuthTest(unittest.TestCase):
     def start(self):
         code, _, data = self.request("/start", {})
         self.assertEqual(code, 200)
+        return self.launch(data)
+
+    def launch(self, data):
         self.assertNotIn(data["secret"], data["url"])
         ticket = {"state": data["state"], "secret": data["secret"]}
         code, headers, _ = self.request("/launch?" + urlsplit(data["url"]).query)
@@ -101,3 +104,37 @@ class OAuthTest(unittest.TestCase):
         ticket, _ = self.start()
         self.oauth.logins[ticket["state"]].deadline = 0
         self.assertEqual(self.request("/poll", ticket)[2], {"status": "expired"})
+
+    def test_diagnostic_with_identity_disabled(self):
+        self.oauth.identity_ready = self.oauth.enabled = False
+        control = ThreadingHTTPServer(("127.0.0.1", 0), server.DiagnosticHandler)
+        control.oauth = self.oauth
+        self.addCleanup(control.server_close)
+        threading.Thread(target=control.serve_forever, daemon=True).start()
+        self.addCleanup(control.shutdown)
+
+        def run_control(path, payload):
+            return self.request(path, payload, control_port=control.server_port)[2]
+
+        self.assertEqual(self.request("/start", {})[0], 503)
+        with patch.object(server, "upstream", return_value={
+            "access_token": "fixture-token", "token_type": "Bearer", "expires_in": 3600,
+        }) as upstream:
+            for expected in ("state_missing", "state_mismatch", "identity_unconfigured"):
+                ticket, cookie = self.launch(run_control("/start", {}))
+                self.assertEqual(self.request("/start", {})[0], 503)
+                callback = "/callback?authorization_code=fixture"
+                if expected == "identity_unconfigured":
+                    callback += f"&state={ticket['state']}"
+                elif expected == "state_mismatch":
+                    callback += "&state=wrong"
+                self.assertEqual(self.request(callback)[1]["Location"], "/oauth/zhihu/result/invalid")
+                self.assertEqual(self.request(callback, cookie=cookie)[1]["Location"],
+                                 "/oauth/zhihu/result/diagnostic")
+                self.assertEqual(run_control("/poll", ticket), {"status": expected})
+                self.assertEqual(run_control("/poll", ticket), {"status": "expired"})
+            self.assertEqual(upstream.call_count, 1)
+            self.assertEqual(self.oauth.sessions, {})
+
+        self.oauth.missing_credentials = ["ZHIHU_OAUTH_APP_KEY"]
+        self.assertEqual(run_control("/start", {}), {"missing": ["ZHIHU_OAUTH_APP_KEY"]})

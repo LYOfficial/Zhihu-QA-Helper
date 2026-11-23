@@ -37,6 +37,16 @@ curl --fail https://zh.ijune.cn/healthz
 
 配置齐全时健康检查返回 `{"status":"ok","oauthEnabled":true}`。它只检查服务配置，随后需在桌面端完成一次真实知乎授权。更新后重跑同一脚本，停止时运行 `docker compose down`。当前只运行单个副本，授权事务和知乎令牌保存在服务内存。服务重启后，打开桌面端「设置 → 知乎账号 → 刷新」可检查会话，失效时重新授权。
 
+## 用现有 APP 凭证诊断知乎回调
+
+填好 APP ID 和 APP Key、重新部署后，可从服务器的 `deploy 目录运行以下命令。
+
+```sh
+docker compose exec oauth python -B server.py --diagnose
+```
+
+用浏览器打开命令打印的链接，在五分钟内完成知乎授权，再看服务器终端的结果。用户信息接口可以暂时留空。命令只显示校验结果和待补的配置，不打印授权码、APP Key、OAuth 令牌或用户资料。诊断不会生成桌面会话，缺少身份接口时健康检查仍为 `oauthEnabled: false。若知乎未回传匹配的 `state，诊断不会交换授权码。
+
 ## DNS 和反向代理
 
 1. 在 `ijune.cn` 的 DNS 控制台将主机记录 `zh` 配置为 `A`，值为 **HTTPS 反代服务器的公网 IPv4**。如果 `zh` 已有指向 `lyofficial.github.io` 的 `CNAME`，先删掉或改掉那条记录，不能让同名 `CNAME` 和 `A` 共存。只有反代已支持公网 IPv6 时才添加 `AAAA`。不要修改现有 `zhihu.ijune.cn` 记录。
