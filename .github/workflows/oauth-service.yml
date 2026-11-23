@@ -21,11 +21,16 @@ jobs:
           persist-credentials: false
       - name: Start Docker service
         run: sh deploy/deploy.sh
+      - name: Test OAuth transactions
+        run: python3 -m unittest discover -s deploy -p 'test_*.py'
       - name: Check health and disabled OAuth callback
         run: |
           curl --fail --silent --show-error http://127.0.0.1:33111/healthz |
             jq -e '.status == "ok" and .oauthEnabled == false'
-          body=$(curl --fail --silent --show-error 'http://127.0.0.1:33111/oauth/zhihu/callback?authorization_code=fixture')
+          output=$(mktemp)
+          code=$(curl --silent --show-error --output "$output" --write-out '%{http_code}' 'http://127.0.0.1:33111/oauth/zhihu/callback?authorization_code=fixture')
+          [[ "$code" == 503 ]]
+          body=$(cat "$output")
           [[ "$body" == *'登录尚未启用'* && "$body" != *'fixture'* ]]
       - name: Show service status
         if: failure()

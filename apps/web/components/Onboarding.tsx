@@ -7,16 +7,16 @@ import type { Job, Question, Session, Settings, WritingMode } from "@/lib/types"
 import SettingsContent, { WritingModePicker, ZhihuOpenSection } from "./SettingsContent";
 import { IconArrowRight, IconCheck, IconCompass, IconInbox, IconQuill, IconSliders, IconSpark, Modal, Spinner } from "./ui";
 
-const steps = [
-  { title: "连接大模型", icon: IconSpark, text: "选择平台和模型，填入 API Key。先测试连接，再保存配置。画像分析与拟稿都需要可用的模型。" },
-  { title: "配置知乎 Access Secret", icon: IconCompass, text: "这是可选项。启用后使用你自己的知乎开放平台额度；未配置、关闭或请求失败时，助手仍保留原有来源。" },
-  { title: "选择写作方式", icon: IconSliders, text: "让助手完成从选题到初稿，或由你把握判断和解答方向。以后也可以在设置里切换。" },
-  { title: "分析领域画像", icon: IconSpark, text: "助手会参考你的历史回答与文章，总结擅长的主题和常用写法。没有历史作品也能跳过，稍后手动填写领域。" },
-  { title: "同步问题", icon: IconInbox, text: "取回最近三天的邀请和推荐，先排除已答问题。这一步只收题，不自动生成初稿。" },
-  { title: "试写第一份初稿", icon: IconQuill, text: "选一道题，写下想保留的判断与理由。助手会查资料并起草，结果留在写作台，不会自动发布。" },
+const allSteps = [
+  { key: "model", title: "连接大模型", icon: IconSpark, text: "选择平台和模型，填入 API Key。先测试连接，再保存配置。画像分析与拟稿都需要可用的模型。" },
+  { key: "open", title: "配置知乎 Access Secret", icon: IconCompass, text: "这是可选项。启用后使用你自己的知乎开放平台额度；未配置、关闭或请求失败时，助手仍保留原有来源。" },
+  { key: "mode", title: "选择写作方式", icon: IconSliders, text: "让助手完成从选题到初稿，或由你把握判断和解答方向。以后也可以在设置里切换。" },
+  { key: "profile", title: "分析领域画像", icon: IconSpark, text: "助手会参考你的历史回答与文章，总结擅长的主题和常用写法。没有历史作品也能跳过，稍后手动填写领域。" },
+  { key: "sync", title: "同步问题", icon: IconInbox, text: "取回最近三天的邀请和推荐，先排除已答问题。这一步只收题，不自动生成初稿。" },
+  { key: "draft", title: "试写第一份初稿", icon: IconQuill, text: "选一道题，写下想保留的判断与理由。助手会查资料并起草，结果留在写作台，不会自动发布。" },
 ];
 
-export default function Onboarding({ account, onExit }: { account: Session["user"]; onExit: (path?: string) => void }) {
+export default function Onboarding({ account, canSyncNotifications, onExit }: { account: Session["user"]; canSyncNotifications: boolean; onExit: (path?: string) => void }) {
   const [step, setStep] = React.useState(0);
   const [job, setJob] = React.useState<Job | null>(null);
   const [starting, setStarting] = React.useState(false);
@@ -33,7 +33,8 @@ export default function Onboarding({ account, onExit }: { account: Session["user
   const needsDirection = config.data?.writingMode === "subjective" && question?.bucket === "selected"
     && !["imported", "discovered"].includes(question.source);
   const activeQuestion = job?.kind === "research" ? job.questionId : null;
-  const current = steps[step];
+  const steps = canSyncNotifications ? allSteps : allSteps.filter((item) => item.key !== "sync");
+  const current = steps[Math.min(step, steps.length - 1)];
   const Icon = current.icon;
 
   React.useEffect(() => {
@@ -106,16 +107,16 @@ export default function Onboarding({ account, onExit }: { account: Session["user
         <small>第 {step + 1} 步 / 共 {steps.length} 步</small><h4>{current.title}</h4>
       </div></div>
       <p className="setup-description">{current.text}</p>
-      {step === 0 && <SettingsContent embeddedModel />}
-      {step === 1 && <ZhihuOpenSection account={account} />}
-      {step === 2 && (config.data ? <WritingModePicker value={modeChoice ?? config.data.writingMode ?? "automatic"} onChange={saveMode} disabled={savingMode} /> : <Spinner />)}
-      {step === 3 && <button className="btn btn-primary" disabled={running || job?.state === "done"} onClick={() => void run("/api/profile/analyze", "profile")}>
+      {current.key === "model" && <SettingsContent embeddedModel />}
+      {current.key === "open" && <ZhihuOpenSection account={account} />}
+      {current.key === "mode" && (config.data ? <WritingModePicker value={modeChoice ?? config.data.writingMode ?? "automatic"} onChange={saveMode} disabled={savingMode} /> : <Spinner />)}
+      {current.key === "profile" && <button className="btn btn-primary" disabled={running || job?.state === "done"} onClick={() => void run("/api/profile/analyze", "profile")}>
         分析我的画像
       </button>}
-      {step === 4 && <button className="btn btn-primary" disabled={running || job?.state === "done"} onClick={() => void run("/api/questions/sync/recent", "sync", { selectOnly: true })}>
+      {current.key === "sync" && <button className="btn btn-primary" disabled={running || job?.state === "done"} onClick={() => void run("/api/questions/sync/recent", "sync", { selectOnly: true })}>
         同步近 3 天
       </button>}
-      {step === 5 && !activeQuestion && (question ? <div className="setup-fields">
+      {current.key === "draft" && !activeQuestion && (question ? <div className="setup-fields">
         <div className="field"><label htmlFor="setup-question">试写题目</label><select className="select" id="setup-question" value={question.id} disabled={running}
           onChange={(event) => { setChoice(event.target.value); setDirection(""); }}>
           {candidates.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}

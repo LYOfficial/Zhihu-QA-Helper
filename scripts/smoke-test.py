@@ -151,7 +151,8 @@ class Smoke:
     def seed(self):
         with sqlite3.connect(self.directory / "zhihu-qa.db") as database:
             database.execute("UPDATE settings SET auto_sync=0")
-            database.execute("INSERT INTO account (id, name, cookie, zhihu_id) VALUES (1, '本机测试答主', 'fixture', 'first-account')")
+            database.execute("""INSERT INTO account (id,name,cookie,zhihu_id,oauth_session,oauth_expires_at)
+                                VALUES (1,'本机测试答主','fixture','first-account','fixture-session',unixepoch()+3600)""")
             for qid, title in (("rail", QUESTION), ("other", "另一条测试问题")):
                 database.execute("INSERT INTO questions (id,question_id,title,domain,tags) VALUES (?,?,?,?,?)",
                                  (qid, "123456789" if qid == "other" else "987654321", title, "测试资料", '["铁路"]'))
@@ -282,12 +283,16 @@ class Smoke:
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.route("**/api/session", lambda route: route.fulfill(json={"loggedIn": False}))
+            page.route("**/api/session/oauth/start", lambda route: route.fulfill(json={"ok": True}))
+            page.route("**/api/session/oauth/poll", lambda route: route.fulfill(json={"status": "pending"}))
+            page.route("**/api/session/oauth/cancel", lambda route: route.fulfill(json={"ok": True}))
             page.goto(self.base)
-            page.get_by_role("button", name="在应用内登录知乎").click()
-            retry = page.get_by_role("button", name="重新打开登录窗口")
-            with page.expect_response(lambda response: response.url.endswith("/api/login/browser")) as reopened:
-                retry.click()
-            assert reopened.value.ok
+            login = page.get_by_role("button", name="使用知乎账号登录")
+            login.click()
+            page.get_by_role("status").filter(has_text="正在等待知乎授权").wait_for()
+            page.get_by_role("button", name="取消授权等待").click()
+            login.wait_for()
+            page.screenshot(path=output / "oauth-login.png")
             page.unroute("**/api/session")
             self.check_zhihu_settings(page, output)
             page.goto(self.base + "/settings/")

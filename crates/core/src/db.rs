@@ -20,8 +20,13 @@ CREATE TABLE IF NOT EXISTS account (
   follower_count INTEGER NOT NULL DEFAULT 0,
   cookie        TEXT NOT NULL DEFAULT '',
   expires_at    TEXT,
+  oauth_session TEXT NOT NULL DEFAULT '',
+  oauth_expires_at INTEGER NOT NULL DEFAULT 0,
   updated_at    TEXT NOT NULL DEFAULT ''
 );
+
+CREATE VIEW IF NOT EXISTS active_account AS SELECT * FROM account
+WHERE id=1 AND zhihu_id<>'' AND oauth_session<>'' AND oauth_expires_at > unixepoch();
 
 CREATE TABLE IF NOT EXISTS profile_meta (
   id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -302,6 +307,12 @@ fn migrate(conn: &Connection) -> Result<()> {
             .unwrap_or(false);
         found
     };
+    if !has_column("account", "oauth_session") {
+        conn.execute("ALTER TABLE account ADD COLUMN oauth_session TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    if !has_column("account", "oauth_expires_at") {
+        conn.execute("ALTER TABLE account ADD COLUMN oauth_expires_at INTEGER NOT NULL DEFAULT 0", [])?;
+    }
     if !has_column("drafts", "warnings") {
         conn.execute(
             "ALTER TABLE drafts ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]'",

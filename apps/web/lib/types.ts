@@ -26,20 +26,7 @@ export interface Session {
   user: ZhihuUser | null;
   expiresAt: string | null;
   lastSyncAt: string | null;
-  signMode: string;
-}
-
-export interface QrTicket {
-  token: string;
-  link: string;
-  svg: string;
-  expiresAt: number;
-}
-
-export interface QrState {
-  status: "waiting" | "scanned" | "confirmed" | "expired" | "error";
-  user: ZhihuUser | null;
-  message: string;
+  canSyncNotifications: boolean;
 }
 
 export interface ProfileTerm {

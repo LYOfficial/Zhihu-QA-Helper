@@ -5,7 +5,7 @@ import { Empty, IconExternal, IconRefresh, IconSearch, Modal, Spinner } from "@/
 import { api, openExternal, toast } from "@/lib/api";
 import { answerQuality, formatMetric, qualityLevel } from "@/lib/creator-metrics";
 import { useLoad } from "@/lib/hooks";
-import type { AnswerMetrics, CreatorAnswer, Job } from "@/lib/types";
+import type { AnswerMetrics, CreatorAnswer, Job, Session } from "@/lib/types";
 
 interface AnswerPageData {
   answers: CreatorAnswer[];
@@ -130,6 +130,8 @@ export default function AnswersPage() {
     const params = new URLSearchParams({ offset: String(page * 20), q: keyword });
     return api.get(`/api/answers?${params}`);
   }, [page, keyword]);
+  const session = useLoad<Session>(() => api.get("/api/session"));
+  const canSync = session.data?.canSyncNotifications;
   const { reload } = list;
   const activeJob = jobId ?? list.data?.jobId;
   const busy = starting || Boolean(activeJob && (!job || job.id !== activeJob || job.state === "running"));
@@ -180,13 +182,13 @@ export default function AnswersPage() {
       <header className="page-head">
         <div>
           <h1 className="page-title">历史作答</h1>
-          <p className="page-sub">{list.data?.syncedAt ? `上次同步 ${dateTime.format(new Date(list.data.syncedAt))}` : "从知乎创作中心同步本人作答和互动数据"}</p>
+          <p className="page-sub">{list.data?.syncedAt ? `上次同步 ${dateTime.format(new Date(list.data.syncedAt))}` : canSync ? "从知乎创作中心同步本人作答和互动数据" : "查看此账号已保存的历史作答"}</p>
         </div>
-        <div className="page-actions">
+        {canSync && <div className="page-actions">
           <button className="btn btn-primary" onClick={() => void sync()} disabled={busy}>
             <IconRefresh size={14} /> {busy ? "同步中" : "同步作答"}
           </button>
-        </div>
+        </div>}
       </header>
       <div className="page-body">
         {job && <p className="answer-sync-status" role={job.state === "failed" ? "alert" : "status"}>{job.message}</p>}
@@ -216,7 +218,7 @@ export default function AnswersPage() {
             ))}
           </div>
         ) : !list.error && (
-          <Empty glyph="答">{keyword ? "没有找到匹配的作答。" : list.data?.syncedAt ? "知乎创作中心没有返回作答记录。" : "点击「同步作答」，在这里查看历史回答。"}</Empty>
+          <Empty glyph="答">{keyword ? "没有找到匹配的作答。" : list.data?.syncedAt ? "知乎创作中心没有返回作答记录。" : canSync ? "点击「同步作答」，在这里查看历史回答。" : "此账号暂无已保存的回答。知乎授权暂不支持创作中心同步。"}</Empty>
         )}
         {pages > 1 && (
           <nav aria-label="作答分页" className="answer-pagination">

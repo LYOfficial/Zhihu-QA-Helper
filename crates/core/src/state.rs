@@ -12,10 +12,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub version: String,
-    /// 本次扫码流程中建立起来的匿名会话，轮询时必须沿用同一份
-    pub qr_cookie: Mutex<String>,
-    /// 界面请求「用应用内浏览器登录」的标记，由桌面壳轮询后打开登录窗口
-    pub browser_login_pending: Mutex<bool>,
+    pub oauth: crate::oauth::Client,
     /// 拟稿并发名额：同时最多两份，避免多份稿子抢同一个模型 Key
     pub research_slots: tokio::sync::Semaphore,
     pub image_slots: tokio::sync::Semaphore,
@@ -55,8 +52,7 @@ impl AppState {
             data_dir,
             started_at: chrono::Utc::now(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            qr_cookie: Mutex::new(String::new()),
-            browser_login_pending: Mutex::new(false),
+            oauth: crate::oauth::Client::new(),
             research_slots: tokio::sync::Semaphore::new(2),
             image_slots: tokio::sync::Semaphore::new(1),
             answer_history_lock: Mutex::new(()),
@@ -137,16 +133,11 @@ impl AgentBridge {
     }
 }
 
-/// 组一个带当前登录态的知乎客户端
-pub async fn zhihu_client(state: &AppState) -> anyhow::Result<ZhihuClient> {
-    zhihu_client_from_db(&*state.db.lock().await)
-}
-
 pub fn zhihu_client_from_db(db: &Db) -> anyhow::Result<ZhihuClient> {
     let (cookie, sign_mode) = {
         let cookie: String = db
             .conn
-            .query_row("SELECT cookie FROM account WHERE id = 1", [], |r| {
+            .query_row("SELECT cookie FROM active_account", [], |r| {
                 r.get::<_, String>(0)
             })
             .unwrap_or_default();
@@ -158,8 +149,5 @@ pub fn zhihu_client_from_db(db: &Db) -> anyhow::Result<ZhihuClient> {
             .unwrap_or_else(|_| "auto".into());
         (cookie, mode)
     };
-    if cookie.trim().is_empty() {
-        anyhow::bail!("尚未登录知乎账号");
-    }
     ZhihuClient::new(cookie, crate::zhihu::SignMode::from_str(&sign_mode))
 }

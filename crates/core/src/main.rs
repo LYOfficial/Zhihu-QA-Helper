@@ -7,6 +7,7 @@ mod api;
 mod creator;
 mod db;
 mod models;
+mod oauth;
 mod scheduler;
 mod state;
 mod tasks;

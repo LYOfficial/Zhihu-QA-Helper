@@ -37,24 +37,7 @@ pub struct Session {
     pub user: Option<ZhihuUser>,
     pub expires_at: Option<String>,
     pub last_sync_at: Option<String>,
-    pub sign_mode: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct QrTicket {
-    pub token: String,
-    pub link: String,
-    pub svg: String,
-    pub expires_at: i64,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct QrState {
-    pub status: String, // waiting | scanned | confirmed | expired
-    pub user: Option<ZhihuUser>,
-    pub message: String,
+    pub can_sync_notifications: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

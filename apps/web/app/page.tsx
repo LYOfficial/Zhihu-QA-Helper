@@ -108,9 +108,9 @@ export default function DeskHome() {
         </div>
         <div className="page-actions">
           <ImportQuestions onImported={() => { void q.reload(true); void st.reload(true); }} />
-          <button className="btn" onClick={() => void syncNow()} disabled={syncJob?.state === "running"}>
+          {ss.data?.canSyncNotifications && <button className="btn" onClick={() => void syncNow()} disabled={syncJob?.state === "running"}>
             <IconRefresh size={14} /> 同步通知
-          </button>
+          </button>}
           <button className="btn btn-primary" onClick={() => router.push("/desk")}>
             开始批阅 <IconArrowRight size={14} />
           </button>
@@ -213,6 +213,7 @@ export default function DeskHome() {
         </div>
 
         <aside>
+          {ss.data?.canSyncNotifications && <>
           <SectionTitle right="每日 3 次">值守时刻</SectionTitle>
           <div className="timeline">
             {slots.map((s) => (
@@ -225,12 +226,13 @@ export default function DeskHome() {
                   {s.state === "done"
                     ? "抓取邀请与推荐，归入领域文件夹"
                     : s.state === "live"
-                      ? "到点自动登录并拉取通知"
+                      ? "到点拉取知乎通知"
                       : "本次未触发（软件可能未运行）"}
                 </div>
               </div>
             ))}
           </div>
+          </>}
 
           <div className="divider" />
 

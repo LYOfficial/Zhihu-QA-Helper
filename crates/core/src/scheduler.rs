@@ -1,6 +1,4 @@
-//! 定时器：每天按用户设定的时间点（默认 07:00 / 15:00 / 20:00）自动登录知乎、
-//! 拉取通知，并记录一次同步事件。用「分钟级轮询 + 当天去重」实现，
-//! 这样用户改了时间点也不需要重启。
+//! 定时器按用户设定的时间点拉取知乎通知，并在当天去重。
 
 use chrono::{Local, NaiveDateTime, Timelike};
 use std::collections::HashSet;
@@ -20,7 +18,10 @@ pub fn spawn(state: Shared) {
             };
             let auto_sync = {
                 let db = state.db.lock().await;
-                tasks::load_settings(&db).auto_sync && !tasks::onboarding_required(&db.conn).unwrap_or(true)
+                let can_sync = db.conn.query_row(
+                    "SELECT cookie<>'' FROM active_account", [], |row| row.get::<_, bool>(0)
+                ).unwrap_or(false);
+                can_sync && tasks::load_settings(&db).auto_sync && !tasks::onboarding_required(&db.conn).unwrap_or(true)
             };
 
             let today = now.format("%Y-%m-%d").to_string();

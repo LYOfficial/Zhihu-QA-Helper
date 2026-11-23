@@ -3,8 +3,7 @@
 import React from "react";
 import { api, toast } from "@/lib/api";
 import type { Theme } from "@/lib/theme";
-import type { Session } from "@/lib/types";
-import { IconCheck, IconExternal, Spinner, Seal } from "./ui";
+import { IconExternal, Spinner, Seal } from "./ui";
 
 export default function LoginScreen({
   onSuccess,
@@ -15,77 +14,71 @@ export default function LoginScreen({
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
 }) {
-  /** none = 什么都没开始；paste = 已在默认浏览器打开，等用户粘贴 */
-  const [phase, setPhase] = React.useState<"none" | "inapp" | "paste">("none");
-  const [browserHint, setBrowserHint] = React.useState("");
-  const [cookie, setCookie] = React.useState("");
-  const [submitting, setSubmitting] = React.useState(false);
-  const [err, setErr] = React.useState("");
+  const [waiting, setWaiting] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
 
-  // 应用内登录：开了窗口之后盯会话，成功即进
   React.useEffect(() => {
-    if (phase !== "inapp") return;
-    const t = setInterval(async () => {
+    if (!waiting) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
       try {
-        const s = await api.get<Session>("/api/session");
-        if (s.loggedIn) {
-          clearInterval(t);
-          toast("登录成功", "ok");
-          onSuccess();
+        const { status } = await api.post<{ status: string }>("/api/session/oauth/poll");
+        if (!active) return;
+        if (status === "pending") {
+          setError("");
+          timer = setTimeout(poll, 1500);
+          return;
         }
-      } catch {
-        /* 忽略 */
+        setWaiting(false);
+        if (status === "complete") {
+          toast("知乎授权成功", "ok");
+          onSuccess();
+        } else if (status === "cancelled") {
+          setError("已取消知乎授权，可重新登录。");
+        } else if (status === "expired") {
+          setError("授权等待已结束，请重新发起登录。");
+        } else {
+          setError("知乎授权或账号验证失败，请重试。");
+        }
+      } catch (e) {
+        if (!active) return;
+        setError(e instanceof Error ? e.message : "暂时无法检查授权状态。");
+        timer = setTimeout(poll, 2500);
       }
-    }, 1500);
-    return () => clearInterval(t);
-  }, [phase, onSuccess]);
+    }
+    timer = setTimeout(poll, 1500);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [waiting, onSuccess]);
 
-  React.useEffect(() => {
-    if (phase !== "inapp") return;
-    const timer = setTimeout(() => {
-      setBrowserHint("没看到登录窗口？可点击上方按钮重新打开，或使用默认浏览器登录。");
-    }, 10_000);
-    return () => clearTimeout(timer);
-  }, [phase]);
-
-  async function loginInApp() {
-    setErr("");
-    setBrowserHint("");
-    setPhase("inapp");
+  async function authorize() {
+    setBusy(true);
+    setError("");
     try {
-      await api.post("/api/login/browser");
+      await api.post("/api/session/oauth/start");
+      setWaiting(true);
     } catch (e) {
-      setPhase("none");
-      setErr(e instanceof Error ? e.message : "无法唤起登录窗口");
+      setError(e instanceof Error ? e.message : "无法打开知乎授权页。");
+    } finally {
+      setBusy(false);
     }
   }
 
-  async function loginInBrowser() {
-    setErr("");
-    setBrowserHint("");
+  async function cancel() {
+    setWaiting(false);
+    setBusy(true);
+    setError("");
     try {
-      await api.post("/api/session/open-browser");
-      setPhase("paste");
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "无法打开浏览器");
-    }
-  }
-
-  async function submitCookie() {
-    setErr("");
-    if (cookie.trim().length < 12) {
-      setErr("请粘贴完整的 Cookie，至少要包含 z_c0=xxx");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      await api.post("/api/session/cookie", { cookie });
-      toast("登录成功", "ok");
+      await api.post("/api/session/oauth/cancel");
       onSuccess();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : "Cookie 无效");
+      setError(e instanceof Error ? e.message : "无法取消，请重试。");
     } finally {
-      setSubmitting(false);
+      setBusy(false);
     }
   }
 
@@ -106,8 +99,8 @@ export default function LoginScreen({
           <li>
             <span className="idx">一</span>
             <span>
-              <b>每天三次自动值守</b>
-              定时登录知乎，把邀请与推荐回答取回来，按你的领域归档。
+              <b>收集适合回答的问题</b>
+              按领域找题，也可以直接导入知乎问题链接。
             </span>
           </li>
           <li>
@@ -128,8 +121,7 @@ export default function LoginScreen({
 
         <div className="foot">
           <span>v0.1</span>
-          <span>本地运行 · 凭证不出本机</span>
-          <span>不采集 · 不上传</span>
+          <span>草稿和资料保存在本机</span>
         </div>
       </div>
 
@@ -142,78 +134,27 @@ export default function LoginScreen({
         </button>
         <div className="login-card">
           <h2>登录知乎</h2>
-          <p className="sub">
-            邀请与推荐只存在于你的账号通知里。没有登录态，软件无法工作。
-          </p>
+          <p className="sub">在浏览器的知乎授权页确认后，返回此处即可继续。</p>
 
-          <button
-            className="btn btn-primary btn-block"
-            style={{ marginTop: 18 }}
-            onClick={loginInApp}
-          >
-            {phase === "inapp" ? <Spinner /> : <IconExternal size={14} />}
-            {phase === "inapp" ? "重新打开登录窗口" : "在应用内登录知乎"}
-          </button>
-          <p className="hint" style={{ textAlign: "center" }}>
-            弹出应用内的知乎登录页，可以在里面扫码或密码登录；登录完自动关闭。
-          </p>
-
-          {phase === "inapp" && (
-            <div className="login-waiting">
-              <Spinner />
-              <span>请在知乎窗口完成登录，成功后会自动回到这里</span>
-            </div>
-          )}
-          {browserHint && <div className="login-warn">{browserHint}</div>}
-
-          <div className="or">
-            <span>或</span>
-          </div>
-
-          <button className="btn btn-block" onClick={loginInBrowser}>
-            <IconExternal size={13} /> 用默认浏览器登录
-          </button>
-          <p className="hint" style={{ textAlign: "center" }}>
-            用你自己的浏览器登录，然后把 z_c0 复制回来粘一次。
-          </p>
-
-          {phase === "paste" && (
-            <div className="paste-box">
-              <div className="steps">
-                <b>复制 z_c0 的步骤</b>
-                <ol>
-                  <li>在刚打开的浏览器里完成知乎登录（扫码或账号密码都行）</li>
-                  <li>按 <kbd>F12</kbd> → <b>Application</b> → <b>Cookies</b> → https://www.zhihu.com</li>
-                  <li>找到 <b>z_c0</b>，双击 Value 全选复制</li>
-                  <li>粘贴到下面这个框里</li>
-                </ol>
+          {waiting ? (
+            <>
+              <div className="login-waiting" role="status">
+                <Spinner />
+                <span>正在等待知乎授权</span>
               </div>
-              <textarea
-                className="textarea"
-                style={{ minHeight: 74, fontSize: 11.5, fontFamily: "var(--font-num)" }}
-                placeholder="z_c0=xxxxxxxxxxxx  （粘贴整行 Cookie 也可以）"
-                value={cookie}
-                onChange={(e) => setCookie(e.target.value)}
-              />
-              <button
-                className="btn btn-primary btn-block"
-                style={{ marginTop: 8 }}
-                onClick={submitCookie}
-                disabled={submitting}
-              >
-                {submitting ? <Spinner /> : <IconCheck size={13} />} 用这段 Cookie 登录
-              </button>
-            </div>
+              <button className="btn btn-block" onClick={cancel}>取消授权等待</button>
+            </>
+          ) : (
+            <button
+              className="btn btn-primary btn-block"
+              style={{ marginTop: 18 }}
+              disabled={busy}
+              onClick={authorize}
+            >
+              {busy ? <Spinner /> : <IconExternal size={14} />} 使用知乎账号登录
+            </button>
           )}
-
-          {err && <div className="login-err">{err}</div>}
-
-          <div className="login-steps">
-            <b>为什么默认浏览器登录还得多一步复制？</b>
-            <br />
-            知乎没有提供回调地址，浏览器里的登录态属于浏览器，软件读不到。
-            「在应用内登录」用的是软件自己的浏览器内核，所以能自动取到，不需要复制。
-          </div>
+          {error && <div className="login-err" role="alert">{error}</div>}
         </div>
       </div>
     </div>

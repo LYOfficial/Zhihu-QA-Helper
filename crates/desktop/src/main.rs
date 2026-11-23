@@ -156,21 +156,6 @@ fn startup_error(message: &str) {
 
 // ---------------- 与内核通信（只走本机回环，不引额外依赖） ----------------
 
-fn core_post(path: &str, body: &str) -> Option<String> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], core_port()));
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok()?;
-    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.as_bytes().len(),
-        body
-    );
-    s.write_all(req.as_bytes()).ok()?;
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    Some(out)
-}
-
 fn core_get(path: &str) -> Option<String> {
     let addr = SocketAddr::from(([127, 0, 0, 1], core_port()));
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok()?;
@@ -180,87 +165,6 @@ fn core_get(path: &str) -> Option<String> {
     let mut out = String::new();
     let _ = s.read_to_string(&mut out);
     Some(out)
-}
-
-/// 知乎 Cookie 都在 zhihu.com 域下；拿到 z_c0 就说明登录成功
-fn harvest_cookie(win: &tauri::WebviewWindow) -> Option<String> {
-    let url = tauri::Url::parse("https://www.zhihu.com").ok()?;
-    let cookies = win.cookies_for_url(url).ok()?;
-    let mut parts: Vec<String> = Vec::new();
-    let mut has_zc0 = false;
-    for c in cookies {
-        let name = c.name().to_string();
-        if name == "z_c0" {
-            has_zc0 = true;
-        }
-        parts.push(format!("{}={}", name, c.value()));
-    }
-    if !has_zc0 {
-        return None;
-    }
-    Some(parts.join("; "))
-}
-
-/// 打开知乎登录窗口，登录成功后把 Cookie 交给内核并关窗
-fn open_login_window(app: tauri::AppHandle) {
-    let app_main = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(window) = app_main.get_webview_window("login") {
-            let _ = window.set_focus();
-            return;
-        }
-        let Ok(url) = tauri::Url::parse("https://www.zhihu.com/signin") else {
-            return;
-        };
-        let Ok(login) = WebviewWindowBuilder::new(&app_main, "login", WebviewUrl::External(url))
-            .title("登录知乎 · 完成后本窗口会自动关闭")
-            .inner_size(560.0, 780.0)
-            .center()
-            .build()
-        else {
-            return;
-        };
-        std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(900);
-            while Instant::now() < deadline && login.is_visible().unwrap_or(false) {
-                std::thread::sleep(Duration::from_millis(900));
-                if !login.is_visible().unwrap_or(false) {
-                    return;
-                }
-                let Some(cookie) = harvest_cookie(&login) else {
-                    continue;
-                };
-                let body = serde_json::json!({ "cookie": cookie }).to_string();
-                let accepted = core_post("/api/session/cookie", &body)
-                    .is_some_and(|response| response.split_whitespace().nth(1) == Some("200"));
-                if !accepted {
-                    let _ = login.set_title("登录知乎 · 验证未完成，请重试或关闭窗口后重新打开");
-                    std::thread::sleep(Duration::from_secs(5));
-                    continue;
-                }
-                let _ = login.close();
-                if let Some(main) = app_main.get_webview_window("main") {
-                    let _ = main.set_focus();
-                }
-                return;
-            }
-            let _ = login.close();
-        });
-    });
-}
-
-/// 轮询内核：界面点了「内置浏览器登录」就开窗
-fn watch_browser_login(app: tauri::AppHandle) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(1200));
-        if let Some(resp) = core_get("/api/login/browser") {
-            if resp.contains("\"pending\":true") {
-                open_login_window(app.clone());
-                let _ = core_post("/api/login/browser/done", "{}");
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        }
-    });
 }
 
 /// 托盘菜单直接触发一次同步（内核没在跑时静默失败，不弹窗打扰）
@@ -419,7 +323,6 @@ fn main() {
             let _ = window.show();
             let _ = window.set_focus();
 
-            watch_browser_login(app.handle().clone());
 
             if !ok {
                 // 内核没起来：窗口会显示内核自带的提示页，这里只留一条日志

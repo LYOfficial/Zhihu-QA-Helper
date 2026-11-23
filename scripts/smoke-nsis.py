@@ -61,7 +61,9 @@ def test_nsis(extracted, screenshots, live_search, live_sources):
                 assert health["version"] == VERSION and Path(health["dataDir"]) == data, health
                 with sqlite3.connect(data / "zhihu-qa.db") as db:
                     db.execute("UPDATE settings SET auto_sync=0")
-                    db.execute("INSERT INTO account(id,name,cookie) VALUES (1,'离线测试账号','fixture')")
+                    db.execute("""INSERT INTO account(id,name,zhihu_id,cookie,oauth_session,oauth_expires_at)
+                               VALUES (1,'离线测试账号','fixture-user','fixture','fixture-session',unixepoch()+3600)""")
+                    db.execute("INSERT INTO onboarding_finished VALUES ('fixture-user')")
                     db.execute("INSERT INTO questions(id,title,domain) VALUES ('test','Steam locomotive','铁路')")
                     db.execute("INSERT INTO drafts(question_id,markdown) VALUES ('test',?)", (smoke.MANUAL_DRAFT,))
                     if live_sources:

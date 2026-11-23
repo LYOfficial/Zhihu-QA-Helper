@@ -1,4 +1,4 @@
-//! 知乎客户端：二维码登录、通知拉取、历史内容抓取。
+//! 知乎网页客户端：通知拉取、公开内容查询。
 //!
 //! 协议参考 docs/zhihu-apis.md（整理自知乎++ / zhurl 的公开接口索引）。
 //! 注意：知乎风控参数（x-zse-96）会随版本变动，本项目把它做成可切换策略，
@@ -6,10 +6,10 @@
 
 use anyhow::{anyhow, Result};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::time::Duration;
 
-use crate::models::{now_iso, QuestionMetrics, ZhihuUser};
+use crate::models::{now_iso, QuestionMetrics};
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const ZSE93: &str = "101_3_3.0";
@@ -45,21 +45,6 @@ pub struct ZhihuClient {
     pub sign_mode: SignMode,
 }
 
-/// 从 `z_c0=xxx; Path=/; Domain=.zhihu.com` 这类串里抽出 k=v 对。
-fn extract_cookie_pairs(raw: &str) -> Vec<(String, String)> {
-    raw.split(';')
-        .filter_map(|seg| {
-            let seg = seg.trim();
-            if seg.is_empty() || seg.contains("Path=") || seg.contains("Domain=") {
-                return None;
-            }
-            let (k, v) = seg.split_once('=')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
-        })
-        .filter(|(k, _)| !k.is_empty())
-        .collect()
-}
-
 impl ZhihuClient {
     pub fn new(cookie: String, sign_mode: SignMode) -> Result<Self> {
         let http = Client::builder()
@@ -72,49 +57,6 @@ impl ZhihuClient {
             cookie,
             sign_mode,
         })
-    }
-
-    /// 把响应里的 Set-Cookie 合并进本地 jar（只取 name=value，忽略属性）
-    fn absorb(&mut self, resp: &reqwest::Response) {
-        let parts: Vec<String> = resp
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .filter_map(|raw| {
-                let first = raw.split(';').next()?.trim();
-                if first.contains('=') {
-                    Some(first.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if parts.is_empty() {
-            return;
-        }
-        for pair in parts {
-            let (k, v) = match pair.split_once('=') {
-                Some(x) => x,
-                None => continue,
-            };
-            let mut pairs: Vec<(String, String)> = self
-                .cookie
-                .split(';')
-                .filter_map(|s| s.trim().split_once('='))
-                .map(|(a, b)| (a.to_string(), b.to_string()))
-                .filter(|(a, _)| !a.is_empty())
-                .collect();
-            match pairs.iter_mut().find(|(a, _)| a == k) {
-                Some(slot) => slot.1 = v.to_string(),
-                None => pairs.push((k.to_string(), v.to_string())),
-            }
-            self.cookie = pairs
-                .into_iter()
-                .map(|(a, b)| format!("{a}={b}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-        }
     }
 
     fn xsrf(&self) -> Option<String> {
@@ -134,30 +76,8 @@ impl ZhihuClient {
             .unwrap_or_default()
     }
 
-    /// 合并新 cookie（登录回调返回的只包含 z_c0 等少量字段）。
-    pub fn merge_cookie(&mut self, raw: &str) {
-        let mut pairs: Vec<(String, String)> = self
-            .cookie
-            .split(';')
-            .filter_map(|s| s.trim().split_once('='))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        for (k, v) in extract_cookie_pairs(raw) {
-            if let Some(slot) = pairs.iter_mut().find(|(pk, _)| *pk == k) {
-                slot.1 = v;
-            } else {
-                pairs.push((k, v));
-            }
-        }
-        self.cookie = pairs
-            .into_iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-    }
-
     async fn send(&self, method: reqwest::Method, url: &str, signed: bool) -> Result<Value> {
-        let signed = signed && match self.sign_mode {
+        let signed = signed && !self.cookie.is_empty() && match self.sign_mode {
             SignMode::Always => true,
             SignMode::Auto => !self.d_c0().is_empty(),
             SignMode::Off => false,
@@ -183,7 +103,7 @@ impl ZhihuClient {
     ) -> std::result::Result<Value, RequestError> {
         if signed && self.d_c0().is_empty() {
             return Err(RequestError::fatal(
-                "登录 Cookie 缺少 d_c0，无法生成 x-zse-96；请重新粘贴完整 Cookie",
+                "旧版网页会话缺少签名所需的字段",
             ));
         }
         let path = request_path(url);
@@ -233,192 +153,9 @@ impl ZhihuClient {
             .map_err(|error| anyhow!(error.message))
     }
 
-    // ---------- 登录 ----------
-
-    /// 二维码登录的完整握手（顺序不能变，少一步知乎就打回）：
-    ///   ① GET  /signin                    建匿名会话（_xsrf / BEC）
-    ///   ② POST /udid                      设备预热
-    ///   ③ GET  /api/v3/oauth/captcha/v2   关键：这一步才会下发 d_c0
-    ///   ④ POST /api/v3/account/api/login/qrcode
-    /// 没有 d_c0 的二维码是"无设备绑定"的，手机扫了也确认不下来。
-    pub async fn qr_create(&mut self) -> Result<(String, String, i64)> {
-        let signin = self
-            .http
-            .get("https://www.zhihu.com/signin")
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .header("Accept-Language", "zh-CN,zh;q=0.9")
-            .header("Referer", "https://www.zhihu.com/")
-            .send()
-            .await?;
-        self.absorb(&signin);
-
-        let udid = self
-            .http
-            .post("https://www.zhihu.com/udid")
-            .header("Content-Type", "application/json;charset=UTF-8")
-            .header("x-requested-with", "fetch")
-            .header("Cookie", &self.cookie)
-            .header("Referer", "https://www.zhihu.com/signin")
-            .body("{}")
-            .send()
-            .await;
-        if let Ok(r) = udid {
-            self.absorb(&r);
-        }
-
-        // ③ 设备指纹：d_c0 由这个接口下发
-        let cap = self
-            .http
-            .get("https://www.zhihu.com/api/v3/oauth/captcha/v2?type=captcha_sign_in")
-            .header("Cookie", &self.cookie)
-            .header("x-requested-with", "fetch")
-            .header("Referer", "https://www.zhihu.com/signin")
-            .send()
-            .await;
-        if let Ok(r) = cap {
-            self.absorb(&r);
-        }
-        if self.d_c0().is_empty() {
-            tracing::warn!(target: "zhihu", "captcha 未下发 d_c0，登录可能无法确认");
-        }
-
-        // ④ 建码
-        let mut req = self
-            .http
-            .post("https://www.zhihu.com/api/v3/account/api/login/qrcode")
-            .header("Content-Type", "application/json;charset=UTF-8")
-            .header("x-requested-with", "fetch")
-            .header("Origin", "https://www.zhihu.com")
-            .header("Cookie", &self.cookie)
-            .header("Referer", "https://www.zhihu.com/signin");
-        if let Some(t) = self.xsrf() {
-            req = req.header("x-xsrftoken", t);
-        }
-        let resp = req.body("{}").send().await?;
-        let status = resp.status();
-        self.absorb(&resp);
-        let v: Value = resp.json().await.unwrap_or(json!({}));
-        if !status.is_success() {
-            return Err(anyhow!(
-                "知乎拒绝了建码请求（HTTP {status}）：{}",
-                slim(&v.to_string(), 160)
-            ));
-        }
-        let token = v
-            .get("token")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| anyhow!("二维码响应缺少 token 字段"))?
-            .to_string();
-        // 知乎返回的 link 尾部会带一段 "?/api/login/qrcode"（网关把原始路径当查询串追加了），
-        // 直接编码进二维码会让 App 解析不稳；这里只留规范路径。
-        let raw_link = v
-            .get("link")
-            .and_then(|x| x.as_str())
-            .unwrap_or("https://www.zhihu.com/signin");
-        let link = raw_link.split('?').next().unwrap_or(raw_link).to_string();
-        // expires_at 是秒级时间戳
-        let expires_at = v
-            .get("expires_at")
-            .and_then(|x| x.as_i64())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp() + 300);
-        Ok((token, link, expires_at))
-    }
-
-    /// 轮询扫码状态。返回 (状态, 登录 cookie, 给用户看的说明)。
-    /// 状态取值：waiting / scanned / confirmed / expired / blocked
-    pub async fn qr_poll(&self, token: &str) -> Result<(String, Option<String>, String)> {
-        let url =
-            format!("https://www.zhihu.com/api/v3/account/api/login/qrcode/{token}/scan_info");
-        let resp = self
-            .http
-            .get(&url)
-            .header("Cookie", &self.cookie)
-            .header("x-zse-93", ZSE93)
-            .header("x-requested-with", "fetch")
-            .header("Accept", "application/json, text/plain, */*")
-            .header("Origin", "https://www.zhihu.com")
-            .header("Referer", "https://www.zhihu.com/signin")
-            .send()
-            .await?;
-
-        let code = resp.status();
-        let v: Value = resp.json().await.unwrap_or(json!({}));
-
-        // 403 / code 40352：知乎要求人机验证，扫码流程在本机被风控拦住了
-        let err_code = v
-            .pointer("/error/code")
-            .and_then(|x| x.as_i64())
-            .unwrap_or(0);
-        if code == 403 || err_code == 40352 {
-            let msg = v
-                .pointer("/error/message")
-                .and_then(|x| x.as_str())
-                .unwrap_or("知乎要求人机验证，扫码登录已被风控拦截");
-            return Ok(("blocked".to_string(), None, msg.to_string()));
-        }
-        if !code.is_success() {
-            return Ok(("blocked".to_string(), None, format!("轮询返回 HTTP {code}")));
-        }
-
-        let login_status = v
-            .get("login_status")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let status_num = v.get("status").and_then(|x| x.as_i64()).unwrap_or(0);
-        let cookie = v
-            .get("cookie")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
-        let state = match login_status.as_str() {
-            "CONFIRMED" => "confirmed",
-            "SCANNED" => "scanned",
-            "EXPIRED" => "expired",
-            _ => {
-                if status_num == 1 {
-                    "scanned"
-                } else if status_num >= 2 {
-                    "confirmed"
-                } else {
-                    "waiting"
-                }
-            }
-        };
-        let note = match state {
-            "scanned" => "已扫码，请在手机上点「确认登录」",
-            "expired" => "二维码已过期，请换一张",
-            "confirmed" => "登录成功",
-            _ => "等待扫码",
-        };
-        Ok((state.to_string(), cookie, note.to_string()))
-    }
-
-    pub async fn me(&self) -> Result<ZhihuUser> {
-        let v = self
-            .send(
-                reqwest::Method::GET,
-                "https://www.zhihu.com/api/v4/me?include=answer_count,articles_count,follower_count",
-                true,
-            )
-            .await?;
-        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let n = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
-        if s("name").is_empty() {
-            return Err(anyhow!("登录态无效：拿不到账号信息"));
-        }
-        Ok(ZhihuUser {
-            id: s("id"),
-            name: s("name"),
-            url_token: s("url_token"),
-            avatar_url: s("avatar_url"),
-            headline: s("headline"),
-            answer_count: n("answer_count"),
-            articles_count: n("articles_count"),
-            follower_count: n("follower_count"),
-        })
+    pub fn require_web_session(&self) -> Result<()> {
+        anyhow::ensure!(!self.cookie.trim().is_empty(), "知乎 OAuth 暂未开放通知和创作中心接口。可以手动导入问题或使用问题发现。");
+        Ok(())
     }
 
     // ---------- 通知 → 问题 ----------
@@ -603,6 +340,7 @@ impl ZhihuClient {
     }
 
     pub async fn creator_answers_page(&self, offset: usize) -> Result<(Vec<Value>, Option<usize>)> {
+        self.require_web_session()?;
         let url = format!("https://www.zhihu.com/api/v4/creators/creations/v2/answer?start=0&end=0&limit=20&offset={offset}&need_co_creation=1&sort_type=created");
         let response = self.send(reqwest::Method::GET, &url, true).await?;
         let rows = response["data"].as_array().ok_or_else(|| anyhow!("知乎创作中心没有返回回答列表"))?;
@@ -1085,6 +823,7 @@ fn parse_notification(item: &Value, assume_invite: bool) -> Option<RawQuestion> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn normalizes_supported_share_links_and_rejects_other_content() {
@@ -1173,16 +912,4 @@ mod tests {
 fn slim(s: &str, n: usize) -> String {
     let t: String = s.chars().take(n).collect();
     t
-}
-
-pub fn make_qr_svg(link: &str) -> Result<String> {
-    use qrcode::render::svg;
-    let code = qrcode::QrCode::new(link.as_bytes())?;
-    Ok(code
-        .render::<svg::Color>()
-        .min_dimensions(236, 236)
-        .quiet_zone(true)
-        .dark_color(svg::Color("#1b1a17"))
-        .light_color(svg::Color("#ffffff"))
-        .build())
 }

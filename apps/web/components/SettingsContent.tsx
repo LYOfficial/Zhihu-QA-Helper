@@ -15,7 +15,7 @@ import {
 import { api, getMode, openExternal, toast } from "@/lib/api";
 import { useLoad } from "@/lib/hooks";
 import { PROVIDERS } from "@/lib/providers";
-import type { Health, ModelConfig, QrTicket, Session, Settings, WritingMode } from "@/lib/types";
+import type { Health, ModelConfig, Session, Settings, WritingMode } from "@/lib/types";
 
 type ZhihuOpenStatus = { configured: boolean; enabled: boolean; profileEnabled: boolean };
 const zhihuOpenChecks = { user_contents: "用户画像", zhihu_search: "知乎搜索", global_search: "全网搜索" };
@@ -335,14 +335,14 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
           <SectionTitle>服务与偏好</SectionTitle>
           <div className="setting-line"><div><strong>大模型</strong><small>{model.model || "还未选择模型"} · 用于画像、查证和拟稿</small></div><button className="btn" onClick={() => setDialog("model")}>配置大模型</button></div>
           <div className="setting-line"><div><strong>知乎开放平台</strong><small>{openStatus.data?.enabled ? "已启用" : "可选"} · 使用自己的搜索额度，不配置也可继续</small></div><button className="btn" onClick={() => setDialog("zhihu")}>配置 Access Secret</button></div>
-          <div className="setting-line"><div><strong>值守与拟稿</strong><small>{settings.autoSync ? `每天 ${settings.cronTimes.length} 个同步时段` : "定时同步已关闭"} · 篇幅、配图和核查时间</small></div><button className="btn" onClick={() => setDialog("schedule")}>调整偏好</button></div>
+          <div className="setting-line"><div><strong>值守与拟稿</strong><small>{ss.data?.canSyncNotifications && settings.autoSync ? `每天 ${settings.cronTimes.length} 个同步时段` : "定时同步已关闭"} · 篇幅、配图和核查时间</small></div><button className="btn" onClick={() => setDialog("schedule")}>调整偏好</button></div>
         </section>
         <section className="settings-group">
           {/* 账号 */}
           <SectionTitle
             right={
               <span className="dim">
-                {ss.data?.loggedIn ? "已登录 · 凭证存于本机" : "扫码登录"}
+                {ss.data?.loggedIn ? "已通过知乎授权" : "未登录"}
               </span>
             }
           >
@@ -391,8 +391,8 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
               </div>
               <div style={{ fontSize: 11.5, color: "var(--ink-3)" }}>
                 {ss.data?.loggedIn
-                  ? `${ss.data.user?.answerCount ?? 0} 回答 · ${ss.data.user?.articlesCount ?? 0} 文章 · 上次同步 ${relTime(ss.data.lastSyncAt)}`
-                  : "登录后才会拉取你的邀请与推荐回答"}
+                  ? `账号资料更新于 ${relTime(ss.data.lastSyncAt)}`
+                  : "请使用知乎账号授权登录"}
               </div>
             </div>
             {ss.data?.loggedIn ? (
@@ -403,9 +403,11 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
                     try {
                       await api.post("/api/session/refresh");
                       toast("账号资料已刷新", "ok");
-                      ss.reload(true);
                     } catch (e) {
                       toast(e instanceof Error ? e.message : "失败", "err");
+                    } finally {
+                      ss.reload(true);
+                      window.dispatchEvent(new Event("zhihu-session-updated"));
                     }
                   }}
                 >
@@ -706,7 +708,7 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
             <p className="hint">默认 180 秒。前置查证和正文保存后的复核各用一轮；调整后在下次启动或续跑时生效。</p>
           </div>
 
-          <div className="switch">
+          {ss.data?.canSyncNotifications && <div className="switch">
             <div>
               <div className="switch-label">到点自动同步</div>
               <div className="switch-desc">关闭后只能手动点「同步通知」</div>
@@ -715,7 +717,7 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
               on={settings.autoSync}
               onChange={(v) => saveSettings({ autoSync: v })}
             />
-          </div>
+          </div>}
         </Modal>}
 
         {!embeddedModel && <>
@@ -736,8 +738,8 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
 
         <details className="settings-group settings-details">
           <summary>高级选项与本机状态</summary>
-          <div className="field mt-16">
-            <label>知乎请求签名策略</label>
+          {ss.data?.canSyncNotifications && <div className="field mt-16">
+            <label>旧版通知接口签名策略</label>
             <select
               className="select"
               value={settings.signMode}
@@ -751,7 +753,7 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
               知乎的风控参数会随版本变化。若同步报 403，先切到「仅 Cookie」试试；
               这是接口层面的兼容开关，不影响账号安全。
             </div>
-          </div>
+          </div>}
           <SectionTitle>本机状态</SectionTitle>
           <div className="kv">
             <span>内核版本</span>
@@ -787,8 +789,7 @@ export default function SettingsContent({ embeddedModel = false }: { embeddedMod
 
           <SectionTitle>隐私</SectionTitle>
           <p style={{ fontSize: 11.5, color: "var(--ink-3)", lineHeight: 1.8 }}>
-            知乎 Cookie 只写在本地 SQLite；拟稿时只把你选择的问题、画像与抓到的公开资料发给模型，
-            不会上传 Cookie、历史回答原文或任何账号凭证。
+            知乎授权由授权服务验证。草稿和数据库保存在本机。拟稿时，所选模型会收到你的问题、画像与查到的公开资料。
           </p>
 
           <div className="divider" />

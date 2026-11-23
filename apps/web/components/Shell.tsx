@@ -236,6 +236,18 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     stats.reload(true);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  React.useEffect(() => {
+    window.addEventListener("zhihu-session-updated", refreshAll);
+    return () => window.removeEventListener("zhihu-session-updated", refreshAll);
+  }, [refreshAll]);
+
+  React.useEffect(() => {
+    if (!session.data?.loggedIn || !session.data.expiresAt) return;
+    const untilExpiry = Date.parse(session.data.expiresAt) - Date.now();
+    const timer = setTimeout(() => session.reload(true), Math.max(1000, Math.min(untilExpiry, 60_000)));
+    return () => clearTimeout(timer);
+  }, [session.data, session.reload]);
+
   async function retry() {
     const m = await probe();
     setMode(m);
@@ -265,9 +277,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
         <LoginScreen
           theme={theme}
           onThemeChange={changeTheme}
-          onSuccess={() => {
-            refreshAll();
-          }}
+          onSuccess={refreshAll}
         />
         {toastHost}
       </DesktopFrame>
@@ -363,7 +373,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
         </div>
       </div>
 
-      {(showGuide || session.data.onboardingRequired) && <Onboarding key={user?.id} account={user} onExit={async (path) => {
+      {(showGuide || session.data.onboardingRequired) && <Onboarding key={user?.id} account={user} canSyncNotifications={session.data.canSyncNotifications} onExit={async (path) => {
         await session.reload(true);
         setShowGuide(false);
         void stats.reload(true);

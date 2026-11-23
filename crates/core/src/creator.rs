@@ -153,6 +153,7 @@ pub(crate) async fn list_answers(State(st): State<Shared>, Query(query): Query<A
 pub(crate) async fn sync_answers(State(st): State<Shared>) -> R {
     let _lock = st.creator_jobs_lock.lock().await;
     let (account, _, client) = account_client(&st).await?;
+    client.require_web_session()?;
     if let Some(job) = running_job(&st.db.lock().await.conn, ANSWER_SYNC)? {
         return Ok(Json(json!({ "jobId": job })));
     }

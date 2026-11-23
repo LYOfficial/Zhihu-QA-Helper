@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::models::*;
-use crate::state::{zhihu_client, Shared, ZhihuOpenSettings};
+use crate::state::{Shared, ZhihuOpenSettings};
 use crate::tasks;
 
 pub struct ApiError(anyhow::Error);
@@ -44,18 +44,12 @@ pub fn router(state: Shared) -> Router {
         .route("/health", get(health))
         .route("/session", get(get_session))
         .route("/session/onboarding/finish", post(finish_onboarding))
-        .route("/session/qrcode", post(create_qrcode))
-        .route("/session/qrcode/{token}", get(poll_qrcode))
-        .route("/session/cookie", post(login_with_cookie))
-        .route("/session/logout", post(logout))
-        .route(
-            "/login/browser",
-            post(browser_login_request).get(browser_login_pending),
-        )
-        .route("/login/browser/done", post(browser_login_done))
-        .route("/session/open-browser", post(open_login_in_browser))
         .route("/open-url", post(open_external))
-        .route("/session/refresh", post(refresh_me))
+        .route("/session/oauth/start", post(crate::oauth::start))
+        .route("/session/oauth/poll", post(crate::oauth::poll))
+        .route("/session/oauth/cancel", post(crate::oauth::cancel))
+        .route("/session/logout", post(crate::oauth::logout))
+        .route("/session/refresh", post(crate::oauth::refresh))
         .route("/profile", get(get_profile).put(put_profile))
         .route("/profile/analyze", post(analyze_profile))
         .route("/sources", get(get_sources).put(put_sources))
@@ -135,48 +129,30 @@ async fn health(State(st): State<Shared>) -> R {
 
 async fn get_session(State(st): State<Shared>) -> R {
     let db = st.db.lock().await;
-    let row: Option<(String, String, String, String, String, i64, i64, i64, String, Option<String>)> = db
-        .conn
-        .query_row(
-            "SELECT zhihu_id, name, url_token, avatar_url, headline, answer_count, articles_count, follower_count, cookie, expires_at FROM account WHERE id=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
-        )
-        .ok();
-    let sign_mode = db
-        .conn
-        .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .unwrap_or_else(|_| "auto".into());
-    let last_sync: Option<String> = db
-        .conn
-        .query_row("SELECT updated_at FROM account WHERE id=1", [], |r| {
-            r.get(0)
-        })
-        .ok()
-        .filter(|s: &String| !s.is_empty());
-
-    let (logged_in, user, expires_at) = match row {
-        Some((id, name, tok, avatar, headline, ac, arc, fc, cookie, exp)) => (
-            !cookie.trim().is_empty() && !name.is_empty(),
-            if name.is_empty() {
-                None
-            } else {
-                Some(ZhihuUser {
-                    id,
-                    name,
-                    url_token: tok,
-                    avatar_url: avatar,
-                    headline,
-                    answer_count: ac,
-                    articles_count: arc,
-                    follower_count: fc,
-                })
-            },
-            exp,
+    let row = db.conn.query_row(
+        "SELECT zhihu_id, name, url_token, avatar_url, headline, answer_count, articles_count,
+         follower_count, oauth_expires_at, updated_at, cookie<>'' FROM active_account",
+        [],
+        |r| Ok((ZhihuUser {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            url_token: r.get(2)?,
+            avatar_url: r.get(3)?,
+            headline: r.get(4)?,
+            answer_count: r.get(5)?,
+            articles_count: r.get(6)?,
+            follower_count: r.get(7)?,
+        }, r.get::<_, i64>(8)?, r.get::<_, String>(9)?, r.get::<_, bool>(10)?)),
+    ).optional()?;
+    let logged_in = row.is_some();
+    let (user, expires_at, last_sync_at, can_sync_notifications) = match row {
+        Some((user, expires, updated, can_sync)) => (
+            Some(user),
+            chrono::DateTime::from_timestamp(expires, 0).map(|time| time.to_rfc3339()),
+            Some(updated),
+            can_sync,
         ),
-        None => (false, None, None),
+        None => (None, None, None, false),
     };
 
     Ok(Json(json!(Session {
@@ -184,164 +160,23 @@ async fn get_session(State(st): State<Shared>) -> R {
         onboarding_required: logged_in && tasks::onboarding_required(&db.conn)?,
         user,
         expires_at,
-        last_sync_at: last_sync,
-        sign_mode,
+        last_sync_at,
+        can_sync_notifications,
     })))
 }
 
 async fn finish_onboarding(State(st): State<Shared>) -> R {
     let db = st.db.lock().await;
     db.conn.execute(
-        "INSERT OR IGNORE INTO onboarding_finished SELECT zhihu_id FROM account
-         WHERE id=1 AND cookie<>'' AND zhihu_id<>''", [],
+        "INSERT OR IGNORE INTO onboarding_finished SELECT zhihu_id FROM active_account", [],
     )?;
     Ok(Json(json!({"ok": true})))
-}
-
-async fn create_qrcode(State(st): State<Shared>) -> R {
-    let sign_mode = {
-        let db = st.db.lock().await;
-        db.conn
-            .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .unwrap_or_else(|_| "auto".into())
-    };
-    let mut client = crate::zhihu::ZhihuClient::new(
-        String::new(),
-        crate::zhihu::SignMode::from_str(&sign_mode),
-    )?;
-    let (token, link, expires_secs) = client.qr_create().await?;
-    // 轮询要沿用同一份匿名会话（含 d_c0），否则知乎认不出这张码
-    *st.qr_cookie.lock().await = client.cookie.clone();
-    let svg = crate::zhihu::make_qr_svg(&link).unwrap_or_default();
-    Ok(Json(json!(QrTicket {
-        token,
-        link,
-        svg,
-        expires_at: expires_secs * 1000,
-    })))
-}
-
-/// 把登录态落库（扫码登录与 Cookie 登录共用）
-async fn persist_account(st: &Shared, cookie: &str, user: &ZhihuUser) {
-    let db = st.db.lock().await;
-    let _ = db.conn.execute(
-        "INSERT INTO account (id, zhihu_id, name, url_token, avatar_url, headline, answer_count, articles_count, follower_count, cookie, expires_at, updated_at)
-         VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10)
-         ON CONFLICT(id) DO UPDATE SET zhihu_id=?1, name=?2, url_token=?3, avatar_url=?4, headline=?5,
-         answer_count=?6, articles_count=?7, follower_count=?8, cookie=?9, updated_at=?10",
-        params![
-            user.id, user.name, user.url_token, user.avatar_url, user.headline,
-            user.answer_count, user.articles_count, user.follower_count, cookie, now_iso()
-        ],
-    );
-    db.log_event("login", None, "登录成功", &user.name);
-}
-
-async fn poll_qrcode(State(st): State<Shared>, Path(token): Path<String>) -> R {
-    let cookie = st.qr_cookie.lock().await.clone();
-    let client = crate::zhihu::ZhihuClient::new(cookie, crate::zhihu::SignMode::Off)?;
-    let (state_str, cb, note) = client.qr_poll(&token).await?;
-
-    // 风控拦截：不要再让界面干等，如实告诉用户换一条路
-    if state_str == "blocked" {
-        return Ok(Json(json!(QrState {
-            status: "blocked".into(),
-            user: None,
-            message: note,
-        })));
-    }
-
-    if state_str == "confirmed" {
-        let mut c = client;
-        let Some(raw) = cb else {
-            return Ok(Json(json!(QrState {
-                status: "error".into(),
-                user: None,
-                message: "扫码已确认但未拿到登录凭证".into(),
-            })));
-        };
-        c.merge_cookie(&raw);
-        match c.me().await {
-            Ok(user) => {
-                persist_account(&st, &c.cookie, &user).await;
-                return Ok(Json(json!(QrState {
-                    status: "confirmed".into(),
-                    user: Some(user),
-                    message: "登录成功".into(),
-                })));
-            }
-            Err(e) => {
-                return Ok(Json(json!(QrState {
-                    status: "error".into(),
-                    user: None,
-                    message: format!("扫码已确认，但获取账号失败：{e}"),
-                })));
-            }
-        }
-    }
-
-    Ok(Json(json!(QrState {
-        status: state_str,
-        user: None,
-        message: note,
-    })))
-}
-
-/// 手工粘贴 Cookie 的兜底登录：用户从浏览器 DevTools 里复制 z_c0 即可。
-/// 这是知乎改协议时唯一必然可用的入口，所以做成正式能力而不是隐藏开关。
-fn normalize_cookie(raw: &str) -> String {
-    let s = raw
-        .trim()
-        .trim_start_matches("Cookie:")
-        .trim_start_matches("cookie:")
-        .replace(['\n', '\r', '\t'], " ")
-        .trim()
-        .to_string();
-    if s.contains('=') {
-        return s;
-    }
-    // 只粘贴了 z_c0 的值
-    if s.len() > 12 && !s.contains(' ') {
-        return format!("z_c0={s}");
-    }
-    s
-}
-
-async fn login_with_cookie(State(st): State<Shared>, Json(body): Json<Value>) -> R {
-    let raw = body.get("cookie").and_then(|x| x.as_str()).unwrap_or("");
-    let cookie = normalize_cookie(raw);
-    if cookie.len() < 12 {
-        return Err(ApiError(anyhow::anyhow!(
-            "Cookie 太短了，至少要包含 z_c0=... 这一项"
-        )));
-    }
-    let sign_mode = {
-        let db = st.db.lock().await;
-        db.conn
-            .query_row("SELECT sign_mode FROM settings WHERE id=1", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .unwrap_or_else(|_| "auto".into())
-    };
-    let client = crate::zhihu::ZhihuClient::new(
-        cookie.clone(),
-        crate::zhihu::SignMode::from_str(&sign_mode),
-    )?;
-    let user = client.me().await.map_err(|e| {
-        ApiError(anyhow::anyhow!(
-            "这份 Cookie 无效或已过期（{e}）。请确认复制的是 z_c0，且没有漏掉等号后面那段。"
-        ))
-    })?;
-    persist_account(&st, &client.cookie, &user).await;
-    Ok(Json(json!({ "ok": true, "user": user })))
 }
 
 /// 用系统默认浏览器打开链接。
 /// 桌面壳是 Tauri 的 WebView2，页面里的 `<a target="_blank">` 与 window.open()
 /// 都不会真的唤起浏览器，所以必须交给内核用系统命令打开。
-fn open_in_default_browser(url: &str) -> anyhow::Result<()> {
+pub(crate) fn open_in_default_browser(url: &str) -> anyhow::Result<()> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         anyhow::bail!("只允许打开 http/https 链接");
     }
@@ -397,54 +232,6 @@ async fn open_external(Json(body): Json<Value>) -> R {
     }
     open_in_default_browser(&url)?;
     Ok(Json(json!({ "ok": true, "url": url })))
-}
-
-/// 用系统默认浏览器打开知乎登录页。
-/// 这条路走的是用户自己的浏览器会话，软件读不到它的 Cookie，
-/// 所以登录后需要用户把 z_c0 复制回来；好在只需要一次。
-async fn open_login_in_browser() -> R {
-    let url = "https://www.zhihu.com/signin";
-    open_in_default_browser(url)?;
-    Ok(Json(json!({ "ok": true, "url": url })))
-}
-
-// 桌面壳每隔一两秒问一次：要不要开登录窗口
-async fn browser_login_request(State(st): State<Shared>) -> R {
-    *st.browser_login_pending.lock().await = true;
-    Ok(Json(json!({ "ok": true })))
-}
-async fn browser_login_pending(State(st): State<Shared>) -> R {
-    let pending = *st.browser_login_pending.lock().await;
-    Ok(Json(json!({ "pending": pending })))
-}
-async fn browser_login_done(State(st): State<Shared>) -> R {
-    *st.browser_login_pending.lock().await = false;
-    Ok(Json(json!({ "ok": true })))
-}
-
-async fn logout(State(st): State<Shared>) -> R {
-    let db = st.db.lock().await;
-    let _ = db.conn.execute(
-        "UPDATE account SET cookie='', name='', zhihu_id='' WHERE id=1",
-        [],
-    );
-    db.log_event("logout", None, "退出登录", "");
-    Ok(Json(json!({ "ok": true })))
-}
-
-async fn refresh_me(State(st): State<Shared>) -> R {
-    let client = zhihu_client(&st).await?;
-    let user = client.me().await?;
-    let db = st.db.lock().await;
-    let _ = db.conn.execute(
-        "UPDATE account SET name=?1, url_token=?2, avatar_url=?3, headline=?4, answer_count=?5, articles_count=?6, follower_count=?7, updated_at=?8 WHERE id=1",
-        params![user.name, user.url_token, user.avatar_url, user.headline, user.answer_count, user.articles_count, user.follower_count, now_iso()],
-    );
-    let _ = db.conn.execute(
-        "UPDATE account SET cookie=?1 WHERE id=1",
-        params![client.cookie],
-    );
-    Ok(Json(json!(user)))
 }
 
 // ---------------- 画像 ----------------
@@ -774,6 +561,7 @@ async fn get_question(State(st): State<Shared>, Path(id): Path<String>) -> R {
 }
 
 async fn sync_now(State(st): State<Shared>) -> R {
+    crate::tasks::account_client(&st).await?.2.require_web_session()?;
     let job_id = tasks::start_sync(&st, None, false).await;
     Ok(Json(
         json!({ "ok": true, "jobId": job_id, "message": "开始同步知乎通知" }),
@@ -781,6 +569,7 @@ async fn sync_now(State(st): State<Shared>) -> R {
 }
 
 async fn sync_recent_now(State(st): State<Shared>, body: Option<Json<Value>>) -> R {
+    crate::tasks::account_client(&st).await?.2.require_web_session()?;
     let select_only = body.as_ref().and_then(|body| body.get("selectOnly")).and_then(Value::as_bool).unwrap_or(false);
     let job_id = tasks::start_sync(&st, Some(3), select_only).await;
     Ok(Json(
@@ -883,8 +672,8 @@ async fn mark_answered(State(st): State<Shared>, Path(id): Path<String>) -> R {
         let freed = db.purge_images(&id).unwrap_or(0);
         db.conn.execute(
             "INSERT OR IGNORE INTO answered_questions SELECT a.zhihu_id, q.question_id
-             FROM account a JOIN questions q ON q.id=?1
-             WHERE a.id=1 AND a.cookie<>'' AND a.zhihu_id<>'' AND q.question_id<>''", params![id],
+             FROM active_account a JOIN questions q ON q.id=?1
+             WHERE q.question_id<>''", params![id],
         )?;
         db.conn.execute(
             "UPDATE questions SET status='answered', bucket='archived' WHERE id=?1",
@@ -1426,7 +1215,7 @@ fn zhihu_open_status(db: &crate::db::Db, settings: &ZhihuOpenSettings) -> R {
 
 fn zhihu_open_account(db: &crate::db::Db) -> rusqlite::Result<String> {
     Ok(db.conn.query_row(
-        "SELECT zhihu_id FROM account WHERE id=1 AND trim(cookie)<>''",
+        "SELECT zhihu_id FROM active_account",
         [], |row| row.get(0),
     ).optional()?.unwrap_or_default())
 }

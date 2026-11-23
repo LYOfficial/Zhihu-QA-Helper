@@ -110,18 +110,17 @@ fn classify(title: &str, tags: &[String], terms: &[ProfileTerm]) -> (String, Str
     (best.0, best.1, best.2)
 }
 
-pub const IS_ANSWERED: &str = "EXISTS(SELECT 1 FROM answered_questions h JOIN account a ON a.zhihu_id=h.account_id
-    WHERE a.id=1 AND a.cookie<>'' AND h.question_id=q.question_id)";
+pub const IS_ANSWERED: &str = "EXISTS(SELECT 1 FROM answered_questions h JOIN active_account a ON a.zhihu_id=h.account_id
+    WHERE h.question_id=q.question_id)";
 
 pub fn onboarding_required(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM account a WHERE a.id=1 AND a.cookie<>'' AND a.zhihu_id<>''
-         AND NOT EXISTS(SELECT 1 FROM onboarding_finished WHERE account_id=a.zhihu_id))", [], |row| row.get(0),
+        "SELECT EXISTS(SELECT 1 FROM active_account a WHERE NOT EXISTS(SELECT 1 FROM onboarding_finished WHERE account_id=a.zhihu_id))", [], |row| row.get(0),
     )
 }
 
 pub(crate) fn account_identity(conn: &rusqlite::Connection) -> Result<(String, String)> {
-    conn.query_row("SELECT zhihu_id, url_token FROM account WHERE id=1 AND cookie<>'' AND zhihu_id<>''",
+    conn.query_row("SELECT zhihu_id, url_token FROM active_account",
         [], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|_| anyhow::anyhow!("尚未登录知乎账号"))
 }
@@ -558,7 +557,7 @@ pub async fn bootstrap_if_empty(state: &crate::state::Shared) {
         let db = state.db.lock().await;
         let logged_in = db
             .conn
-            .query_row("SELECT cookie FROM account WHERE id=1", [], |r| {
+            .query_row("SELECT cookie FROM active_account", [], |r| {
                 r.get::<_, String>(0)
             })
             .map(|cookie| !cookie.trim().is_empty())
@@ -608,6 +607,7 @@ async fn sync_inner(
     )
     .await;
     let (account_id, token, client) = account_client(state).await?;
+    client.require_web_session()?;
     let batch = match days {
         Some(days) => client.fetch_invites_since(days).await?,
         None => client.fetch_invites(20).await?,
@@ -751,27 +751,15 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         (token, account_id, ZhihuOpenSettings::load(&db)?, crate::state::zhihu_client_from_db(&db)?)
     };
 
-    job_step(state, job, "抓取回答", 0.16, "正在获取回答列表").await;
-    let answers = client.my_answers(&url_token, 3).await.unwrap_or_default();
-    remember_answers(&state.db.lock().await.conn, &account_id, &answers)?;
-    job_step(
-        state,
-        job,
-        "抓取回答",
-        0.28,
-        &format!("已获取 {} 条回答", answers.len()),
-    )
-    .await;
-    job_step(state, job, "抓取文章", 0.34, "正在获取文章列表").await;
-    let articles = client.my_articles(&url_token, 2).await.unwrap_or_default();
-    job_step(
-        state,
-        job,
-        "整理样本",
-        0.42,
-        &format!("已获取 {} 篇文章", articles.len()),
-    )
-    .await;
+    job_step(state, job, "获取创作样本", 0.16, "正在读取账号的公开创作").await;
+    let (answers, articles) = if client.require_web_session().is_ok() && !url_token.is_empty() {
+        let (answers, articles) = tokio::join!(client.my_answers(&url_token, 3), client.my_articles(&url_token, 2));
+        let answers = answers.unwrap_or_default();
+        remember_answers(&state.db.lock().await.conn, &account_id, &answers)?;
+        (answers, articles.unwrap_or_default())
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let mut samples: Vec<Value> = answers
         .iter()
         .map(|a| {
@@ -792,6 +780,11 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         }))
         .collect();
 
+    let official = crate::oauth::profile_samples(state, &account_id).await;
+    let official_error = official.as_ref().err().map(ToString::to_string);
+    if let Ok(official) = official {
+        samples.extend(official);
+    }
     if open_settings.profile_enabled(&account_id) {
         job_step(state, job, "整理样本", 0.46, "补充知乎开放平台公开创作摘要").await;
         let payload = json!({ "zhihuAccessSecret": open_settings.secret });
@@ -810,8 +803,18 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
             }
         }
     }
+    let mut seen = std::collections::HashSet::new();
+    samples.retain(|sample| {
+        seen.insert((sample["kind"].as_str().unwrap_or_default().to_owned(),
+                     sample["title"].as_str().unwrap_or_default().trim().to_owned()))
+    });
     let sample = samples.len();
-    anyhow::ensure!(sample > 0, "没有抓到历史内容，可能是登录态失效");
+    if sample == 0 {
+        if let Some(error) = official_error {
+            anyhow::bail!("未获取到公开创作样本：{error}");
+        }
+    }
+    anyhow::ensure!(sample > 0, "未获取到公开创作样本，请确认账号有公开内容且已授权读取");
 
     job_step(
         state,
@@ -862,7 +865,7 @@ async fn profile_inner(state: &AppState, job: &str) -> Result<()> {
         let mut db = state.db.lock().await;
         let tx = db.conn.transaction()?;
         let current_account: String =
-            tx.query_row("SELECT zhihu_id FROM account WHERE id=1", [], |row| {
+            tx.query_row("SELECT zhihu_id FROM active_account", [], |row| {
                 row.get(0)
             })?;
         anyhow::ensure!(

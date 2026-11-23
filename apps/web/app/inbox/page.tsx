@@ -14,7 +14,7 @@ import { api, toast } from "@/lib/api";
 import { questionOpportunity } from "@/lib/creator-metrics";
 import { clearDraftRecovery } from "@/lib/draft-recovery";
 import { useLoad } from "@/lib/hooks";
-import type { DomainCount, Job, Question } from "@/lib/types";
+import type { DomainCount, Job, Question, Session } from "@/lib/types";
 
 const TABS = [
   { key: "todo", label: "全部待办" },
@@ -40,6 +40,8 @@ export default function InboxPage() {
   const qs = useLoad<{ questions: Question[]; domains: DomainCount[]; metricsJobId: string | null }>(() =>
     api.get("/api/questions?status=all")
   );
+  const session = useLoad<Session>(() => api.get("/api/session"));
+  const canSync = session.data?.canSyncNotifications;
   const { reload } = qs;
   const all = qs.data?.questions ?? [];
   const domains = qs.data?.domains ?? [];
@@ -200,12 +202,14 @@ export default function InboxPage() {
           <button className="btn btn-primary" onClick={() => void findQuestions()} disabled={syncing}>
             <IconSearch size={14} /> 主动找题
           </button>
+          {canSync && <>
           <button className="btn" onClick={() => void syncNow(false)} disabled={syncing}>
             <IconRefresh size={14} /> 立即同步
           </button>
           <button className="btn" onClick={() => void syncNow(true)} disabled={syncing}>
             <IconRefresh size={14} /> 同步近 3 天
           </button>
+          </>}
         </div>
       </header>
 
@@ -328,7 +332,7 @@ export default function InboxPage() {
 
       {list.length === 0 ? (
         <Empty glyph="无">
-          这个筛选下没有内容。换个标签，或者点「立即同步」去看看知乎上有没有新的邀请。
+          这个筛选下没有内容。可以换个标签、主动找题或导入知乎问题。
         </Empty>
       ) : (
         <div className="memorial-list">
